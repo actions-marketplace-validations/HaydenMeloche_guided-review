@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Box, Text, useInput } from 'ink';
+import { useInput } from 'ink';
+import { Box, Text } from './themed.js';
+import { SURFACES } from './theme.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
 
 // Loading screen for a tour: a title card over a drifting pattern that tracks the
@@ -8,7 +10,7 @@ import { sanitizeTerminal as safe } from '../util/sanitize.js';
 const FRAME_MS = 40;
 const NEEDLE = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'];
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const CURTAIN_BG = '#1E1E2E';
+const CURTAIN_BG = SURFACES.popup;
 
 interface Seg {
   text: string;
@@ -78,6 +80,7 @@ export function TourIntro(props: {
   width: number;
   height: number;
   lines: (spinner: string) => IntroLine[]; // spinner frame for in-progress steps
+  onBack?: () => void; // q: back to the PR list; unset, q quits
   onQuit: () => void;
 }) {
   const [elapsed, setElapsed] = useState(0);
@@ -86,7 +89,10 @@ export function TourIntro(props: {
     const t = setInterval(() => setElapsed(Date.now() - start), FRAME_MS);
     return () => clearInterval(t);
   }, []);
-  useInput((input) => input === 'q' && props.onQuit());
+  useInput((input) => {
+    if (input === 'q') (props.onBack ?? props.onQuit)();
+    if (input === 'Q') props.onQuit();
+  });
 
   const rows = introFrame(props.width, props.height, props.lines(SPIN[Math.floor(elapsed / 90) % SPIN.length]), elapsed);
   return (

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { grHome } from './paths.js';
+import { TERMINAL_THEME } from './tui/theme.js';
 import type { ChapterOrder, FileKind, KindRule, RepoConfig } from './types.js';
 import { AGENT_ROLES, PROVIDERS, type AgentConfig, type AgentRouting, type Provider } from './agent/types.js';
 
@@ -102,36 +103,65 @@ export function githubApiUrlProblem(value: string): string | undefined {
   return url.protocol === 'https:' ? undefined : 'the GitHub API URL must use https';
 }
 
-export type UserConfig = AgentRouting & { chapterOrder?: ChapterOrderSetting; hideWhitespace?: boolean; splitDiff?: boolean; github?: GitHubConfig };
+// "provider": "none" chooses no model: every tour is built by static analysis alone, as with --no-agent.
+// The model settings stay in the file, with the provider they were for in "lastProvider", so turning
+// AI back on in gr config starts from them.
+export const NO_PROVIDER = 'none';
+
+export type UserConfig = Omit<AgentRouting, 'provider'> & {
+  provider?: Provider | typeof NO_PROVIDER;
+  lastProvider?: Provider;
+  chapterOrder?: ChapterOrderSetting;
+  hideWhitespace?: boolean;
+  splitDiff?: boolean;
+  theme?: string;
+  github?: GitHubConfig;
+};
 
 export class UserConfigError extends Error {}
 
-// Presets written by `gr config`; the fast model handles briefing and narration, the strong one Q&A.
-export const PRESET_MODELS: Partial<Record<Provider, { fast: string; strong: string }>> = {
+// Models for the two tasks, with a Cursor model's variant: the fast one for the briefing and
+// narration, the strong one for Q&A.
+export interface ModelPair {
+  fast: string;
+  strong: string;
+  fastParams?: Record<string, string>;
+  strongParams?: Record<string, string>;
+}
+
+// Presets written by `gr config`. Cursor's name a variant at 256k context: its default variants
+// are Max Mode, the most expensive way to run a model.
+export const PRESET_MODELS: Partial<Record<Provider, ModelPair>> = {
   'claude-code': { fast: 'haiku', strong: 'opus' },
   anthropic: { fast: 'claude-haiku-5-5', strong: 'claude-opus-5-5' },
   bedrock: { fast: 'haiku', strong: 'opus' },
   vertex: { fast: 'haiku', strong: 'opus' },
   codex: { fast: 'gpt-6-luna', strong: 'gpt-6.1-sol' },
-  cursor: { fast: 'composer-2.5', strong: 'composer-2.5' },
+  cursor: {
+    fast: 'grok-4.7',
+    strong: 'grok-4.7',
+    fastParams: { context: '256k', reasoning_effort: 'low', fast: 'true' },
+    strongParams: { context: '256k', reasoning_effort: 'high', fast: 'false' },
+  },
   openai: { fast: 'gpt-6-luna', strong: 'gpt-6.1-sol' },
 };
 
-export function presetUserConfig(provider: Provider, models: { fast: string; strong: string }, connection: Omit<AgentConfig, 'provider' | 'model'> = {}): UserConfig {
+export function presetUserConfig(provider: Provider, models: ModelPair, connection: Omit<AgentConfig, 'provider' | 'model' | 'modelParams'> = {}): UserConfig & AgentRouting {
+  // When either task has a variant, both name theirs ({} for the default), so one can't inherit
+  // the other's through the top level.
+  const variants = !!(models.fastParams || models.strongParams);
+  const fast = { model: models.fast, ...(variants ? { modelParams: models.fastParams ?? {} } : {}) };
+  const strong = { model: models.strong, ...(variants ? { modelParams: models.strongParams ?? {} } : {}) };
   return {
     provider,
-    model: models.strong,
+    ...strong,
     chapterOrder: DEFAULT_CHAPTER_ORDER,
     ...connection,
-    roles: {
-      briefing: { model: models.fast },
-      narration: { model: models.fast },
-      qa: { model: models.strong },
-    },
+    roles: { briefing: fast, narration: fast, qa: strong },
   };
 }
 
-export function defaultUserConfig(): UserConfig {
+export function defaultUserConfig(): UserConfig & AgentRouting {
   return presetUserConfig('codex', PRESET_MODELS.codex!);
 }
 
@@ -148,6 +178,14 @@ function parseAgentConfig(raw: Record<string, unknown>, where: string): AgentCon
   if (typeof raw.apiKeyEnv === 'string' && raw.apiKeyEnv) out.apiKeyEnv = raw.apiKeyEnv.replace(/^\$/, '');
   if (typeof raw.toolCalling === 'boolean') out.toolCalling = raw.toolCalling;
   if (Number.isInteger(raw.maxOutputTokens) && (raw.maxOutputTokens as number) > 0) out.maxOutputTokens = raw.maxOutputTokens as number;
+  if (raw.modelParams !== undefined) {
+    const params = raw.modelParams;
+    if (!params || typeof params !== 'object' || Array.isArray(params) || Object.values(params).some((v) => typeof v !== 'string')) {
+      throw new UserConfigError(`${where}: "modelParams" must be an object of strings, such as { "reasoning_effort": "low" }`);
+    }
+    // Kept even when empty: {} says "the model's default variant" and stops a role inheriting one.
+    out.modelParams = params as Record<string, string>;
+  }
   return out;
 }
 
@@ -208,6 +246,34 @@ export function saveViewSetting(key: ViewSetting, value: boolean): void {
   fs.chmodSync(file, 0o600);
 }
 
+function parseTheme(raw: Record<string, unknown>, where: string): string | undefined {
+  if (raw.theme === undefined) return undefined;
+  if (typeof raw.theme !== 'string' || !raw.theme) throw new UserConfigError(`${where}: "theme" must be a theme name`);
+  return raw.theme;
+}
+
+// The color theme's name, readable without a model provider; undefined uses the terminal's colors.
+// Whether the name exists is checked when the theme loads.
+export function loadThemeSetting(): string | undefined {
+  const raw = readUserConfigFile();
+  return raw && parseTheme(raw, userConfigPath());
+}
+
+// Records the theme chosen in the picker; like saveViewSetting, it needs an existing config file.
+// The terminal's colors are the default, so choosing them removes the key, as gr config does.
+export function saveThemeSetting(theme: string): boolean {
+  const file = userConfigPath();
+  const raw = readUserConfigFile();
+  if (!raw) return false;
+  const { theme: saved, ...rest } = raw;
+  const next = theme === TERMINAL_THEME ? rest : { ...rest, theme };
+  if (saved !== (theme === TERMINAL_THEME ? undefined : theme)) {
+    fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+  }
+  return true;
+}
+
 function parseGitHubConfig(raw: Record<string, unknown>, where: string): GitHubConfig | undefined {
   if (raw.github === undefined) return undefined;
   if (!raw.github || typeof raw.github !== 'object' || Array.isArray(raw.github)) throw new UserConfigError(`${where}: "github" must be an object`);
@@ -230,19 +296,41 @@ export function loadGitHubConfig(): GitHubConfig | undefined {
   return raw && parseGitHubConfig(raw, userConfigPath());
 }
 
+function routingOf(config: UserConfig, provider: Provider | undefined): AgentRouting {
+  const { model, modelParams, baseUrl, apiKey, apiKeyEnv, toolCalling, maxOutputTokens, roles } = config;
+  const routing: AgentRouting = { provider, model, modelParams, baseUrl, apiKey, apiKeyEnv, toolCalling, maxOutputTokens, roles };
+  return Object.fromEntries(Object.entries(routing).filter(([, v]) => v !== undefined));
+}
+
+// The model routing of a config, or undefined when it chooses no model.
+export function agentRouting(config: UserConfig): AgentRouting | undefined {
+  if (config.provider === NO_PROVIDER) return undefined;
+  return routingOf(config, config.provider);
+}
+
+// The model settings a config with no model keeps for later, or undefined when it keeps none.
+export function keptRouting(config: UserConfig): AgentRouting | undefined {
+  return config.provider === NO_PROVIDER && config.lastProvider ? routingOf(config, config.lastProvider) : undefined;
+}
+
 // Throws UserConfigError when the config is missing or unusable; nothing is written implicitly.
 export function loadUserConfig(): UserConfig {
   const file = userConfigPath();
   const raw = readUserConfigFile();
   if (!raw) throw new UserConfigError(`no model provider is configured (${file} does not exist)`);
   if (raw.provider === undefined) throw new UserConfigError(`${file} does not set a "provider"`);
-  const out: UserConfig = parseAgentConfig(raw, file);
+  // With no model, the settings kept for later are checked as settings for lastProvider.
+  const noModel = raw.provider === NO_PROVIDER;
+  const parsed = parseAgentConfig(noModel ? { ...raw, provider: raw.lastProvider } : raw, file);
+  const out: UserConfig = noModel ? { ...parsed, provider: NO_PROVIDER, ...(parsed.provider ? { lastProvider: parsed.provider } : {}) } : parsed;
   const chapterOrder = parseChapterOrder(raw, file);
   if (chapterOrder) out.chapterOrder = chapterOrder;
   for (const key of ['hideWhitespace', 'splitDiff'] as const) {
     const value = parseViewSetting(raw, key, file);
     if (value !== undefined) out[key] = value;
   }
+  const theme = parseTheme(raw, file);
+  if (theme) out.theme = theme;
   const github = parseGitHubConfig(raw, file);
   if (github) out.github = github;
   if (raw.roles !== undefined) {

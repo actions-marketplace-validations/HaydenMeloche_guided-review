@@ -21,6 +21,7 @@ import { waitFor } from './helpers/waitFor.js';
 import { filesFor, hunkFromDiff, tour as makeTour } from './fixtures/tour.js';
 
 // Never reach GitHub from a test: confirming the submit screen posts through this.
+vi.mock('../src/agent/agent.js', async (orig) => ({ ...(await orig<typeof import('../src/agent/agent.js')>()), ask: vi.fn(async () => ({ value: 'An answer.' })) }));
 vi.mock('../src/github/gh.js', async (orig) => ({ ...(await orig<typeof import('../src/github/gh.js')>()), postReview: vi.fn(async () => ({ id: 1, url: 'https://example.test/review/1' })) }));
 
 // A short settle for keypresses that change no output but must land before the next key
@@ -59,6 +60,8 @@ function Harness(props: {
   onBriefing?: () => void;
   onReply?: (body: string) => Promise<void>;
   onDelete?: (d: Draft) => void;
+  onTheme?: () => void;
+  agent?: { cwd: string };
 }) {
   const { tour } = props;
   const [pos, setPos] = useState({ ci: props.startCi ?? 0, hi: 0 });
@@ -74,6 +77,7 @@ function Harness(props: {
       hi={pos.hi}
       order="flow"
       deltaOnly={false}
+      agent={props.agent}
       width={props.width ?? 150}
       height={40}
       setPos={(ci, hi) => setPos({ ci, hi })}
@@ -99,12 +103,22 @@ function Harness(props: {
       openSubmit={() => {}}
       openBriefing={() => props.onBriefing?.()}
       openInClaude={() => {}}
+      onTheme={props.onTheme}
       quit={() => {}}
     />
   );
 }
 
 describe('ChapterScreen', () => {
+  it('opens the color theme picker on L', async () => {
+    const onTheme = vi.fn();
+    const ui = render(<Harness tour={fixtureTour()} onDraft={() => {}} onState={() => {}} onTheme={onTheme} />);
+    await tick();
+    ui.stdin.write('L');
+    await waitFor(() => expect(onTheme).toHaveBeenCalledTimes(1));
+    ui.unmount();
+  });
+
   it('keeps the keyboard alive when an overlay would have nothing to show', async () => {
     const tour = fixtureTour();
     // A chapter emptied by moves, with a checklist but no checkout yet (no services).
@@ -315,7 +329,7 @@ describe('ChapterScreen', () => {
     expect(ui.lastFrame()).toContain('Could this fail?');
     expect(ui.lastFrame()).toContain(line.text.trim().slice(0, 20));
     ui.stdin.write('Agreed @al');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Tab to complete'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('tab insert · ↑↓ choose'));
     expect(ui.lastFrame()).toContain('@alice');
     ui.stdin.write('\t');
     await tick();
@@ -337,7 +351,7 @@ describe('ChapterScreen', () => {
     ui.stdin.write('@zo');
     await waitFor(() => expect(ui.lastFrame()).toContain('@zoe'));
     ui.stdin.write('\t');
-    await waitFor(() => expect(ui.lastFrame()).not.toContain('Tab to complete'));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('tab insert · ↑↓ choose'));
     expect(ui.lastFrame()).toContain('@zoe ');
     ui.unmount();
   });
@@ -383,7 +397,7 @@ describe('ChapterScreen', () => {
     const tour = fixtureTour();
     const chapter = tour.chapters[0];
     const hunk = tour.hunks[chapter.hunkIds[0]];
-    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
+    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} agent={{ cwd: '/tmp' }} />);
     await tick();
     ui.stdin.write('?');
     await waitFor(() => expect(ui.lastFrame()).toContain('Ask about'));
@@ -400,7 +414,19 @@ describe('ChapterScreen', () => {
   it('keeps earlier questions in the thread when asking a follow-up', async () => {
     const tour = fixtureTour();
     const ui = render(
-      <BriefingScreen tour={tour} chapters={tour.chapters} order="flow" cycleOrder={() => {}} states={{}} width={140} height={45} onStart={() => {}} onSubmit={() => {}} onQuit={() => {}} />,
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        order="flow"
+        cycleOrder={() => {}}
+        states={{}}
+        agent={{ cwd: '/tmp' }}
+        width={140}
+        height={45}
+        onStart={() => {}}
+        onSubmit={() => {}}
+        onQuit={() => {}}
+      />,
     );
     await tick();
     ui.stdin.write('?');
@@ -712,6 +738,92 @@ describe('BriefingScreen and SubmitScreen', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('Risk first order'));
     ui.stdin.write('f');
     await waitFor(() => expect(ui.lastFrame()).toContain('Small first order'));
+    ui.unmount();
+  });
+
+  it('on a re-review, lists unchanged chapters greyed under the changes and D shows the full review', async () => {
+    const tour = fixtureTour();
+    expect(tour.chapters.length).toBeGreaterThan(1);
+    const changed = tour.chapters[0];
+    const unchanged = tour.chapters[1];
+    tour.rereview = { previousHead: 'c'.repeat(40), newHunkIds: [changed.hunkIds[0]], comments: [] };
+    const deltaChapters = tour.chapters.map((c) => ({ ...c, hunkIds: c.hunkIds.filter((id) => tour.rereview!.newHunkIds.includes(id)) })).filter((c) => c.hunkIds.length);
+    const toggles: boolean[] = [];
+    function ReReviewBriefing() {
+      const [deltaOnly, setDeltaOnly] = useState(true);
+      return (
+        <BriefingScreen
+          tour={tour}
+          chapters={deltaOnly ? deltaChapters : tour.chapters}
+          allChapters={tour.chapters}
+          deltaOnly={deltaOnly}
+          toggleDelta={() => setDeltaOnly((d) => (toggles.push(!d), !d))}
+          order="flow"
+          cycleOrder={() => {}}
+          states={{}}
+          width={140}
+          height={45}
+          onStart={() => {}}
+          onSubmit={() => {}}
+          onQuit={() => {}}
+        />
+      );
+    }
+    const ui = render(<ReReviewBriefing />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('Changes only:'));
+    const frame = ui.lastFrame()!;
+    expect(frame).toContain(`1 of ${changed.hunkIds.length} hunk(s) changed`);
+    expect(frame).toContain(unchanged.title);
+    expect(frame).toContain('unchanged');
+    // The re-review note sits just above the chapter list, not under the description.
+    expect(frame.indexOf('Changes only:')).toBeLessThan(frame.indexOf('Chapters'));
+    expect(frame.indexOf('Changes only:')).toBeGreaterThan(frame.indexOf('Adds POST /invoices.'));
+    ui.stdin.write('D');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Full review:'));
+    expect(toggles).toEqual([false]);
+    expect(ui.lastFrame()).not.toContain('· unchanged');
+    ui.unmount();
+  });
+
+  it('on a re-review, the chapter screen badges the header, greys unchanged chapters, and offers D', async () => {
+    const tour = fixtureTour();
+    const changed = tour.chapters.find((c) => c.hunkIds.length > 1)!;
+    const unchanged = tour.chapters.find((c) => c !== changed)!;
+    tour.rereview = { previousHead: 'c'.repeat(40), newHunkIds: [changed.hunkIds[0]], comments: [] };
+    const deltaChapters = [{ ...changed, hunkIds: [changed.hunkIds[0]] }];
+    let toggled = 0;
+    const ui = render(
+      <ChapterScreen
+        tour={tour}
+        chapters={deltaChapters}
+        allChapters={tour.chapters}
+        states={{}}
+        drafts={[]}
+        ci={0}
+        hi={0}
+        order="flow"
+        deltaOnly
+        width={190}
+        height={40}
+        setPos={() => {}}
+        setState={() => {}}
+        saveDraft={() => {}}
+        deleteDraft={() => {}}
+        moveHunk={() => {}}
+        toggleOrder={() => {}}
+        toggleDelta={() => toggled++}
+        openSubmit={() => {}}
+        openBriefing={() => {}}
+        openInClaude={() => {}}
+        quit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('changes only'));
+    expect(ui.lastFrame()).toContain(unchanged.title.slice(0, 15));
+    expect(ui.lastFrame()).toContain(`${changed.hunkIds.length - 1} unchanged hidden`);
+    expect(ui.lastFrame()).toContain('full review');
+    ui.stdin.write('D');
+    await waitFor(() => expect(toggled).toBe(1));
     ui.unmount();
   });
 
@@ -1368,12 +1480,27 @@ describe('split view, test pane toggle and expanded context', () => {
     ui.unmount();
   });
 
-  it('says how a moved block changed: its indent, a reindent in place, or a copy', async () => {
+  it('gives one note to a move split by a small edit', async () => {
+    const h = hunkFromDiff('src/loans.go', '-open(path);', '-check(err);', '-defer close();', '-rows := read(file);', '-check(rows);', '-guard(empty);', '-index := -1');
+    // Lines 1-3 went to 27-29 and lines 5-7 to 32-34; line 4 was rewritten in between.
+    h.lines.forEach((l, i) => i !== 3 && (l.moved = { ...movedTo('src/loanids.go', i < 3 ? 27 + i : 28 + i), kind: 'merged', also: [{ file: 'src/ratios.go', line: 9, side: 'del' }] }));
+    const ui = render(screen(makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) })));
+    await waitFor(() => expect(ui.lastFrame()).toContain('6 lines merged into src/loanids.go:27, split by 1 other line; also removed at src/ratios.go:9'));
+    expect(ui.lastFrame()).not.toContain('3 lines merged');
+    ui.unmount();
+  });
+
+  it('says how a moved block changed: its indent, a reindent in place, a copy, or a merge', async () => {
     const lines = (file: string) => hunkFromDiff(file, ' a();', '-first(block);', '-second(block);', '-third(block);', ' b();');
     const cases: [Hunk, (i: number) => MovedTo, string][] = [
       [lines('src/a.ts'), (i) => ({ ...movedTo('src/b.ts', 40 + i), indent: -4 }), '3 lines moved to src/b.ts:41, indent −4'],
       [lines('src/c.ts'), (i) => ({ ...movedTo('src/c.ts', 2 + i), kind: 'reindented', indent: 2 }), '3 lines re-indented in place (indent +2), now line 3'],
       [lines('src/d.ts'), (i) => ({ ...movedTo('src/e.ts', 10 + i), kind: 'copied', also: [{ file: 'src/f.ts', line: 20, side: 'add' }] }), '3 lines copied to src/e.ts:11; also added at src/f.ts:20'],
+      [
+        lines('src/g.ts'),
+        (i) => ({ ...movedTo('src/h.ts', 10 + i), kind: 'merged', also: [{ file: 'src/i.ts', line: 30, side: 'del' }] }),
+        '3 lines merged into src/h.ts:11; also removed at src/i.ts:30',
+      ],
     ];
     for (const [h, at, note] of cases) {
       h.lines.forEach((l, i) => l.kind === 'del' && (l.moved = at(i)));

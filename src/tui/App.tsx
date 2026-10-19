@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Box, Text, useApp, useInput, useWindowSize } from 'ink';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useApp, useInput, useWindowSize } from 'ink';
+import { Box, PreviewingContext, Text, ThemeContext, useThemePreview } from './themed.js';
+import { terminalPalette, themeList, type Palette, type ThemeInfo } from './theme.js';
+import { ThemePicker } from './ThemePicker.js';
 import { spawnSync } from 'node:child_process';
 import type { Chapter, ChapterOrder, Draft, ExistingThread, Hunk, PRInfo, ReactionContent, ReadState, ThreadComment, Tour } from '../types.js';
 import { Store } from '../store/db.js';
@@ -16,6 +19,12 @@ import { BriefingScreen } from './BriefingScreen.js';
 import { SubmitScreen } from './SubmitScreen.js';
 import { ReviewPopup } from './ReviewPopup.js';
 import { CommentEditor } from './CommentEditor.js';
+import { aiChromeRows } from './AiSuggestion.js';
+import { initComposer, type ComposerEnv, type ComposerState, type ReferenceServices } from './composer.js';
+import { pushRecent, type RecentLocation } from './references.js';
+import { RepoIndex } from '../analysis/repoIndex.js';
+import { githubWebHost } from '../github/auth.js';
+import { generateSuggestion } from '../agent/suggest.js';
 import { PickerScreen, keyFor, type DownloadJob, type Target as PickTarget } from './PickerScreen.js';
 import { TourIntro, type IntroLine } from './TourIntro.js';
 
@@ -35,6 +44,15 @@ export interface AppOptions {
   noAgent?: boolean;
   fresh?: boolean;
   preview?: { pr: PRInfo; diff: string; worktree: string }; // author mode on a local branch
+  palette?: Palette; // the saved theme, loaded before the first frame; the terminal's colors when unset
+  saveTheme?: (name: string) => void; // records a theme chosen in the picker; unset when there is no config file
+}
+
+// The theme picker as the screens see it: L opens it over the picker, briefing, or chapter.
+interface ThemeControl {
+  open: boolean;
+  show: () => void;
+  popup: (width: number, height: number) => ReactNode;
 }
 
 type Phase = 'pick' | 'load' | 'briefing' | 'chapter' | 'submit' | 'edit' | 'error';
@@ -64,15 +82,59 @@ function slots(limit: number) {
 
 function chaptersForOrder(tour: Tour, order: ChapterOrder, moves: Record<string, string>, deltaOnly: boolean): Chapter[] {
   const base = order === 'file' ? fileOrderChapters(tour.files, tour.hunks) : tour.chapters;
-  let chapters = applyMoves(base, tour, moves);
-  if (deltaOnly && tour.rereview) {
-    const delta = new Set(tour.rereview.newHunkIds);
-    chapters = chapters.map((c) => ({ ...c, hunkIds: c.hunkIds.filter((id) => delta.has(id)) })).filter((c) => c.hunkIds.length);
-  }
-  return sortChapters(chapters, tour, order);
+  // Sorted before the delta filter, so a re-review lists chapters in the same order as the whole tour.
+  const chapters = sortChapters(applyMoves(base, tour, moves), tour, order);
+  if (!deltaOnly || !tour.rereview) return chapters;
+  const delta = new Set(tour.rereview.newHunkIds);
+  return chapters.map((c) => ({ ...c, hunkIds: c.hunkIds.filter((id) => delta.has(id)) })).filter((c) => c.hunkIds.length);
 }
 
+// Holds the theme, so changing it never remounts the screens (and loses their state).
 export function App(opts: AppOptions) {
+  const { columns, rows } = useWindowSize();
+  const { palette, preview } = useThemePreview(opts.palette ?? terminalPalette);
+  const [themes, setThemes] = useState<ThemeInfo[] | undefined>(); // the picker is open while set
+  // The theme last chosen, by name: the palette may still be loading when the picker reopens.
+  const committed = useRef(palette.name);
+  const opened = useRef(palette.name); // restored when the picker is cancelled
+  const theme: ThemeControl = {
+    open: !!themes,
+    show: () => {
+      opened.current = committed.current;
+      void themeList().then(setThemes);
+    },
+    popup: (width, height) =>
+      themes ? (
+        <ThemePicker
+          themes={themes}
+          current={opened.current}
+          width={width}
+          height={height}
+          note={opts.saveTheme ? 'enter saves the theme to your config' : 'no config file: enter uses the theme until you quit (gr config saves one)'}
+          onPreview={preview}
+          onDone={(name) => {
+            setThemes(undefined);
+            const chosen = name ?? opened.current;
+            committed.current = chosen;
+            preview(chosen);
+            if (name) opts.saveTheme?.(name);
+          }}
+        />
+      ) : null,
+  };
+  return (
+    <ThemeContext value={palette}>
+      <PreviewingContext value={!!themes && palette.name !== committed.current}>
+        <Box flexDirection="column" width={palette.bg ? columns : undefined} height={palette.bg ? rows : undefined} backgroundColor={palette.bg}>
+          <Screens {...opts} theme={theme} />
+        </Box>
+      </PreviewingContext>
+    </ThemeContext>
+  );
+}
+
+function Screens(opts: AppOptions & { theme: ThemeControl }) {
+  const { theme } = opts;
   const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useWindowSize();
   const store = useMemo(() => new Store(), []);
@@ -97,6 +159,11 @@ export function App(opts: AppOptions) {
   const [pickerNotice, setPickerNotice] = useState<string | undefined>();
   const [newHead, setNewHead] = useState<string | undefined>();
   const [editing, setEditing] = useState<Draft | undefined>();
+  const [editState, setEditState] = useState<ComposerState>();
+  // Recent locations for this PR's session feed @ completion and its recent: filter. A ref:
+  // noting a place must not re-render.
+  const recent = useRef<RecentLocation[]>([]);
+  const repoIndex = useRef<{ key: string; index: RepoIndex } | undefined>(undefined);
   const [confirms, setConfirms] = useState<Record<string, boolean>>({});
   const [prTitle, setPrTitle] = useState<string | undefined>();
   const loadGen = useRef(0);
@@ -160,6 +227,7 @@ export function App(opts: AppOptions) {
       loadAbort.current = abort;
       const { signal } = abort;
       agentSessions.current = {};
+      recent.current = [];
       setPhase('load');
       setPrTitle(undefined);
       setSteps([]);
@@ -269,6 +337,19 @@ export function App(opts: AppOptions) {
     if (!tour) return [];
     return chaptersForOrder(tour, order, moves, deltaOnly);
   }, [tour, order, moves, deltaOnly]);
+  // The whole tour, so a re-review can show the chapters it leaves out, greyed.
+  const allChapters: Chapter[] = useMemo(() => {
+    if (!tour) return [];
+    return deltaOnly ? chaptersForOrder(tour, order, moves, false) : chapters;
+  }, [tour, order, moves, deltaOnly, chapters]);
+
+  // Switch between the new or changed hunks and the whole tour, keeping the current hunk when it is in both.
+  const toggleDelta = () => {
+    if (!tour?.rereview) return;
+    const nextChapters = chaptersForOrder(tour, order, moves, !deltaOnly);
+    setDeltaOnly(!deltaOnly);
+    setPosState(positionAfterOrderChange(chapters, pos, nextChapters));
+  };
 
   const cycleOrder = () => {
     if (!tour) return;
@@ -456,17 +537,41 @@ export function App(opts: AppOptions) {
     exit();
   };
 
+  // q while reviewing: drop the open tour and return to the PR list. A preview has no list,
+  // so there q quits.
+  const back = opts.preview
+    ? undefined
+    : () => {
+        loadGen.current++;
+        loadAbort.current?.abort();
+        setTour(undefined);
+        setSteps([]);
+        setBanner(undefined);
+        setNewHead(undefined);
+        setAnalyzing(undefined);
+        setPhase('pick');
+      };
+
   // ---------- screens ----------
   const width = columns;
   const height = rows;
 
+  // A screen with the theme picker over it while open. The element tree is the same either way,
+  // so opening the picker never remounts the screen and loses its state.
+  const withThemePicker = (screen: (active: boolean) => ReactNode) => (
+    <ReviewPopup background={screen(!theme.open)} width={width} height={height} maxWidth={100} maxHeight={30}>
+      {theme.open ? theme.popup : undefined}
+    </ReviewPopup>
+  );
+
   if (phase === 'pick') {
-    return (
+    return withThemePicker((active) => (
       <PickerScreen
         store={store}
         notice={pickerNotice}
         width={width}
         height={height}
+        active={active}
         onPick={(t) => {
           setPickerNotice(undefined);
           setTarget(t);
@@ -474,12 +579,13 @@ export function App(opts: AppOptions) {
         }}
         downloads={downloads}
         onDownload={startDownloads}
+        onTheme={theme.show}
         onQuit={quit}
       />
-    );
+    ));
   }
   if (phase === 'error') {
-    return <ErrorScreen message={error} onRetry={() => target && void load(target, true)} onQuit={quit} />;
+    return <ErrorScreen message={error} onRetry={() => target && void load(target, true)} onBack={back} onQuit={quit} />;
   }
   const introLines = (spinner: string): IntroLine[] => {
     const shown: IntroLine[] = steps
@@ -492,11 +598,11 @@ export function App(opts: AppOptions) {
       ...shown,
       ...Array.from({ length: INTRO_STEPS - shown.length }, () => ' '),
       ' ',
-      [{ text: 'The briefing opens as soon as it is written · q to quit', dim: true }],
+      [{ text: `The briefing opens as soon as it is written · ${back ? 'q for the PR list · Q to quit' : 'q to quit'}`, dim: true }],
     ];
   };
   if (phase === 'load' || !tour) {
-    return <TourIntro width={width} height={height} lines={introLines} onQuit={quit} />;
+    return <TourIntro width={width} height={height} lines={introLines} onBack={back} onQuit={quit} />;
   }
   const agent =
     tour.mode === 'agent' && worktree
@@ -511,24 +617,65 @@ export function App(opts: AppOptions) {
           },
         }
       : undefined;
+  // Why AI features are off, said in their place.
+  const aiOff = agent
+    ? undefined
+    : opts.noAgent
+      ? 'AI is off for this review (no model in gr config, or --no-agent), so questions are off.'
+      : 'The model is unavailable for this tour, so questions are off. The briefing says why.';
+
+  // One index per checkout and head; its caches never invalidate, so preview mode, where the
+  // working tree changes under it, gets a fresh one for each composer.
+  const indexFor = (): RepoIndex | undefined => {
+    if (!worktree) return undefined;
+    const make = () => new RepoIndex({ root: worktree, headSha: tour.headSha, changedFiles: tour.files.map((f) => f.path) });
+    if (opts.preview) return make();
+    const key = `${worktree}\0${tour.headSha}`;
+    if (repoIndex.current?.key !== key) repoIndex.current = { key, index: make() };
+    return repoIndex.current.index;
+  };
+  const references: ReferenceServices = {
+    host: githubWebHost(),
+    repoIndex: indexFor,
+    recent: () => recent.current,
+    noteRecent: (loc) => {
+      recent.current = pushRecent(recent.current, loc);
+    },
+  };
+  const composerEnv: ComposerEnv = {
+    tour,
+    root: worktree || undefined,
+    host: references.host,
+    agent,
+    generate: generateSuggestion,
+    recent: references.recent,
+    noteRecent: references.noteRecent,
+    repoIndex: indexFor,
+  };
 
   const briefingScreen = (active: boolean) => (
     <BriefingScreen
       tour={tour}
       chapters={chapters}
+      allChapters={allChapters}
       order={order}
       cycleOrder={cycleOrder}
+      deltaOnly={deltaOnly}
+      toggleDelta={toggleDelta}
       states={states}
       analyzing={analyzing}
       agent={agent}
+      aiOff={aiOff}
       width={width}
       height={height}
       active={active}
+      onTheme={theme.show}
       onStart={resume}
       onSubmit={() => {
         setSubmitFrom('briefing');
         setPhase('submit');
       }}
+      onBack={back}
       onQuit={quit}
     />
   );
@@ -536,7 +683,9 @@ export function App(opts: AppOptions) {
     <ChapterScreen
       tour={tour}
       services={services}
+      references={references}
       chapters={chapters}
+      allChapters={allChapters}
       states={states}
       drafts={drafts}
       ci={Math.min(pos.ci, Math.max(0, chapters.length - 1))}
@@ -545,6 +694,7 @@ export function App(opts: AppOptions) {
       deltaOnly={deltaOnly}
       banner={banner ?? (analyzing ? `⟳ ${analyzing}` : undefined)}
       agent={agent}
+      aiOff={aiOff}
       width={width}
       height={height}
       active={active}
@@ -568,10 +718,7 @@ export function App(opts: AppOptions) {
       toggleSplit={() => toggleView('splitDiff', splitDiff, setSplitDiff)}
       hideTestPane={hideTestPane}
       toggleTestPane={() => setHideTestPane((h) => !h)}
-      toggleDelta={() => {
-        setDeltaOnly((d) => !d);
-        setPosState({ ci: 0, hi: 0 });
-      }}
+      toggleDelta={toggleDelta}
       openSubmit={() => {
         setSubmitFrom('chapter');
         setPhase('submit');
@@ -579,20 +726,26 @@ export function App(opts: AppOptions) {
       openBriefing={() => setPhase('briefing')}
       openInClaude={(h, c) => void openInClaude(h, c)}
       rebase={newHead && target ? () => void load(target, false) : undefined}
+      onTheme={theme.show}
+      back={back}
       quit={quit}
     />
   );
   const submitBackground = () => (submitFrom === 'briefing' ? briefingScreen(false) : chapterScreen(false));
-  if (phase === 'briefing') return <ReviewPopup background={briefingScreen(true)} width={width} height={height} maxWidth={104} maxHeight={34} />;
-  if (phase === 'edit' && editing) {
+  if (phase === 'briefing') return withThemePicker(briefingScreen);
+  if (phase === 'edit' && editing && editState) {
     return (
-      <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={96} maxHeight={16}>
-        {(dialogWidth) => (
+      <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={96} maxHeight={editState.ai ? 30 : 16}>
+        {(dialogWidth, dialogHeight) => (
           <CommentEditor
             draft={editing}
             target={editing.anchor.type === 'line' || editing.anchor.type === 'range' ? `${editing.anchor.file}:${editing.anchor.line}` : 'flow'}
             hunk={editing.anchor.type === 'line' || editing.anchor.type === 'range' ? tour.hunks[editing.anchor.hunkId] : undefined}
             width={dialogWidth}
+            aiRows={editState.ai ? Math.max(4, dialogHeight - aiChromeRows(editState, dialogWidth)) : undefined}
+            env={composerEnv}
+            state={editState}
+            setState={(f) => setEditState((s) => (s ? f(s) : s))}
             onCancel={() => setPhase('submit')}
             onSave={(d) => {
               saveDraft(d);
@@ -625,6 +778,7 @@ export function App(opts: AppOptions) {
             height={dialogHeight}
             onEdit={(d) => {
               setEditing(d);
+              setEditState(initComposer(d, { index: indexFor() }));
               setPhase('edit');
             }}
             onDelete={(d) => {
@@ -643,17 +797,18 @@ export function App(opts: AppOptions) {
       </ReviewPopup>
     );
   }
-  return <ReviewPopup background={chapterScreen(true)} width={width} height={height} maxWidth={104} maxHeight={34} />;
+  return withThemePicker(chapterScreen);
 }
 
 // ---------- small screens ----------
 
 const INTRO_STEPS = 6;
 
-function ErrorScreen(props: { message: string; onRetry: () => void; onQuit: () => void }) {
+function ErrorScreen(props: { message: string; onRetry: () => void; onBack?: () => void; onQuit: () => void }) {
   useInput((input) => {
     if (input === 'r') props.onRetry();
-    if (input === 'q') props.onQuit();
+    if (input === 'q') (props.onBack ?? props.onQuit)();
+    if (input === 'Q') props.onQuit();
   });
   return (
     <Box flexDirection="column" paddingX={1}>
@@ -661,7 +816,7 @@ function ErrorScreen(props: { message: string; onRetry: () => void; onQuit: () =
         Could not open the tour
       </Text>
       <Text>{props.message}</Text>
-      <Text dimColor>r: retry · q: quit</Text>
+      <Text dimColor>r: retry · {props.onBack ? 'q: PR list · Q: quit' : 'q: quit'}</Text>
     </Box>
   );
 }

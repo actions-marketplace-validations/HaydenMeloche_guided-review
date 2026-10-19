@@ -1,11 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Box, Text, useInput } from 'ink';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useInput } from 'ink';
+import { Box, Text, usePreviewing, useTheme } from './themed.js';
+import { SURFACES } from './theme.js';
 import type { Chapter, ChapterOrder, DiffFile, DiffLine, Draft, DraftAnchor, ExistingThread, Hunk, ReactionContent, ReadState, TestLink, ThreadComment, Tour } from '../types.js';
 import { MdLineView, line, renderMarkdown, restyle, type MdLine } from './markdown.js';
 import { ChecklistPanel } from './Panels.js';
 import { changedLineCount, chapterState, ORDER_LABEL, pad, progress, riskMark, stateMark, stateOf, truncate, wrap, type States } from './nav.js';
 import { DiagramView } from './DiagramView.js';
-import { CommentEditor, LABEL_COLOR } from './CommentEditor.js';
+import { CommentEditor, LABEL_COLOR, type SetComposer } from './CommentEditor.js';
+import { INLINE_ROWS, inlineComposerSlot } from './AiSuggestion.js';
 import { ThreadView } from './ThreadView.js';
 import { AskOverlay } from './AskOverlay.js';
 import { highlightDiffLines, highlightSourceLines, type HunkHighlights, type SyntaxSpan } from './highlight.js';
@@ -18,6 +21,11 @@ import { foldedLines, pairChangedLines, wordDiff, type CharRange, type Fold } fr
 import { isSpecialKind } from '../analysis/special.js';
 import { safeReadFile } from '../analysis/safeRead.js';
 import { fileLines, headFor, withContext } from '../diff/context.js';
+import { KeyBar } from './KeyBar.js';
+import { initComposer, isLineAnchor, sameAnchor, type ComposerEnv, type ComposerState, type ReferenceServices } from './composer.js';
+import { generateSuggestion } from '../agent/suggest.js';
+
+export { KeyBar };
 
 export type AgentCtx = AgentContext;
 
@@ -67,6 +75,7 @@ const LINK_TEXT = { coverage: 'coverage run', 'name-match': 'name match', naming
 export function ChapterScreen(props: {
   tour: Tour;
   chapters: Chapter[];
+  allChapters?: Chapter[]; // the whole tour; a re-review greys the chapters `chapters` leaves out
   states: States;
   drafts: Draft[];
   ci: number;
@@ -75,6 +84,7 @@ export function ChapterScreen(props: {
   deltaOnly: boolean;
   banner?: string;
   agent?: AgentCtx;
+  aiOff?: string; // why the agent is absent
   width: number;
   height: number;
   active?: boolean;
@@ -97,7 +107,10 @@ export function ChapterScreen(props: {
   openBriefing: () => void;
   openInClaude: (h: Hunk | undefined, chapter: Chapter) => void;
   rebase?: () => void;
+  onTheme?: () => void; // L: the color theme picker
   services?: Services;
+  references?: ReferenceServices; // recent locations, repo index; tests may leave it out
+  back?: () => void; // q: back to the PR list; unset, q quits
   quit: () => void;
 }) {
   const { tour, chapters, states, ci, hi, width, height } = props;
@@ -140,6 +153,10 @@ export function ChapterScreen(props: {
   const wantSplit = props.splitDiff ?? ownSplit;
   const [ownHideTests, setOwnHideTests] = useState(false);
   const hideTests = props.hideTestPane ?? ownHideTests;
+  // The open composer's working state (see composer.ts).
+  const ev = props.references;
+  const [composer, setComposer] = useState<ComposerState>();
+  const setComposerState: SetComposer = (f) => setComposer((c) => (c ? f(c) : c));
   // The pipeline fills tour.mentionUsers only if the collaborator list arrived in time; fetch it
   // (memoized in gh.ts) the first time an editor that offers @mentions opens.
   const [lateMentions, setLateMentions] = useState<string[]>();
@@ -195,7 +212,10 @@ export function ChapterScreen(props: {
   );
   // A split diff too narrow to read beside the tests stacks them instead: t still opens them.
   const testsStacked = roomForTests && hasLinkedTests && !hideTests && wantSplit && paneWidths.source < MIN_SPLIT_WIDTH;
-  const sideBySide = roomForTests && hasLinkedTests && !hideTests && !testsStacked;
+  // While the comment's @ list is open the pane holding it takes the full width, so the list
+  // and its code preview sit side by side; the other pane comes back when the list closes.
+  const listWide = overlay === 'comment' && !!composer?.listOpen;
+  const sideBySide = roomForTests && hasLinkedTests && !hideTests && !testsStacked && !listWide;
   // Stacked, only one pane shows at a time, so whichever is visible gets the full width.
   const srcWidth = sideBySide ? paneWidths.source : mainWidth;
   const testWidth = sideBySide ? paneWidths.test : mainWidth;
@@ -267,7 +287,21 @@ export function ChapterScreen(props: {
   const prog = useMemo(() => progress(tour, states), [tour, states]);
   const delta = useMemo(() => new Set(tour.rereview?.newHunkIds ?? []), [tour.rereview]);
   const filesByPath = useMemo(() => new Map(tour.files.map((f) => [f.path, f])), [tour.files]);
-  const chapterStrip = useMemo(() => (wide ? '' : chapters.map((c, i) => (i === ci ? `[${c.title}]` : stateMark(chapterState(tour, c, states)).mark)).join(' ')), [wide, chapters, ci, tour, states]);
+  // On a re-review showing only changes, the chapter list keeps the whole tour and greys what it leaves out.
+  const listed = props.deltaOnly && props.allChapters ? props.allChapters : chapters;
+  const unchangedHunks = props.deltaOnly && chapter ? (props.allChapters?.find((c) => c.id === chapter.id)?.hunkIds.length ?? 0) - chapter.hunkIds.length : 0;
+  const chapterStrip = useMemo(
+    () =>
+      wide
+        ? ''
+        : listed
+            .map((c) => {
+              const shown = chapters.find((d) => d.id === c.id);
+              return c.id === chapter?.id ? `[${c.title}]` : shown ? stateMark(chapterState(tour, shown, states)).mark : '·';
+            })
+            .join(' '),
+    [wide, listed, chapters, chapter?.id, tour, states],
+  );
 
   // ---------- navigation ----------
   const firstHunk = (c: number) => (chapters[c]?.collapsed ? -1 : 0);
@@ -369,6 +403,7 @@ export function ChapterScreen(props: {
     props.saveDraft(d);
     setAnchor(null);
     setOverlay('none');
+    setComposer(undefined);
     setFlash(`Draft ${edited ? 'updated' : 'saved'} (${d.label}). Nothing posts until you submit.`);
   };
 
@@ -378,6 +413,35 @@ export function ChapterScreen(props: {
     if (a.type === 'range') return `${a.file}:${a.startLine}-${a.line}`;
     if (a.type === 'chapter') return `flow "${chapters.find((c) => c.id === a.chapterId)?.title ?? a.chapterId}"`;
     return `diagram node "${chapter?.diagram?.nodes.find((n) => n.id === a.nodeId)?.label ?? a.nodeId}"`;
+  };
+
+  // ---------- references: composer, recent locations ----------
+  const noteRecent = useRef(ev?.noteRecent);
+  noteRecent.current = ev?.noteRecent;
+  // A line the reader stays on for a second is a recent location.
+  const dwellPath = testFocus ? testFile : hunk?.file;
+  const dwellLine = testFocus ? testCodeLines[testCursor]?.newLine : cursorLine?.kind !== 'del' ? cursorLine?.newLine : undefined;
+  useEffect(() => {
+    if (!dwellPath || dwellLine === undefined) return;
+    const t = setTimeout(() => noteRecent.current?.({ path: dwellPath, line: dwellLine, why: testFocus ? 'test' : 'dwell' }), 1000);
+    return () => clearTimeout(t);
+  }, [dwellPath, dwellLine, testFocus]);
+
+  const composerEnv: ComposerEnv = {
+    tour,
+    root: svc?.root,
+    host: ev?.host ?? 'github.com',
+    agent: props.agent,
+    generate: ev?.generate ?? generateSuggestion,
+    recent: ev?.recent,
+    noteRecent: ev?.noteRecent,
+    repoIndex: ev?.repoIndex,
+  };
+  const openComposer = (d: Draft) => {
+    setPending(d);
+    setComposer(initComposer(d, { index: ev?.repoIndex?.() }));
+    setOverlay('comment');
+    if (isLineAnchor(d.anchor)) noteRecent.current?.({ path: d.anchor.file, line: d.anchor.line, why: 'comment' });
   };
 
   // ---------- input ----------
@@ -408,11 +472,11 @@ export function ChapterScreen(props: {
               candidate.file === testFile && candidate.lines.some((l) => !l.expanded && (side === 'LEFT' ? l.kind !== 'add' && l.oldLine === lineNo : l.kind !== 'del' && l.newLine === lineNo)),
           );
           if (!target || lineNo === undefined || !testFile) return setFlash('This test line is outside the PR diff, so GitHub cannot attach a line comment.');
-          setPending(newDraft({ type: 'line', hunkId: target.id, file: testFile, line: lineNo, side }));
-          return setOverlay('comment');
+          return openComposer(newDraft({ type: 'line', hunkId: target.id, file: testFile, line: lineNo, side }));
         }
         if (input === '?') return setOverlay('ask');
-        if (input === 'q') return props.quit();
+        if (input === 'q') return (props.back ?? props.quit)();
+        if (input === 'Q') return props.quit();
         return;
       }
       if (collapsedView) {
@@ -466,8 +530,7 @@ export function ChapterScreen(props: {
         const a = lineAnchor(hunk);
         if (!a && anchorLines(hunk).length === 0) return setFlash('This is context outside the PR’s diff: GitHub can’t take a comment on it.');
         if (!a) return setFlash('Nothing to anchor a comment to here.');
-        setPending(newDraft(a));
-        return setOverlay('comment');
+        return openComposer(newDraft(a));
       }
       if (input === 'y' && hunk && props.replyToThread) {
         if (!cursorThreads.length) return setFlash('No review thread on this line. Move to a commented line and press y.');
@@ -479,18 +542,17 @@ export function ChapterScreen(props: {
       }
       if (input === 'E' && hunk) {
         if (!cursorDraft) return setFlash('No draft on this line. Move to a line with ✎ and press E.');
-        setPending(cursorDraft);
-        return setOverlay('comment');
+        return openComposer(cursorDraft);
       }
       if (input === 'X' && hunk) {
         if (!cursorDraft) return setFlash('No draft on this line. Move to a line with ✎ and press X.');
         return setOverlay('delete');
       }
-      if (input === 'C' && chapter) {
-        setPending(newDraft({ type: 'chapter', chapterId: chapter.id }));
-        return setOverlay('comment');
+      if (input === 'C' && chapter) return openComposer(newDraft({ type: 'chapter', chapterId: chapter.id }));
+      if (input === '?') {
+        if (hunk && cursorLine?.newLine !== undefined) noteRecent.current?.({ path: hunk.file, line: cursorLine.newLine, why: 'ask' });
+        return collapsedView || hunk ? setOverlay('ask') : setFlash('Nothing to ask about here.');
       }
-      if (input === '?') return collapsedView || hunk ? setOverlay('ask') : setFlash('Nothing to ask about here.');
       if (input === 'd') return chapter?.diagram || tour.overview ? setOverlay('diagram') : setFlash('No diagram for this chapter.');
       if (input === 'm' && hunk) {
         setMoveSel(ci);
@@ -506,7 +568,9 @@ export function ChapterScreen(props: {
         if (!chapter?.checklist?.length) return setFlash('No team checklist applies to this chapter (.guided-review.json → checklists).');
         return svc ? setOverlay('checklist') : setFlash('The checklist opens once the checkout is ready.');
       }
-      if (input === 'q') return props.quit();
+      if (input === 'L' && props.onTheme) return props.onTheme();
+      if (input === 'q') return (props.back ?? props.quit)();
+      if (input === 'Q') return props.quit();
     },
     { isActive: props.active !== false && overlay === 'none' },
   );
@@ -550,7 +614,12 @@ export function ChapterScreen(props: {
             ['D', 'whole tour'],
             ['s', 'submit'],
             ['b', 'briefing'],
-            ['q', 'quit'],
+            ...((props.back
+              ? [
+                  ['q', 'PR list'],
+                  ['Q', 'quit'],
+                ]
+              : [['q', 'quit']]) as [string, string][]),
           ]}
         />
       </Box>
@@ -559,12 +628,8 @@ export function ChapterScreen(props: {
 
   // The key bar shows only keys that do something here, most useful first; the rest are under h.
   const barKeys = (): [string, string][] => {
-    if (testFocus)
-      return [
-        ['n/p', 'test'],
-        ['c', 'comment'],
-        ['?', 'ask'],
-      ];
+    const ask: [string, string][] = props.agent ? [['?', 'ask']] : [];
+    if (testFocus) return [['n/p', 'test'], ['c', 'comment'], ...ask];
     const submit: [string, string][] = prog.read + prog.skipped === prog.total ? [['s', 'submit']] : [];
     if (collapsedView) return [...submit, ['enter', 'expand'], ['n/p', 'next/prev'], ['C', 'comment on flow'], ['x', 'skip chapter'], [']/[', 'chapter']];
     const selecting = anchor !== null;
@@ -579,7 +644,7 @@ export function ChapterScreen(props: {
             ['X', 'delete draft'],
           ] as [string, string][])
         : []),
-      ['?', 'ask'],
+      ...ask,
       ['v', selecting ? 'end range' : 'range'],
       [']/[', 'chapter'],
       ...(showTests ? ([['t', 'tests']] as [string, string][]) : []),
@@ -605,7 +670,6 @@ export function ChapterScreen(props: {
     const open = chapter.checklist.filter((c) => !svc?.confirms[c.id]).length;
     if (open) chapterNotes.push(`Team checklist: ${open} item(s) to confirm (i). ${chapter.checklist.filter((c) => c.status === 'fail').length} flagged by the agent.`);
   }
-  if (hunk && hunk.risk >= 2 && hunk.riskReasons.length > 1) chapterNotes.push(`Risk: ${hunk.riskReasons.join('; ')}`);
 
   // Linked tests that are not beside the code (a narrow terminal, T, or a split diff) get a tab
   // saying they are there and how to open them.
@@ -648,7 +712,10 @@ export function ChapterScreen(props: {
   const explainRows = explainLines.length ? explainLines.length + 3 : 0; // title + top/bottom border
   const bodyHeight = Math.max(6, avail - explainRows);
   const codeWidth = srcWidth;
-  const lineComment = overlay === 'comment' && pending && (pending.anchor.type === 'line' || pending.anchor.type === 'range');
+  // The composer sits under the commented line, growing while its AI line is open. Its state is
+  // ours, so it survives moving between the inline slot and the popup.
+  const editAnchor = composer?.anchor ?? pending?.anchor;
+  const lineComment = overlay === 'comment' && pending && editAnchor && isLineAnchor(editAnchor);
   const inlineSourceComment = lineComment && !testFocus;
   const inlineTestComment = lineComment && testFocus;
   const threadHeight = Math.min(Math.max(6, bodyHeight - 2), Math.max(8, Math.floor(bodyHeight * 0.7)));
@@ -667,30 +734,11 @@ export function ChapterScreen(props: {
             if (c >= 0) props.setPos(c, chapters[c].hunkIds.indexOf(hid));
             setOverlay('none');
           }}
-          onComment={(nodeId) => {
-            setPending(newDraft({ type: 'node', chapterId: chapter.id, nodeId }));
-            setOverlay('comment');
-          }}
+          onComment={(nodeId) => openComposer(newDraft({ type: 'node', chapterId: chapter.id, nodeId }))}
         />
       );
     }
-    if (overlay === 'comment' && pending && !inlineSourceComment && !inlineTestComment) {
-      const selText = selectedCode();
-      return (
-        <CommentEditor
-          draft={pending}
-          target={safe(describeAnchor(pending))}
-          hunk={pending.anchor.type === 'line' || pending.anchor.type === 'range' ? tour.hunks[pending.anchor.hunkId] : undefined}
-          selectedText={selText}
-          width={mainWidth}
-          mentions={mentions}
-          onCancel={() => setOverlay('none')}
-          onSave={(d) => {
-            saveDraft(d);
-          }}
-        />
-      );
-    }
+    if (overlay === 'comment' && pending && !inlineSourceComment && !inlineTestComment) return commentEditor(mainWidth, height - headerRows - footerRows);
     if (overlay === 'move') {
       return (
         <Box flexDirection="column" borderStyle="round" paddingX={1}>
@@ -710,24 +758,34 @@ export function ChapterScreen(props: {
     return null;
   })();
 
-  const commentEditor = (w: number) => {
-    if (!pending) return null;
-    const selText = selectedCode();
+  // The inline composer under a source or test line, `w` wide in a `pane` rows tall.
+  const inlineComposer = (w: number, pane: number) => {
+    const slot = inlineComposerSlot(composer, tour, pane, w);
+    return { node: commentEditor(w, INLINE_ROWS, slot.aiRows, slot.listRows), height: slot.height };
+  };
+
+  function commentEditor(w: number, h: number, aiRows?: number, listRows?: number) {
+    if (!pending || !composer) return null;
+    const a = composer.anchor;
     return (
       <CommentEditor
         draft={pending}
-        target={safe(describeAnchor(pending))}
-        hunk={pending.anchor.type === 'line' || pending.anchor.type === 'range' ? tour.hunks[pending.anchor.hunkId] : hunk}
-        selectedText={selText}
+        target={safe(describeAnchor({ ...pending, anchor: a }))}
+        hunk={isLineAnchor(a) ? tour.hunks[a.hunkId] : hunk}
+        selectedText={sameAnchor(a, pending.anchor) ? selectedCode() : undefined}
         width={w}
+        height={h}
         mentions={mentions}
+        env={composerEnv}
+        state={composer}
+        setState={setComposerState}
+        aiRows={aiRows}
+        listRows={listRows}
         onCancel={() => setOverlay('none')}
-        onSave={(d) => {
-          saveDraft(d);
-        }}
+        onSave={saveDraft}
       />
     );
-  };
+  }
 
   const askHeight = Math.min(14, Math.max(5, bodyHeight - 2));
   const askTestLine = testCodeLines[testCursor];
@@ -746,6 +804,7 @@ export function ChapterScreen(props: {
               : `chapter "${chapter.title}"`
         }
         agent={props.agent}
+        aiOff={props.aiOff}
         width={testFocus ? testWidth - (sideBySide ? 3 : 1) : hunk ? codeWidth - 1 : mainWidth}
         height={askHeight}
         onClose={() => setOverlay('none')}
@@ -781,12 +840,12 @@ export function ChapterScreen(props: {
         </Text>
       ) : null}
       <Box flexDirection="row">
-        {wide ? <ChapterList tour={tour} chapters={chapters} states={states} ci={ci} width={listWidth} height={height - headerRows - footerRows} /> : null}
+        {wide ? <ChapterList tour={tour} chapters={chapters} listed={listed} states={states} current={chapter.id} width={listWidth} height={height - headerRows - footerRows} /> : null}
         {wide ? <Box width={1} /> : null}
         <Box flexDirection="column" width={mainWidth}>
           {overlayNode ?? (
             <>
-              <ChapterTitle chapter={chapter} hunk={hunk} hi={hi} isNew={!!hunk && delta.has(hunk.id)} width={mainWidth} states={states} drawer={testDrawer} />
+              <ChapterTitle chapter={chapter} hunk={hunk} hi={hi} isNew={!!hunk && delta.has(hunk.id)} unchanged={unchangedHunks} width={mainWidth} states={states} drawer={testDrawer} />
               {explainLines.length ? (
                 <Box flexDirection="column" flexShrink={0} borderStyle="round" borderColor={hunk?.narrationInferred ? 'gray' : 'blue'} paddingX={1} width={mainWidth}>
                   <Text bold color={hunk?.narrationInferred ? 'gray' : 'blue'}>
@@ -825,7 +884,7 @@ export function ChapterScreen(props: {
                               height: threadHeight,
                             }
                           : inlineSourceComment
-                            ? { afterIdx: selRange()[1], node: commentEditor(codeWidth - 1), height: 11 }
+                            ? { afterIdx: selRange()[1], ...inlineComposer(codeWidth - 1, bodyHeight) }
                             : askPanel && !testFocus
                               ? { afterIdx: selRange()[1], node: askPanel, height: askHeight }
                               : undefined
@@ -874,7 +933,7 @@ export function ChapterScreen(props: {
                         scroll={testScroll}
                         setScroll={setTestScroll}
                         focused={testFocus}
-                        inline={inlineTestComment ? { node: commentEditor(testWidth - 3), height: 11 } : testFocus && overlay === 'ask' ? { node: askPanel, height: askHeight } : undefined}
+                        inline={inlineTestComment ? inlineComposer(testWidth - 3, bodyHeight - 1) : testFocus && overlay === 'ask' ? { node: askPanel, height: askHeight } : undefined}
                         width={testWidth - 2}
                         height={bodyHeight - 1}
                       />
@@ -888,7 +947,7 @@ export function ChapterScreen(props: {
                       scroll={testScroll}
                       setScroll={setTestScroll}
                       focused={testFocus}
-                      inline={inlineTestComment ? { node: commentEditor(testWidth - 1), height: 11 } : testFocus && overlay === 'ask' ? { node: askPanel, height: askHeight } : undefined}
+                      inline={inlineTestComment ? inlineComposer(testWidth - 1, bodyHeight) : testFocus && overlay === 'ask' ? { node: askPanel, height: askHeight } : undefined}
                       width={testWidth}
                       height={bodyHeight}
                     />
@@ -919,10 +978,7 @@ export function ChapterScreen(props: {
                   ['t/esc', 'back to code'],
                   ['b', 'briefing'],
                 ]
-              : [
-                  ['b', 'briefing'],
-                  ['h', 'all keys'],
-                ]
+              : [...((tour.rereview ? [['D', props.deltaOnly ? 'full review' : 'changes only']] : []) as [string, string][]), ['b', 'briefing'], ['h', 'all keys']]
         }
         keys={overlay !== 'none' ? [] : barKeys()}
       />
@@ -932,7 +988,7 @@ export function ChapterScreen(props: {
   if (overlay === 'help')
     return (
       <ReviewPopup background={screen} width={width} height={height} maxWidth={HELP_WIDTH} maxHeight={HELP_ROWS.length + 4}>
-        {(w, h) => <Help width={w} height={h} />}
+        {(w, h) => <Help width={w} height={h} ai={!!props.agent} />}
       </ReviewPopup>
     );
   return screen;
@@ -945,30 +1001,49 @@ const Header = React.memo(function Header(props: { tour: Tour; prog: ReturnType<
   const barW = 16;
   const filled = prog.totalLines ? Math.round((prog.readLines / prog.totalLines) * barW) : barW;
   const meter = '█'.repeat(filled) + '░'.repeat(barW - filled);
-  const right = `${meter} ${prog.readLines}/${prog.totalLines} lines · ${prog.read + prog.skipped}/${prog.total} hunks${props.deltaOnly ? ' · delta' : ''} · ${ORDER_LABEL[props.order]} order`;
+  const right = `${meter} ${prog.readLines}/${prog.totalLines} lines · ${prog.read + prog.skipped}/${prog.total} hunks · ${ORDER_LABEL[props.order]} order`;
+  // A re-review says which hunks it is showing, so the hidden ones are never a surprise.
+  const badge = !tour.rereview ? '' : props.deltaOnly ? 'changes only' : 'full review';
+  const repo = `${safe(tour.repo)} `;
   const left = `#${tour.pr} ${safe(tour.title)}`;
   return (
     <Text wrap="truncate">
-      <Text bold>{pad(left, Math.max(10, width - right.length - 1))}</Text> <Text color="green">{meter}</Text>
+      <Text color="cyan" bold>
+        {repo}
+      </Text>
+      <Text bold>{pad(left, Math.max(10, width - right.length - repo.length - (badge ? badge.length + 1 : 0) - 1))}</Text>{' '}
+      {badge ? (
+        <>
+          <Text color={props.deltaOnly ? 'yellow' : 'cyan'} bold>
+            {badge}
+          </Text>{' '}
+        </>
+      ) : null}
+      <Text color="green">{meter}</Text>
       <Text dimColor>{right.slice(barW)}</Text>
     </Text>
   );
 });
 
-const ChapterList = React.memo(function ChapterList(props: { tour: Tour; chapters: Chapter[]; states: States; ci: number; width: number; height: number }) {
-  const { tour, chapters, states, ci, width } = props;
-  const start = Math.max(0, Math.min(ci - Math.floor(props.height / 2), chapters.length - props.height));
+// `listed` is every chapter to show; one not in `chapters` (left out of a re-review) is greyed.
+const ChapterList = React.memo(function ChapterList(props: { tour: Tour; chapters: Chapter[]; listed: Chapter[]; states: States; current: string; width: number; height: number }) {
+  const { tour, chapters, listed, states, current, width } = props;
+  const at = listed.findIndex((c) => c.id === current);
+  const start = Math.max(0, Math.min(at - Math.floor(props.height / 2), listed.length - props.height));
   return (
     <Box flexDirection="column" width={width}>
-      {chapters.slice(start, start + props.height).map((c, k) => {
-        const i = start + k;
+      {listed.slice(start, start + props.height).map((full) => {
+        const shown = chapters.find((d) => d.id === full.id);
+        const unchanged = !shown;
+        const c = shown ?? full;
+        const here = c.id === current;
         const st = stateMark(chapterState(tour, c, states));
         const rk = riskMark(Math.max(0, ...c.hunkIds.map((id) => tour.hunks[id]?.risk ?? 0)));
         const p = progress(tour, states, c.hunkIds);
         return (
-          <Text key={c.id} inverse={i === ci} dimColor={c.collapsed && i !== ci}>
-            <Text color={st.color}>{st.mark}</Text>
-            <Text color={rk.color}>{rk.mark}</Text> {pad(safe(c.title), width - 9)}
+          <Text key={c.id} inverse={here} dimColor={unchanged || (c.collapsed && !here)}>
+            <Text color={unchanged ? undefined : st.color}>{st.mark}</Text>
+            <Text color={unchanged ? undefined : rk.color}>{rk.mark}</Text> {pad(safe(c.title), width - 9)}
             <Text dimColor>{c.optional ? ' opt ' : `${String(p.read + p.skipped).padStart(2)}/${String(p.total).padEnd(2)}`}</Text>
           </Text>
         );
@@ -978,12 +1053,12 @@ const ChapterList = React.memo(function ChapterList(props: { tour: Tour; chapter
 });
 
 // `drawer`: a hint at the right end of the title row for linked tests that are not on screen.
-const ChapterTitle = React.memo(function ChapterTitle(props: { chapter: Chapter; hunk?: Hunk; hi: number; isNew: boolean; width: number; states: States; drawer?: string }) {
+const ChapterTitle = React.memo(function ChapterTitle(props: { chapter: Chapter; hunk?: Hunk; hi: number; isNew: boolean; unchanged?: number; width: number; states: States; drawer?: string }) {
   const { chapter, hunk, hi } = props;
-  const rk = riskMark(hunk ? hunk.risk : chapter.risk);
   const cov = hunk ? COVERAGE[hunk.coverage] : undefined;
   const st = hunk ? stateMark(stateOf(props.states, hunk)) : undefined;
-  const orphan = hunk ? chapter.orphanReasons[hunk.id] : undefined;
+  // A deleted file's hunk has no new lines: point at where it was.
+  const location = hunk ? `${hunk.file}:${hunk.newStart || hunk.oldStart}` : '';
   return (
     <Box flexDirection="column" flexShrink={0}>
       <Box width={props.width}>
@@ -999,6 +1074,7 @@ const ChapterTitle = React.memo(function ChapterTitle(props: { chapter: Chapter;
                 · hunk {hi + 1}/{chapter.hunkIds.length}
               </Text>
             ) : null}
+            {props.unchanged ? <Text dimColor> · {props.unchanged} unchanged hidden</Text> : null}
           </Text>
         </Box>
         {props.drawer ? (
@@ -1019,22 +1095,14 @@ const ChapterTitle = React.memo(function ChapterTitle(props: { chapter: Chapter;
               NEW{' '}
             </Text>
           ) : null}
-          <Text>{truncate(` ${hunk.file}:${hunk.newStart}`, 60)}</Text>
-          {hunk.symbols.length ? <Text dimColor> {truncate(hunk.symbols.join(', '), 30)}</Text> : null}
+          <Text> {safe(location)}</Text>
           {cov && cov.text ? (
             <Text color={cov.color}>
               {'  '}
               {cov.mark} {cov.text}
             </Text>
           ) : null}
-          {hunk.risk >= 2 ? (
-            <Text color={rk.color}>
-              {'  '}
-              {rk.mark} {truncate(hunk.riskReasons[0] ?? 'risky', 40)}
-            </Text>
-          ) : null}
-          {hunk.importOnly ? <Text dimColor> imports only · optional</Text> : null}
-          {orphan ? <Text dimColor> — {safe(orphan)}</Text> : null}
+          {hunk.importOnly ? <Text dimColor> · imports only · optional</Text> : null}
         </Text>
       ) : (
         <Text dimColor>{chapter.collapsed ? `${chapter.hunkIds.length} hunk(s), collapsed${chapter.optional ? ' · optional: not counted toward progress' : ''}` : ''}</Text>
@@ -1048,29 +1116,65 @@ function threadAt(threads: ExistingThread[], file: string, line?: number, side: 
   return threads.filter((t) => t.path === file && (side === 'LEFT' ? t.isOutdated && t.originalLine === line : t.line === line || (t.line === undefined && !t.isOutdated && t.originalLine === line)));
 }
 
+// Two moved blocks at most this many lines apart on both sides, going to the same place in the
+// same way, are one move split by a small edit and share one note.
+const SPLIT_GAP = 4;
+
+const movedNotes = new WeakMap<Hunk, Map<number, string>>();
+
 // Under the last line of a block moved within the PR: where the block was, or went, and how.
 function movedNote(hunk: Hunk, j: number): string | undefined {
-  const l = hunk.lines[j];
-  // Lines k and k + 1 are one block when both moved, alike, to consecutive lines of one file.
-  const joined = (k: number) => {
-    const [a, b] = [hunk.lines[k]?.moved, hunk.lines[k + 1]?.moved];
-    return !!a && !!b && hunk.lines[k].kind === hunk.lines[k + 1].kind && a.file === b.file && b.line === a.line + 1 && a.kind === b.kind && a.indent === b.indent;
-  };
-  if (!l.moved || joined(j)) return undefined;
-  let first = j;
-  while (joined(first - 1)) first--;
-  const at = hunk.lines[first].moved!;
-  const where = (p: { file: string; line: number }) => (p.file === hunk.file ? `line ${p.line}` : `${safe(p.file)}:${p.line}`);
-  const lines = `${j - first + 1} line${j === first ? '' : 's'}`;
-  const indent = at.indent ? `indent ${at.indent > 0 ? '+' : '−'}${Math.abs(at.indent)}` : '';
-  if (at.kind === 'reindented') return `↔ ${lines} re-indented in place${indent ? ` (${indent})` : ''}, ${l.kind === 'del' ? 'now' : 'was'} ${where(at)}`;
-  const also = (side: 'add' | 'del') => {
-    const places = at.also.filter((p) => p.side === side);
-    if (!places.length) return '';
-    const shown = places.slice(0, 2).map(where).join(', ');
-    return `; also ${side === 'add' ? 'added' : 'removed'} at ${shown}${places.length > 2 ? ` and ${places.length - 2} more` : ''}`;
-  };
-  return `↕ ${lines} ${at.kind} ${l.kind === 'del' ? 'to' : 'from'} ${where(at)}${indent ? `, ${indent}` : ''}${also('add')}${also('del')}`;
+  let notes = movedNotes.get(hunk);
+  if (!notes) movedNotes.set(hunk, (notes = notesFor(hunk)));
+  return notes.get(j);
+}
+
+// The move notes of a hunk, by the index of the line each goes under.
+function notesFor(hunk: Hunk): Map<number, string> {
+  const ls = hunk.lines;
+  const alike = (a: DiffLine, b: DiffLine) => a.kind === b.kind && a.moved!.file === b.moved!.file && a.moved!.kind === b.moved!.kind && a.moved!.indent === b.moved!.indent;
+  // Runs of lines moved alike to consecutive lines of one file.
+  const blocks: [number, number][] = [];
+  ls.forEach((l, k) => {
+    const last = blocks.at(-1);
+    if (!l.moved) return;
+    if (last && last[1] === k - 1 && alike(ls[k - 1], l) && l.moved.line === ls[k - 1].moved!.line + 1) last[1] = k;
+    else blocks.push([k, k]);
+  });
+  // Blocks a small edit apart, landing in order a few lines apart, as one note.
+  const groups: [number, number][][] = [];
+  for (const b of blocks) {
+    const prev = groups.at(-1)?.at(-1);
+    const between = prev ? ls.slice(prev[1] + 1, b[0]) : [];
+    const [p, q] = prev ? [ls[prev[1]], ls[b[0]]] : [];
+    const split = prev && between.length <= SPLIT_GAP && alike(p!, q!) && q!.moved!.line > p!.moved!.line && q!.moved!.line - p!.moved!.line - 1 <= SPLIT_GAP;
+    if (split) groups.at(-1)!.push(b);
+    else groups.push([b]);
+  }
+  const notes = new Map<number, string>();
+  for (const g of groups) {
+    const [first, last] = [g[0][0], g.at(-1)![1]];
+    const l = ls[last];
+    const at = ls[first].moved!;
+    const n = g.reduce((t, [a, b]) => t + b - a + 1, 0);
+    const other = last - first + 1 - n;
+    const where = (p: { file: string; line: number }) => (p.file === hunk.file ? `line ${p.line}` : `${safe(p.file)}:${p.line}`);
+    const lines = `${n} line${n === 1 ? '' : 's'}`;
+    const gap = other ? `, split by ${other} other line${other === 1 ? '' : 's'}` : '';
+    const indent = at.indent ? `indent ${at.indent > 0 ? '+' : '−'}${Math.abs(at.indent)}` : '';
+    if (at.kind === 'reindented') {
+      notes.set(last, `↔ ${lines} re-indented in place${indent ? ` (${indent})` : ''}, ${l.kind === 'del' ? 'now' : 'was'} ${where(at)}${gap}`);
+      continue;
+    }
+    const also = (side: 'add' | 'del') => {
+      const places = at.also.filter((p) => p.side === side);
+      if (!places.length) return '';
+      const shown = places.slice(0, 2).map(where).join(', ');
+      return `; also ${side === 'add' ? 'added' : 'removed'} at ${shown}${places.length > 2 ? ` and ${places.length - 2} more` : ''}`;
+    };
+    notes.set(last, `↕ ${lines} ${at.kind} ${l.kind === 'del' ? (at.kind === 'merged' ? 'into' : 'to') : 'from'} ${where(at)}${indent ? `, ${indent}` : ''}${gap}${also('add')}${also('del')}`);
+  }
+  return notes;
 }
 
 function draftsAt(drafts: Draft[], hunk: Hunk, line?: number, side: 'LEFT' | 'RIGHT' = 'RIGHT') {
@@ -1101,8 +1205,8 @@ function SyntaxText(props: { text: string; spans?: SyntaxSpan[]; column?: number
   return <Text>{parts}</Text>;
 }
 
-const DIFF_BACKGROUND = { add: '#173B2A', del: '#42262C', ctx: undefined } as const;
-const WORD_BACKGROUND = { add: '#2B6B47', del: '#7A3442', ctx: undefined } as const;
+const DIFF_BACKGROUND = { add: SURFACES.lineAdd, del: SURFACES.lineDel, ctx: undefined } as const;
+const WORD_BACKGROUND = { add: SURFACES.wordAdd, del: SURFACES.wordDel, ctx: undefined } as const;
 
 const SourcePane = React.memo(function SourcePane(props: {
   inline?: { afterIdx: number; node: React.ReactNode; height: number }; // comment editor under the selected line
@@ -1128,25 +1232,28 @@ const SourcePane = React.memo(function SourcePane(props: {
   // Highlights depend on the hunk's identity and the shas, not on the hunk object: a tour
   // update hands every hunk a new object, and that must not re-read and re-tokenize the file.
   const request = { hunk, root: props.root, headSha: props.headSha, baseSha: props.baseSha };
-  const key = hunkHighlightKey(request);
-  const [state, setState] = useState<{ key: string; value?: HunkHighlights }>(() => ({ key, value: peekHunkHighlights(request)?.value }));
-  const cached = state.key === key ? undefined : peekHunkHighlights(request);
-  if (cached && state.key !== key) setState({ key, value: cached.value });
-  const highlights = state.key === key ? state.value : undefined;
-  const latest = React.useRef(request);
-  latest.current = request;
+  const { syntax } = useTheme(); // a theme change re-renders with a new key
+  const previewing = usePreviewing();
+  const key = hunkHighlightKey(request, syntax);
+  const hunkKey = hunkHighlightKey(request, ''); // the same hunk in any theme
+  const [state, setState] = useState<{ key: string; hunkKey: string; value?: HunkHighlights }>(() => ({ key, hunkKey, value: peekHunkHighlights(request, syntax, previewing)?.value }));
+  const cached = state.key === key ? undefined : peekHunkHighlights(request, syntax, previewing);
+  if (cached && state.key !== key) setState({ key, hunkKey, value: cached.value });
+  // Another theme's colors for this hunk stay on screen until this theme's arrive.
+  const highlights = state.key === key || state.hunkKey === hunkKey ? state.value : undefined;
+  const latest = React.useRef({ request, syntax, previewing });
+  latest.current = { request, syntax, previewing };
   useEffect(() => {
     let active = true;
-    // The previous highlight stays on screen until the new one arrives.
-    void highlightHunkCached(latest.current)
+    void highlightHunkCached(latest.current.request, latest.current.syntax, latest.current.previewing)
       .catch(() => undefined)
       .then((value) => {
-        if (active) setState((s) => (s.key === key && s.value === value ? s : { key, value }));
+        if (active) setState((s) => (s.key === key && s.value === value ? s : { key, hunkKey, value }));
       });
     return () => {
       active = false;
     };
-  }, [key]);
+  }, [key, hunkKey]);
   // The changed words of each paired line, as ranges into its displayed (cleaned) text.
   const words = useMemo(() => {
     const out: (CharRange[] | undefined)[] = [];
@@ -1293,7 +1400,8 @@ const SourcePane = React.memo(function SourcePane(props: {
 
   const renderRow = (r: (typeof rows)[number], k: number) => {
     const inRange = range && r.idx >= range[0] && r.idx <= range[1];
-    const isCursor = r.idx === cursor && rows[k - 1]?.idx !== r.idx;
+    const first = rows[k - 1]?.idx !== r.idx;
+    const isCursor = r.idx === cursor && first;
     return (
       <Box key={k}>
         <Text color={isCursor ? 'cyan' : inRange ? 'blue' : undefined}>{isCursor ? '▶' : inRange ? '┃' : ' '}</Text>
@@ -1322,16 +1430,7 @@ const SourcePane = React.memo(function SourcePane(props: {
 
   return (
     <Box flexDirection="column" width={width} flexShrink={0} height={height} overflow="hidden">
-      {rows.slice(top, top + height).map((r, k) => {
-        const inRange = range && r.idx >= range[0] && r.idx <= range[1];
-        const isCursor = r.idx === cursor && rows[top + k - 1]?.idx !== r.idx;
-        return (
-          <Box key={top + k}>
-            <Text color={isCursor ? 'cyan' : inRange ? 'blue' : undefined}>{isCursor ? '▶' : inRange ? '┃' : ' '}</Text>
-            {r.node}
-          </Box>
-        );
-      })}
+      {rows.slice(top, top + height).map((r, k) => renderRow(r, top + k))}
       {rows.length > top + height ? <Text dimColor>{`  … ${rows.length - top - height} more`}</Text> : null}
     </Box>
   );
@@ -1356,23 +1455,30 @@ function TestPane(props: {
   const [diffHighlights, setDiffHighlights] = useState<(HunkHighlights | undefined)[]>();
   // Keyed on the test's file and text, so a tour update with the same test code keeps its highlight.
   const testFileName = covers?.file ?? props.tests[props.idx]?.testFile;
-  const highlightKey = selected
+  const { syntax } = useTheme();
+  const testKey = selected
     ? `${testFileName}\0${'diffHunks' in selected && selected.diffHunks?.length ? selected.diffHunks.map((d) => d.lines.map((l) => l.kind + l.text).join('\n')).join('\0') : selected.lines.join('\n')}`
     : '';
-  const latest = React.useRef({ selected, file: testFileName });
-  latest.current = { selected, file: testFileName };
+  const highlightKey = `${syntax}\0${testKey}`;
+  const latest = React.useRef({ selected, file: testFileName, syntax, testKey });
+  latest.current = { selected, file: testFileName, syntax, testKey };
+  const shownTest = React.useRef('');
   useEffect(() => {
     let active = true;
-    setHighlights(undefined);
-    setDiffHighlights(undefined);
-    const { selected, file } = latest.current;
+    // Another test clears its colors; another theme keeps the old ones until the new arrive.
+    if (shownTest.current !== latest.current.testKey) {
+      setHighlights(undefined);
+      setDiffHighlights(undefined);
+    }
+    shownTest.current = latest.current.testKey;
+    const { selected, file, syntax } = latest.current;
     if (selected && file) {
       if ('diffHunks' in selected && selected.diffHunks?.length) {
-        void Promise.all(selected.diffHunks.map((diff) => highlightDiffLines(file, diff.lines))).then((result) => {
+        void Promise.all(selected.diffHunks.map((diff) => highlightDiffLines(file, diff.lines, undefined, syntax))).then((result) => {
           if (active) setDiffHighlights(result);
         });
       } else {
-        void highlightSourceLines(file, selected.lines).then((result) => {
+        void highlightSourceLines(file, selected.lines, syntax).then((result) => {
           if (active) setHighlights(result);
         });
       }
@@ -1555,42 +1661,6 @@ function DraftLine(props: { drafts: Draft[]; hunk?: Hunk; cursor: number; flash:
   );
 }
 
-// Key hints, kept left to right while they fit. `status` (modes that are on) and the `end`
-// hints sit at the right edge and are never dropped, so help stays reachable on any width.
-export function KeyBar(props: { keys: [string, string][]; end?: [string, string][]; status?: string; width: number }) {
-  const GAP = '   ';
-  const size = ([k, label]: [string, string]) => k.length + 1 + label.length + GAP.length;
-  const hint = ([k, label]: [string, string]) => (
-    <Text key={k}>
-      <Text bold>{k}</Text>
-      <Text dimColor>{` ${label}`}</Text>
-      {GAP}
-    </Text>
-  );
-  const end = props.end ?? [];
-  const endWidth = end.reduce((n, h) => n + size(h), 0) + (props.status ? props.status.length + GAP.length : 0);
-  const keys: [string, string][] = [];
-  let used = 1 + endWidth; // leading space
-  for (const h of props.keys) {
-    if (used + size(h) > props.width) break;
-    used += size(h);
-    keys.push(h);
-  }
-  return (
-    <Box width={props.width}>
-      <Text wrap="truncate"> {keys.map(hint)}</Text>
-      <Box flexGrow={1} />
-      {props.status ? (
-        <Text color="yellow">
-          {props.status}
-          {GAP}
-        </Text>
-      ) : null}
-      <Text wrap="truncate">{end.map(hint)}</Text>
-    </Box>
-  );
-}
-
 const HELP_ROWS: [string, string][] = [
   ['n / p', 'Next or previous hunk (n marks it read), on into the next chapter'],
   ['j / k, J / K', 'Move by line (or 10 lines) inside the hunk'],
@@ -1600,6 +1670,8 @@ const HELP_ROWS: [string, string][] = [
   ['e', 'Read existing review threads on the selected line inline'],
   ['y', 'Reply to an existing review thread on the selected line'],
   ['E / X', 'Edit or delete your draft on the selected line'],
+  ['In a comment', '@ people/code (@callers: @tests: @threads: …)'],
+  ['  ^T', 'In a comment: suggest a code change with AI'],
   ['?', 'Ask the agent about the selection'],
   ['t', 'Focus the test pane (narrow terminals: toggle source/tests)'],
   ['T', 'Hide or show the test pane beside the code'],
@@ -1613,18 +1685,24 @@ const HELP_ROWS: [string, string][] = [
   ['x / z / u', 'Mark the hunk skipped / deferred / unread'],
   ['m', 'Move the hunk to another chapter'],
   ['f', 'Cycle Guided, Risk first, Small first, and File order'],
-  ['D', 'Re-review: toggle delta-only (new and changed hunks)'],
+  ['D', 'Re-review: switch between only new and changed hunks and the full review'],
   ['o', 'Open the hunk in Claude Code'],
   ['i', 'Team checklist for this chapter'],
-  ['b / s / q', 'Briefing / submit screen / quit (progress is saved)'],
+  ['b / s', 'Briefing / submit screen'],
+  ['L', 'Color theme (previews as you move through the list)'],
+  ['q / Q', 'Back to the PR list / quit (progress is saved)'],
 ];
 const HELP_KEY_WIDTH = 15;
 const HELP_WIDTH = 2 + 2 + HELP_KEY_WIDTH + Math.max(...HELP_ROWS.map(([, v]) => v.length)); // border, padding, key column
 
+// Rows for keys that need the agent; left out when it is absent.
+const AI_HELP_KEYS = new Set(['  ^T', '?']);
+
 // The key reference, sized to the popup: descriptions truncate, and rows past its height are cut.
-function Help(props: { width: number; height: number }) {
+function Help(props: { width: number; height: number; ai: boolean }) {
   const inner = props.width - 2;
-  const rows = HELP_ROWS.slice(0, Math.max(0, props.height - 2));
+  const all = props.ai ? HELP_ROWS : HELP_ROWS.filter(([k]) => !AI_HELP_KEYS.has(k)).map(([k, v]): [string, string] => [k, v.replace(' · ? ask', '')]);
+  const rows = all.slice(0, Math.max(0, props.height - 2));
   return (
     <Box flexDirection="column" paddingX={1}>
       <Text bold>Keys</Text>
@@ -1636,7 +1714,7 @@ function Help(props: { width: number; height: number }) {
           {truncate(v, Math.max(1, inner - HELP_KEY_WIDTH))}
         </Text>
       ))}
-      <Text dimColor>{rows.length < HELP_ROWS.length ? `${HELP_ROWS.length - rows.length} more on a taller terminal · ` : ''}any key to close</Text>
+      <Text dimColor>{rows.length < all.length ? `${all.length - rows.length} more on a taller terminal · ` : ''}any key to close</Text>
     </Box>
   );
 }

@@ -6,9 +6,11 @@
 
 > **Status:** Guided Review is early (0.x). Expect small bugs, and breaking changes between minor versions. 
 
-Guided Review (`gr`) is a full-screen terminal app for reviewing GitHub pull requests. It turns a diff into a tour: a briefing explains the change, chapters follow the code's execution flows, and linked tests appear beside the hunks they exercise. You can track what you have read, draft comments, and submit them as one GitHub review.
+Review pull requests as a guided tour, in your terminal.
 
-It is also a way to learn a codebase. Each PR becomes a guided walk through real code, from entry point to the functions it reaches, with the tests that pin the behavior down and a model you can ask about any line. That works for new team members and for anyone reading an unfamiliar repo.
+A diff lists files alphabetically, but code runs from an entry point through the functions it calls. Guided Review (`gr`) reorders a PR to match: a briefing explains what the change is for, chapters follow each route, command, or handler through the changed code, and the tests for each hunk sit beside it. Migrations, API contracts, and dependency upgrades get chapters that explain their impact, not just the lines that changed. You mark what you've read, ask a model about any line, and submit your comments as one GitHub review.
+
+The same tour works for learning a codebase: every PR becomes a walk through real code, with the tests that pin it down and answers that cite files and lines.
 
 <p align="center"><img src="docs/images/chapter.webp" alt="A Guided Review chapter showing an explanation, the changed code, and linked tests side by side" width="900"></p>
 
@@ -18,11 +20,12 @@ It is also a way to learn a codebase. Each PR becomes a guided walk through real
 - **Changes explained by what they mean.** Migrations, API contracts, dependency and runtime upgrades, lockfiles, infrastructure, and CI each get [their own chapter](docs/usage.md#change-aware-chapters) whose explanation covers impact rather than restating the diff: what a migration locks or drops, which API changes break clients, what an upgrade brings, what a workflow can now do.
 - **Tests beside the code.** Linked test cases appear next to the hunks they exercise, and [possible test gaps](docs/usage.md#tests-risk-and-review-prompts) are flagged.
 - **Track your progress.** Hunks are marked read, skipped, or deferred, and that state can survive a new push.
-- **Draft, then submit once.** Comments stay local drafts until you [post them as a single GitHub review](docs/usage.md#draft-and-submit-comments), with code suggestions and `@` mentions.
+- **Draft, then submit once.** Comments stay local drafts until you [post them as a single GitHub review](docs/usage.md#draft-and-submit-comments), with code suggestions and `@` for both mentions and code references; a reference is written as inline code, such as `` `releaseInventory()` `` or `` `stock.ts:84-96` ``, and posts as a link to the exact lines. AI can draft a suggestion for you to accept.
 - **Re-review after a push.** See only the hunks that changed since your last pass, and check whether your earlier comments were addressed. See [Review after a new push](docs/usage.md#review-after-a-new-push).
 - **Ask questions.** Ask the model about a selected line, a chapter, or the whole PR without leaving the review. Follow-ups keep the thread, which makes it useful for learning as well as reviewing: "what calls this?", "why a mutex here?", "where is this tested?".
 - **Author preview.** Tour your own branch before you open a PR, to see your change the way a reviewer will.
-- **Bring your own model.** Claude Code (with your Claude Code login), the Anthropic API, Codex, Cursor, OpenAI, any OpenAI-compatible endpoint, Bedrock, or Vertex. Use `--no-agent` for a static-analysis-only tour with no model calls. See [Configuration](docs/configuration.md).
+- **Bring your own model.** Claude Code (with your Claude Code login), the Anthropic API, Codex, Cursor, OpenAI, any OpenAI-compatible endpoint, Bedrock, or Vertex. Choose no model in `gr config` (or pass `--no-agent`) for a static-analysis-only tour with no model calls. See [Configuration](docs/configuration.md).
+- **Color themes.** Keep your terminal's colors or choose from 65 themes, dark and light, that color the whole interface. `gr config` and `L` preview them live. See [Color themes](docs/configuration.md#color-themes).
 - **Share tours from CI.** A GitHub Action builds the tour once and posts it to the PR, so reviewers open it without their own model calls. See [Share tours from CI](docs/ci.md).
 
 
@@ -30,8 +33,7 @@ It is also a way to learn a codebase. Each PR becomes a guided walk through real
 
 ```sh
 npm install -g @haydenmeloche/guided-review
-gr config            # choose a model provider and GitHub access
-gr                   # pick a PR that's waiting for your review
+gr # first time launches a config walkthrugh
 ```
 
 The package installs the command under two names, `gr` and `guided-review`. If `gr` runs something else, a shell alias is shadowing it; Oh My Zsh's git plugin defines `alias gr='git remote'`. Use `guided-review`, or add `unalias gr` to your shell config after the plugin loads.
@@ -70,7 +72,7 @@ If pnpm's global binary directory is not on your `PATH`, run `pnpm setup` once a
 
 ### Configure a model
 
-Before your first review, run `gr config` to choose a model provider, the models for each task, and where your API key comes from. Until a config exists, `gr` stops and asks you to run `gr config`. The Claude Code choice uses your Claude Code login, and the Codex choice uses your Codex CLI login, so neither needs a key. See [Configuration](docs/configuration.md) for the Anthropic and OpenAI APIs, compatible endpoints, Bedrock, Vertex, and GitHub tokens. To review without model calls (and without a config), pass `--no-agent`.
+The first time you run `gr`, it introduces itself and walks you through setup: a color theme, a model provider, and GitHub access. It finds what your machine already has, such as a Codex login, an `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or a local Ollama server, so a found provider is one `Enter`. Before saving, it sends each model a test request, and then it carries on with the command you ran. Run `gr config` to go through setup again. An Anthropic, OpenAI, or Cursor API key is recommended: `gr` calls those from its own process, so tours start faster than with Codex, which starts a CLI process for every request. Setup lists the current models to choose from, including each Cursor model's effort, speed, and context. Codex uses your Codex CLI login, so it needs no key. See [Configuration](docs/configuration.md) for the Anthropic and OpenAI APIs, compatible endpoints, Bedrock, Vertex, and GitHub tokens. To review without AI, choose **No AI model** in `gr config`: every feature but the briefing text, narration, Q&A, and AI suggestions still works. To skip model calls for one review (even without a config), pass `--no-agent`.
 
 ### Use from Claude Code or Codex
 
@@ -99,7 +101,7 @@ Guided Review checks out the PR head in a detached worktree under `~/.guided-rev
 
 | Option | Purpose |
 | --- | --- |
-| `--no-agent` | Build a plain tour from static analysis, without model calls. |
+| `--no-agent` | Build a plain tour from static analysis, without model calls. Not for `build`, which needs a model. To always review without AI, choose **No AI model** in `gr config` instead. |
 | `--fresh` | Rebuild the tour even if this head commit has a completed cached tour or a tour shared on the PR. |
 | `--comment` | With `build`, post the tour to the PR as a comment. See [Share tours from CI](docs/ci.md). |
 | `--out <file>` | With `build`, write the tour JSON to a file, or `-` for stdout (the default without `--comment`). |
@@ -108,7 +110,7 @@ Guided Review checks out the PR head in a detached worktree under `~/.guided-rev
 
 Set `GR_DEBUG=1` to print stack traces on errors.
 
-Once a day, `gr` checks npm in the background for a newer version. Before a tour it offers to install it (`s` skips that version); other commands mention it when they finish. It never checks in CI or for `gr build`. Set `GR_NO_UPDATE_CHECK=1` to turn it off.
+Once a day, `gr` checks npm in the background for a newer version. Before a tour it opens an update screen with the release notes since your version: Enter installs the update and restarts `gr` where you were, `n` waits until tomorrow, and `s` skips that version. Other commands mention the update when they finish. It never checks in CI or for `gr build`. Set `GR_NO_UPDATE_CHECK=1` to turn it off.
 
 Providers, models, endpoints, and keys are not CLI options; they live in `~/.guided-review/config.json`. See [Configuration](docs/configuration.md).
 
@@ -144,7 +146,7 @@ Run `gr config --repo` inside a repository to create or edit `.guided-review.jso
 
 ## Privacy and security
 
-Guided Review has no telemetry and runs no server of its own. PR content and any files the agent reads go only to the model provider in your config (nothing, with `--no-agent`), and it writes to GitHub only when you post a review, reply, or react. PR content is treated as untrusted: agent tools are read-only and confined to the PR worktree. See [Data, privacy, and security](docs/security.md) for the details, and [SECURITY.md](SECURITY.md) to report a vulnerability.
+Guided Review has no telemetry and runs no server of its own. PR content and any files the agent reads go only to the model provider in your config (nothing, with no model configured or `--no-agent`), and it writes to GitHub only when you post a review, reply, or react. PR content is treated as untrusted: agent tools are read-only and confined to the PR worktree. See [Data, privacy, and security](docs/security.md) for the details, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## Documentation
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { highlightDiffLines, highlightHunk, highlightLanguage, highlightSourceLines, type SyntaxSpan } from '../src/tui/highlight.js';
+import { clearHighlightCache, highlightCacheKeys, highlightHunkCached, peekHunkHighlights } from '../src/tui/highlightCache.js';
+import { highlightDiffLines, highlightFileLines, highlightHunk, highlightLanguage, highlightSourceLines, type SyntaxSpan } from '../src/tui/highlight.js';
 import { hunk } from './fixtures/tour.js';
 
 function coloredText(text: string, spans: SyntaxSpan[]) {
@@ -139,5 +140,35 @@ describe('test pane syntax highlighting', () => {
     const spans = await highlightSourceLines('test/store.test.ts', lines);
     expect(coloredText(lines[1], spans![1])).toContain('saves');
     expect(spans![1].every((span) => span.start >= 0 && span.end <= lines[1].length)).toBe(true);
+  });
+
+  it('offsets a tab-indented file line on the line as shown, tabs as two spaces (the reference preview)', async () => {
+    const spans = await highlightFileLines('src/a.ts', 'function f() {\n\treturn x;\n}');
+    const shown = '  return x;';
+    const words = spans![1].map((s) => shown.slice(s.start, s.end));
+    expect(words).toContain('return');
+  });
+
+  it('highlights in the theme it is given, and caches each theme apart', async () => {
+    const h = hunk('h', 'a.ts', [{ kind: 'add', text: 'const x = "s";', newLine: 1 }]);
+    const colors = async (theme?: string) => (await highlightHunkCached({ hunk: h, headSha: 'x', baseSha: 'y' }, theme))!.flat().map((sp) => sp.color);
+    const byDefault = await colors();
+    const light = await colors('github-light');
+    expect(light).not.toEqual(byDefault);
+    expect(
+      peekHunkHighlights({ hunk: h, headSha: 'x', baseSha: 'y' }, 'github-light')
+        ?.value?.flat()
+        .map((sp) => sp.color),
+    ).toEqual(light);
+  });
+
+  it('keeps previewed themes out of the cache for the theme in use', async () => {
+    clearHighlightCache();
+    const h = hunk('p', 'b.ts', [{ kind: 'add', text: 'let y = 1;', newLine: 1 }]);
+    const req = { hunk: h, headSha: 'x', baseSha: 'y' };
+    await highlightHunkCached(req, 'nord', true);
+    expect(peekHunkHighlights(req, 'nord', true)).toBeDefined();
+    expect(peekHunkHighlights(req, 'nord')).toBeUndefined();
+    expect(highlightCacheKeys().hunks).toHaveLength(0);
   });
 });

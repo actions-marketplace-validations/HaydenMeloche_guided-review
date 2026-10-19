@@ -3,19 +3,25 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  agentRouting,
   defaultUserConfig,
+  keptRouting,
   loadChapterOrder,
   loadUserConfig,
+  loadThemeSetting,
   loadViewSetting,
   parseRepoConfig,
   PRESET_MODELS,
   presetUserConfig,
   repoConfigProblems,
   saveUserConfig,
+  saveThemeSetting,
   saveViewSetting,
   UserConfigError,
+  userConfigPath,
 } from '../src/config.js';
 import { configForRole, resolveApiKey, validateRouting } from '../src/agent/types.js';
+import { describeUserConfig } from '../src/setup.js';
 
 const originalHome = process.env.GR_HOME;
 const originalKey = process.env.GR_TEST_KEY;
@@ -64,12 +70,50 @@ describe('user config', () => {
     expect(fs.readFileSync(file, 'utf8')).toBe(custom);
   });
 
+  it('loads a config that chooses no model, keeping its model settings for later', () => {
+    const file = configFile();
+    fs.writeFileSync(file, '{"provider":"none","lastProvider":"openai","model":"m","apiKeyEnv":"K","roles":{"qa":{"model":"q"}},"chapterOrder":"risk","theme":"nord"}\n');
+    const config = loadUserConfig();
+    expect(config).toEqual({ provider: 'none', lastProvider: 'openai', model: 'm', apiKeyEnv: 'K', roles: { qa: { model: 'q' } }, chapterOrder: 'risk', theme: 'nord' });
+    expect(agentRouting(config)).toBeUndefined();
+    expect(keptRouting(config)).toEqual({ provider: 'openai', model: 'm', apiKeyEnv: 'K', roles: { qa: { model: 'q' } } });
+    expect(loadChapterOrder()).toBe('risk');
+    expect(describeUserConfig(config)[0]).toMatch(/^Provider: none \(no AI/);
+    expect(describeUserConfig(config).join('\n')).not.toMatch(/Q&A|API key/);
+    expect(describeUserConfig(config)).toContain('Kept for later: your openai settings');
+    // Kept settings are still checked.
+    fs.writeFileSync(file, '{"provider":"none","roles":{"qa":{"provider":"nope"}}}\n');
+    expect(() => loadUserConfig()).toThrow(/roles.qa: unknown provider/);
+  });
+
+  it('routes only the model settings', () => {
+    const config = { ...presetUserConfig('openai', PRESET_MODELS.openai!), chapterOrder: 'risk' as const, theme: 'nord', github: { tokenEnv: 'T' } };
+    const routing = agentRouting(config)!;
+    expect(routing).not.toHaveProperty('theme');
+    expect(routing).not.toHaveProperty('github');
+    expect(routing).not.toHaveProperty('chapterOrder');
+    expect(configForRole(routing, 'qa').model).toBe('gpt-6.1-sol');
+  });
+
   it('defaults to Codex with Luna briefing and narration, Sol Q&A', () => {
     const config = defaultUserConfig();
     expect(config.provider).toBe('codex');
     expect(configForRole(config, 'briefing').model).toBe('gpt-6-luna');
     expect(configForRole(config, 'narration').model).toBe('gpt-6-luna');
     expect(configForRole(config, 'qa').model).toBe('gpt-6.1-sol');
+  });
+
+  it("saves Cursor's variants, and an empty one, so neither task takes the other's", () => {
+    configFile();
+    const config = presetUserConfig('cursor', { fast: 'grok-4.7', strong: 'grok-4.7', strongParams: { reasoning_effort: 'high' } });
+    saveUserConfig(config);
+    const loaded = loadUserConfig();
+    expect(loaded).toEqual(config);
+    const routing = agentRouting(loaded);
+    expect(configForRole(routing, 'narration').modelParams).toEqual({});
+    expect(configForRole(routing, 'qa').modelParams).toEqual({ reasoning_effort: 'high' });
+    fs.writeFileSync(userConfigPath(), JSON.stringify({ provider: 'cursor', modelParams: { fast: true } }));
+    expect(() => loadUserConfig()).toThrow(/"modelParams" must be an object of strings/);
   });
 
   it('routes OpenAI briefing and narration to Luna, Q&A to Sol', () => {
@@ -110,6 +154,22 @@ describe('user config', () => {
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ provider: 'openai', apiKeyEnv: 'KEY', custom: { a: 1 }, hideWhitespace: false });
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     expect(loadViewSetting('hideWhitespace')).toBe(false);
+  });
+
+  it('reads and saves the color theme without a provider and leaves the rest of the config alone', () => {
+    const file = configFile();
+    expect(loadThemeSetting()).toBeUndefined();
+    expect(saveThemeSetting('nord')).toBe(false); // no config yet: nothing is created
+    expect(fs.existsSync(file)).toBe(false);
+    fs.writeFileSync(file, '{"provider":"openai","splitDiff":true}\n');
+    expect(saveThemeSetting('nord')).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ provider: 'openai', splitDiff: true, theme: 'nord' });
+    expect(loadThemeSetting()).toBe('nord');
+    expect(loadUserConfig().theme).toBe('nord');
+    expect(saveThemeSetting('terminal')).toBe(true); // the default: the key goes, as gr config does
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ provider: 'openai', splitDiff: true });
+    fs.writeFileSync(file, '{"theme":7}\n');
+    expect(() => loadThemeSetting()).toThrow(/"theme" must be a theme name/);
   });
 
   it('keeps split view off by default and saves it beside the whitespace setting', () => {
