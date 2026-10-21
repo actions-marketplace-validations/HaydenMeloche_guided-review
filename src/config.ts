@@ -4,6 +4,7 @@ import { grHome } from './paths.js';
 import { TERMINAL_THEME } from './tui/theme.js';
 import type { ChapterOrder, FileKind, KindRule, RepoConfig } from './types.js';
 import { AGENT_ROLES, PROVIDERS, type AgentConfig, type AgentRouting, type Provider } from './agent/types.js';
+import { CODING_AGENT_VALUES, CUSTOM_AGENT, customCommandProblem, DEFAULT_CODING_AGENT, isCodingAgent, type CodingAgent, type CodingAgentSetting } from './codingAgent.js';
 
 export const KINDS: FileKind[] = ['logic', 'test', 'config', 'mechanical', 'generated', 'vendored'];
 const REPO_CONFIG_KEYS = ['kinds', 'testPatterns', 'checklists'];
@@ -115,6 +116,8 @@ export type UserConfig = Omit<AgentRouting, 'provider'> & {
   hideWhitespace?: boolean;
   splitDiff?: boolean;
   theme?: string;
+  codingAgent?: CodingAgent;
+  codingAgentCommand?: string; // with "codingAgent": "custom"
   github?: GitHubConfig;
 };
 
@@ -193,9 +196,11 @@ export function userConfigPath(): string {
   return path.join(grHome(), 'config.json');
 }
 
-export function readUserConfigFile(): Record<string, unknown> | undefined {
+// config.json as an object, or null when there is none. The loaders below read it themselves,
+// or take what this returned (null included) so that one read serves several.
+export function readUserConfigFile(): Record<string, unknown> | null {
   const file = userConfigPath();
-  if (!fs.existsSync(file)) return undefined;
+  if (!fs.existsSync(file)) return null;
   let raw: unknown;
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -215,8 +220,7 @@ function parseChapterOrder(raw: Record<string, unknown>, where: string): Chapter
 }
 
 // The preferred chapter order, readable without a model provider (for --no-agent); "guide" when unset.
-export function loadChapterOrder(): ChapterOrder {
-  const raw = readUserConfigFile();
+export function loadChapterOrder(raw = readUserConfigFile()): ChapterOrder {
   return CHAPTER_ORDER_SETTINGS[(raw && parseChapterOrder(raw, userConfigPath())) ?? DEFAULT_CHAPTER_ORDER];
 }
 
@@ -231,8 +235,7 @@ function parseViewSetting(raw: Record<string, unknown>, key: ViewSetting, where:
 }
 
 // A view setting, readable without a model provider: hideWhitespace is on when unset, splitDiff off.
-export function loadViewSetting(key: ViewSetting): boolean {
-  const raw = readUserConfigFile();
+export function loadViewSetting(key: ViewSetting, raw = readUserConfigFile()): boolean {
   return (raw && parseViewSetting(raw, key, userConfigPath())) ?? VIEW_DEFAULTS[key];
 }
 
@@ -254,9 +257,8 @@ function parseTheme(raw: Record<string, unknown>, where: string): string | undef
 
 // The color theme's name, readable without a model provider; undefined uses the terminal's colors.
 // Whether the name exists is checked when the theme loads.
-export function loadThemeSetting(): string | undefined {
-  const raw = readUserConfigFile();
-  return raw && parseTheme(raw, userConfigPath());
+export function loadThemeSetting(raw = readUserConfigFile()): string | undefined {
+  return raw ? parseTheme(raw, userConfigPath()) : undefined;
 }
 
 // Records the theme chosen in the picker; like saveViewSetting, it needs an existing config file.
@@ -272,6 +274,24 @@ export function saveThemeSetting(theme: string): boolean {
     fs.chmodSync(file, 0o600);
   }
   return true;
+}
+
+function parseCodingAgent(raw: Record<string, unknown>, where: string): CodingAgentSetting | undefined {
+  if (raw.codingAgent === undefined) return undefined;
+  if (!isCodingAgent(raw.codingAgent)) {
+    throw new UserConfigError(`${where}: unknown codingAgent ${JSON.stringify(raw.codingAgent)} (expected ${CODING_AGENT_VALUES.join(', ')})`);
+  }
+  if (raw.codingAgent !== CUSTOM_AGENT) return { agent: raw.codingAgent };
+  const command = typeof raw.codingAgentCommand === 'string' ? raw.codingAgentCommand : undefined;
+  if (!command?.trim()) throw new UserConfigError(`${where}: "codingAgent": "custom" needs a "codingAgentCommand", such as "aider --message"`);
+  const problem = customCommandProblem(command);
+  if (problem) throw new UserConfigError(`${where}: "codingAgentCommand": ${problem}`);
+  return { agent: CUSTOM_AGENT, command };
+}
+
+// The coding agent o opens, readable without a model provider; Claude Code when unset.
+export function loadCodingAgent(raw = readUserConfigFile()): CodingAgentSetting {
+  return (raw && parseCodingAgent(raw, userConfigPath())) ?? { agent: DEFAULT_CODING_AGENT };
 }
 
 function parseGitHubConfig(raw: Record<string, unknown>, where: string): GitHubConfig | undefined {
@@ -293,7 +313,7 @@ function parseGitHubConfig(raw: Record<string, unknown>, where: string): GitHubC
 // The GitHub settings, readable without a model provider; undefined means use the gh CLI.
 export function loadGitHubConfig(): GitHubConfig | undefined {
   const raw = readUserConfigFile();
-  return raw && parseGitHubConfig(raw, userConfigPath());
+  return raw ? parseGitHubConfig(raw, userConfigPath()) : undefined;
 }
 
 function routingOf(config: UserConfig, provider: Provider | undefined): AgentRouting {
@@ -314,9 +334,8 @@ export function keptRouting(config: UserConfig): AgentRouting | undefined {
 }
 
 // Throws UserConfigError when the config is missing or unusable; nothing is written implicitly.
-export function loadUserConfig(): UserConfig {
+export function loadUserConfig(raw = readUserConfigFile()): UserConfig {
   const file = userConfigPath();
-  const raw = readUserConfigFile();
   if (!raw) throw new UserConfigError(`no model provider is configured (${file} does not exist)`);
   if (raw.provider === undefined) throw new UserConfigError(`${file} does not set a "provider"`);
   // With no model, the settings kept for later are checked as settings for lastProvider.
@@ -331,6 +350,11 @@ export function loadUserConfig(): UserConfig {
   }
   const theme = parseTheme(raw, file);
   if (theme) out.theme = theme;
+  const codingAgent = parseCodingAgent(raw, file);
+  if (codingAgent) {
+    out.codingAgent = codingAgent.agent;
+    if (codingAgent.command) out.codingAgentCommand = codingAgent.command;
+  }
   const github = parseGitHubConfig(raw, file);
   if (github) out.github = github;
   if (raw.roles !== undefined) {

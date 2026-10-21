@@ -14,6 +14,8 @@ Run `gr cleanup` to remove managed PR worktrees and prune old tours. Tours are a
 
 The **briefing** opens once it is ready; chapter narration may continue in the background. It shows the PR's intent and author description, recent reviewer feedback, flagged gaps, an overview diagram, chapters with risk, and your progress. Press `V` to read all submitted reviews. The chapter heading names the current order. Press `f` to cycle **Guided** (recommended reading path), **Risk first**, **Small first** (fewest changed lines), and **File** (path order). Select a chapter with `j`/`k` and `Enter`, or press `n` to resume where you left off. Press `r` to read the full PR description, `d` for the overview diagram, or `?` to ask about the whole PR in a panel below the briefing. On a re-review, press `D` to switch between only the changes and the full review.
 
+The terminal's window title names the PR and where you are in it, such as `gr · acme/app#42 · chapter 3/7`, and goes back to your own title when you quit (in terminals that keep a title stack). In Ghostty, WezTerm, Windows Terminal, ConEmu, and iTerm2 3.6 or later, the tab or taskbar also shows progress while the tour builds and while chapter narration runs in the background, so you can work in another tab until it is done.
+
 <p align="center"><img src="images/briefing.webp" alt="The briefing screen: a summary of the PR, the author's description, flagged gaps, an overview diagram, chapters in reading order, and blast radius" width="900"></p>
 
 A **chapter** shows an explanation, code hunk, risk and test status, existing review threads, and linked tests. Wide terminals put code and tests side by side; narrow terminals let `t` toggle between them. Generated, vendored, and mechanical changes start collapsed into summaries. Import-only changes form an optional chapter that normal `n`/`p` navigation skips.
@@ -70,7 +72,7 @@ Upgrade highlights and package overviews come from a changelog in the worktree w
 | `D` | On a re-review, switch between only the new and changed hunks and the full review. The header shows which one you are in. |
 | `R` | Rebuild the tour on a newer PR head after the author pushes. |
 | `i` | Open the team's checklist for this chapter. |
-| `o` | Open the current review context in Claude Code. |
+| `o` | Open your coding agent in the PR's checkout, with the hunk, your draft comments on its file, and the file's review threads as its first prompt. Choose the agent in `gr config` (Claude Code by default). |
 | `b` / `s` / `h` | Return to the briefing (description and overview diagram), open submit, or show key help. `b` also works while the test pane has focus. |
 | `L` | Choose a color theme. `/` searches the list by name. Moving through the list applies each theme as the cursor stops, so the screen behind it shows what it looks like; `Enter` keeps it and saves it as `theme` in your config, and `Esc` goes back to the one you had. The PR list and the briefing take `L` too. See [Color themes](configuration.md#color-themes). |
 | `q` / `Q` | Go back to the PR list (progress is saved), or quit Guided Review. In an author preview of a local branch there is no list, so `q` quits. |
