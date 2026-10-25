@@ -1,7 +1,7 @@
 {
   "name": "@haydenmeloche/guided-review",
-  "version": "0.3.0",
-  "description": "Review GitHub pull requests as a guided tour in your terminal: chapters that follow the code's flow, tests beside each change, and one review to submit.",
+  "version": "0.4.0",
+  "description": "Read a code change the way the code runs, in your terminal: a tour of a pull request, branch, or working tree, with chapters that follow the code's flow, tests beside each change, and one review to submit.",
   "keywords": [
     "code-review",
     "pull-request",
@@ -51,11 +51,12 @@
     "typecheck": "tsc -p . --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run --project unit",
     "test:e2e": "vitest run --project e2e",
-    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm clean && pnpm build",
+    "prepublishOnly": "pnpm clean && pnpm build",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test && pnpm test:e2e",
     "test:coverage": "vitest run --project unit --coverage"
   },
   "dependencies": {
@@ -84,6 +85,7 @@
     "ink-testing-library": "^4.0.0",
     "node-pty": "^1.1.0",
     "prettier": "^3.9.9",
+    "string-width": "8.3.0",
     "tsx": "^4.23.15",
     "typescript-eslint": "^8.71.1",
     "vitest": "^5.0.3"

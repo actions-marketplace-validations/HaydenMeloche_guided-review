@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text, useSelected, useTheme } from './themed.js';
-import { ROLES, SURFACES, type ThemeInfo } from './theme.js';
+import { ROLES, SURFACES, type ThemeInfo, colorDepth } from './theme.js';
 import { highlightDiffLines, type HunkHighlights, type SyntaxSpan } from './highlight.js';
 import { pad, riskMark, stateMark, truncate } from './nav.js';
 import { KeyBar } from './KeyBar.js';
-import { Heading } from './BriefingScreen.js';
+import { SectionHeading } from './BriefingScreen.js';
+import { plural } from './plural.js';
 import type { DiffLine } from '../types.js';
+import { G } from './glyphs.js';
+import { fileIcon } from './icons.js';
 
 const PREVIEW_DELAY_MS = 150;
 
@@ -107,6 +110,8 @@ export function ThemePicker(props: {
         ) : (
           <Text dimColor>/ to search</Text>
         )}
+        {/* Why a theme can look different here than in its screenshots. */}
+        {colorDepth() !== 'truecolor' ? <Text color="yellow">{`  ${colorDepth()} colors in this terminal: themes are approximated`}</Text> : null}
       </Text>
       <Box flexDirection="row" height={listH}>
         <Box flexDirection="column" width={listW}>
@@ -214,15 +219,14 @@ function ThemeSample(props: { width: number; height: number }) {
       <Text wrap="truncate">
         Retries a request up to <Text color="cyan">attempts</Text> times when the server fails.
       </Text>
-      <Text wrap="truncate">
-        <Heading terminal={{ dimColor: true }}>From the author</Heading>
+      <SectionHeading title="From the author" width={w}>
         <Text dimColor> · </Text>fixes the flaky deploys in <Text color="cyan">#470</Text>
-      </Text>
+      </SectionHeading>
       <Text color="yellow" wrap="truncate">
-        ⚑ large pr: 1,240 changed lines across 18 files
+        {G.flag} large pr: 1,240 changed lines across 18 files
       </Text>
-      <Text wrap="truncate">
-        <Heading terminal={{}}>Chapters</Heading>{' '}
+      <SectionHeading title="Chapters" width={w}>
+        {' '}
         <Text bold color="cyan">
           · Guided order
         </Text>
@@ -230,7 +234,7 @@ function ThemeSample(props: { width: number; height: number }) {
           {' '}
           · 4/9 hunks done
         </Text>
-      </Text>
+      </SectionHeading>
       {chapters.map(([title, state, risk], i) => {
         const st = stateMark(state);
         const rk = riskMark(risk);
@@ -238,14 +242,14 @@ function ThemeSample(props: { width: number; height: number }) {
           <Text key={title} {...selectedRow(i === 0)} wrap="truncate">
             <Text color={st.color}>{st.mark}</Text>
             <Text color={rk.color}>{rk.mark}</Text> <Text color={i === 0 ? undefined : ROLES.title}>{pad(title, w - 13)}</Text>
-            <Text dimColor>{` ${3 - i} hunk(s)`}</Text>
+            <Text dimColor>{` ${plural(3 - i, 'hunk')}`}</Text>
           </Text>
         );
       })}
       {rule('Chapter')}
       <Text wrap="truncate">
-        <Text bold>{pad('Retry failed requests', Math.max(1, w - 13))}</Text> <Text color="green">████</Text>
-        <Text dimColor>░░░░ 4/9</Text>
+        <Text bold>{pad('Retry failed requests', Math.max(1, w - 13))}</Text> <Text color="green">{G.meterOn.repeat(4)}</Text>
+        <Text dimColor>{G.meterOff.repeat(4)} 4/9</Text>
       </Text>
       <Box flexDirection="column" borderStyle="round" borderColor="blue" paddingX={1} width={w} flexShrink={0}>
         <Text bold color="blue">
@@ -260,7 +264,7 @@ function ThemeSample(props: { width: number; height: number }) {
       </Box>
       <Text dimColor wrap="truncate">
         {' '}
-        src/client.ts <Text color="magenta">[question]</Text>
+        {fileIcon('src/client.ts')}src/client.ts <Text color="blue">[question]</Text>
       </Text>
       {SAMPLE.map((l, i) => (
         <SampleLine key={i} line={l} spans={highlights?.[i]} width={w} />

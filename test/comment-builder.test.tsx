@@ -117,7 +117,7 @@ function Harness(props: { tour: Tour; onDraft?: (d: Draft) => void; initial?: Dr
       references={{ host: 'github.com', repoIndex: fakeIndex, ...props.references }}
       agent={props.agent ? { cwd: root } : undefined}
       setPos={(ci, hi) => setPos({ ci, hi })}
-      setState={(h: Hunk, s: ReadState) => setStates((prev) => ({ ...prev, [h.contentHash]: s }))}
+      setState={(hs: Hunk[], s: ReadState) => setStates((prev) => ({ ...prev, ...Object.fromEntries(hs.map((h) => [h.contentHash, s])) }))}
       saveDraft={(d) => {
         setDrafts((ds) => [...ds.filter((x) => x.id !== d.id), d]);
         props.onDraft?.(d);
@@ -156,7 +156,7 @@ describe('comment composer', () => {
     await tick();
     ui.stdin.write('c');
     await waitFor(() => expect(ui.lastFrame()).toContain('Comment on src/orders/cancel.ts:3'));
-    expect(ui.lastFrame()).toContain('enter: save draft');
+    expect(ui.lastFrame()).toContain('enter save');
     expect(ui.lastFrame()).toContain('@ people/code');
     expect(ui.lastFrame()).not.toMatch(/ctrl\+[pt]/);
     expect(ui.lastFrame()).not.toContain('evidence');
@@ -247,7 +247,7 @@ describe('comment composer', () => {
     const ref: CodeRef = { id: 'r1', kind: 'range', path: 'src/jobs/retries.ts', commitSha: HEAD, startLine: 2, label: 'retries.ts:2' };
     const ui = render(<Harness tour={fixture()} initial={[lineDraft(3, { body: 'Same as `retries.ts:2`', refs: [ref] })]} onDraft={(d) => drafts.push(d)} />);
     await tick();
-    ui.stdin.write('E');
+    ui.stdin.write('c');
     await waitFor(() => expect(ui.lastFrame()).toContain('Same as `retries.ts:2`'));
     expect(ui.lastFrame()).toContain(`→ src/jobs/retries.ts:2 @${HEAD.slice(0, 7)}`);
     ui.stdin.write(CTRL.u);
@@ -354,7 +354,7 @@ describe('comment composer', () => {
     ui.stdin.write('c');
     await waitFor(() => expect(ui.lastFrame()).toContain('Comment on'));
     ui.stdin.write('@');
-    await waitFor(() => expect(ui.lastFrame()).toContain('◷ src/jobs/retries.ts:2'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('◇ src/jobs/retries.ts:2'));
     // Down past the people to the declarations: the list keeps five rows above its two hint lines.
     for (let i = 0; i < 3; i++) {
       ui.stdin.write(DOWN);
@@ -362,8 +362,8 @@ describe('comment composer', () => {
     }
     await waitFor(() => expect(ui.lastFrame()).toContain('▸ ƒ releaseInventory'));
     const frame = ui.lastFrame();
-    expect(ofText(frame, '◷ src/jobs/retries.ts:2')).toBeGreaterThan(-1);
-    expect(ofText(frame, '◷ src/jobs/retries.ts:2')).toBeLessThan(ofText(frame, 'ƒ releaseInventory'));
+    expect(ofText(frame, '◇ src/jobs/retries.ts:2')).toBeGreaterThan(-1);
+    expect(ofText(frame, '◇ src/jobs/retries.ts:2')).toBeLessThan(ofText(frame, 'ƒ releaseInventory'));
     ui.unmount();
   });
 
@@ -386,17 +386,13 @@ describe('comment composer', () => {
     ui.unmount();
   });
 
-  it('a and A do nothing in the chapter screen', async () => {
+  it('A does nothing in the chapter screen, and says so', async () => {
     const ui = render(<Harness tour={fixture()} />);
     await tick();
-    const before = ui.lastFrame();
-    expect(before).not.toMatch(/pin/i);
-    ui.stdin.write('a');
-    await tick(60);
+    expect(ui.lastFrame()).not.toMatch(/pin/i);
     ui.stdin.write('A');
-    await tick(60);
-    expect(ui.lastFrame()).toBe(before);
-    ui.stdin.write('h');
+    await waitFor(() => expect(ui.lastFrame()).toContain('no action for A here · ? lists the keys'));
+    ui.stdin.write('?');
     await waitFor(() => expect(ui.lastFrame()).toContain('Focus the test pane'));
     expect(ui.lastFrame()).not.toMatch(/pin/i);
     ui.unmount();
@@ -495,6 +491,10 @@ describe('@ completion preview', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('→ pick lines'));
     ui.stdin.write(ESC);
     await waitFor(() => expect(ui.lastFrame()).not.toContain('ƒ releaseInventory'));
+    expect(cancelled).toBe(false);
+    // The comment has typed text: the next Esc asks, and one more discards it.
+    ui.stdin.write(ESC);
+    await waitFor(() => expect(ui.lastFrame()).toContain('esc again to discard'));
     expect(cancelled).toBe(false);
     ui.stdin.write(ESC);
     await waitFor(() => expect(cancelled).toBe(true));
@@ -647,9 +647,10 @@ describe('composer keys', () => {
         />,
       );
     for (const [width, height, says] of [
-      [120, 14, '@ people/code · ctrl+t suggest a code change with AI'],
-      [48, 14, '@ people/code · ctrl+t suggest a fix with AI'],
-      [120, 30, 'enter save · @ people/code · ctrl+t suggest a code change with AI · ctrl+g $EDITOR · esc'],
+      [120, 14, 'ctrl+t suggest a code change with AI'],
+      [70, 14, 'ctrl+t suggest a fix with AI'],
+      [48, 14, 'ctrl+t AI fix'],
+      [120, 30, 'enter save   ctrl+t suggest a code change with AI   @ people/code'],
     ] as const) {
       const ui = editor(width, height);
       await waitFor(() => expect(ui.lastFrame()).toContain(says));
@@ -994,7 +995,7 @@ describe('submit screen', () => {
     expect(frame.split('\n').find((l) => l.includes('Stays put'))).not.toMatch(/moves|posts/);
     expect(frame).not.toMatch(/Pre-flight|checking references/i);
     ui.stdin.write('P');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Y / n'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('esc cancel'));
     ui.unmount();
   });
 
@@ -1011,7 +1012,7 @@ describe('submit screen', () => {
     ui.stdin.write(ESC);
     await waitFor(() => expect(ui.lastFrame()).toContain('Drafts (1)'));
     ui.stdin.write('P');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Y / n'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('esc cancel'));
     ui.stdin.write('y');
     await waitFor(() => expect(postReview).toHaveBeenCalled());
     expect(vi.mocked(postReview).mock.calls[0][2].comments[0].body).toContain('```suggestion\nx\n```');

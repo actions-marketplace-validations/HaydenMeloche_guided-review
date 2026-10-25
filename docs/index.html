@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Guided Review</title>
-    <meta name="description" content="Review pull requests as a guided tour, in your terminal." />
+    <meta name="description" content="Read a code change the way the code runs, in your terminal." />
     <link
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232f6f5e'/><text x='16' y='22' font-family='monospace' font-size='15' font-weight='700' fill='white' text-anchor='middle'>gr</text></svg>"
@@ -363,10 +363,11 @@
 
       <div class="hero">
         <span class="status">Early release (0.x)</span>
-        <h1>Review pull requests as a guided tour, in your terminal.</h1>
+        <h1>Read a code change the way the code runs, in your terminal.</h1>
         <p class="lede">
-          A diff lists files alphabetically, but code runs from an entry point through the functions it calls. Guided Review reorders a PR to match: chapters follow each route, command, or handler
-          through the change, with its tests beside it. Draft comments as you go and submit them as one GitHub review.
+          A diff lists files alphabetically. Code runs from an entry point through the functions it calls. Guided Review turns a change into a tour that follows that path: chapters walk each route,
+          command, or handler through the changed code, with its tests beside it. It works on a pull request, your own branch, or uncommitted work. Draft comments as you go and post them as one GitHub
+          review.
         </p>
         <div class="install">
           <code><span class="prompt">$ </span><span id="cmd">npm install -g @haydenmeloche/guided-review</span></code>
@@ -380,6 +381,7 @@
           <pre><span class="p">$ </span>gr                    <span class="c"># pick a PR waiting for your review</span>
 <span class="p">$ </span>gr review 1234        <span class="c"># or owner/repo#1234, or a PR URL</span>
 <span class="p">$ </span>gr preview            <span class="c"># tour your own branch before opening a PR</span>
+<span class="p">$ </span>gr feedback           <span class="c"># work through the review on your own PR</span>
 <span class="p">$ </span>gr review --no-agent  <span class="c"># static analysis only, no model calls</span></pre>
         </div>
       </div>
@@ -389,8 +391,8 @@
           ><img
             src="images/chapter.webp"
             width="2000"
-            height="1191"
-            alt="A chapter of a Guided Review tour: an explanation of the hunk, the changed code, and linked tests with their diffs side by side"
+            height="1178"
+            alt="A chapter of a Guided Review tour: the chapter list, an explanation of the hunk, the changed code with review threads, and linked tests side by side"
         /></a>
         <figcaption>A chapter of a sample PR: an explanation, the changed code, and the linked tests beside it.</figcaption>
       </figure>
@@ -403,16 +405,30 @@
             ><img
               src="images/briefing.webp"
               width="2000"
-              height="1178"
+              height="1185"
               loading="lazy"
-              alt="The briefing screen: a summary of the PR, the author's description, an overview diagram, a list of chapters, and blast radius"
+              alt="The briefing screen: whether the PR can merge, a summary of the PR, chapters in reading order, flagged gaps, the author's description, blast radius, and an overview diagram"
           /></a>
         </figure>
         <h2>Ask about any line</h2>
-        <p>Select code and press <code>?</code>. Answers cite the files and lines they come from, and follow-up questions keep the thread.</p>
+        <p>Select code and press <code>a</code>. Answers cite the files and lines they come from, and follow-up questions keep the thread.</p>
         <figure class="shot wide">
           <a href="images/ask.webp"
             ><img src="images/ask.webp" width="2000" height="1137" loading="lazy" alt="A question about a changed line, answered inline below the code with file and line references"
+          /></a>
+        </figure>
+        <h2>Respond to a review</h2>
+        <p>
+          On your own PR, <code>gr feedback</code> turns the review into a work list: each thread with the code it is on and the files it links to. Triage, reply, and send every reply as one review.
+        </p>
+        <figure class="shot wide">
+          <a href="images/feedback-thread.webp"
+            ><img
+              src="images/feedback-thread.webp"
+              width="2000"
+              height="1190"
+              loading="lazy"
+              alt="A review thread in gr feedback: the commented code, the discussion, and the files the comment links to, read at the commit it names"
           /></a>
         </figure>
       </section>
@@ -452,6 +468,17 @@
             <h3>Preview your own branch</h3>
             <p>Run <code>gr preview</code> to tour your branch before you open a PR and see your change the way a reviewer will.</p>
           </div>
+          <div class="card">
+            <h3>Answer the review</h3>
+            <p>
+              Run <code>gr feedback</code> on your own PR: threads grouped by the code they are on, change requests first, outdated ones followed to where their lines are now. Triage each one, queue
+              replies, and send them as one review.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Merge when it's ready</h3>
+            <p>See what blocks a merge and read failing checks' logs without leaving the terminal. Press <code>M</code> to merge, with a commit message the model drafts for you to edit.</p>
+          </div>
         </div>
       </section>
 
@@ -471,11 +498,8 @@
             <h3>Dependencies and runtimes</h3>
             <p>
               For an upgrade, <code>name old → new</code> and the highlights in between: features, breaking changes, and security fixes. For a new or removed package, what it is and where it is used.
+              A manifest is read with its lockfile: the package changes it caused, listed under its diff, without paging through thousands of lines.
             </p>
-          </div>
-          <div class="card">
-            <h3>Lockfile changes</h3>
-            <p>One summary of indirect changes: major version jumps, notable packages added or removed, and known security fixes, without paging through thousands of lines.</p>
           </div>
           <div class="card">
             <h3>Infrastructure</h3>

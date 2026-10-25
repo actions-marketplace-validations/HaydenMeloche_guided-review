@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text } from './themed.js';
 import { SURFACES } from './theme.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
@@ -89,7 +89,8 @@ export function TourIntro(props: {
     const t = setInterval(() => setElapsed(Date.now() - start), FRAME_MS);
     return () => clearInterval(t);
   }, []);
-  useInput((input) => {
+  useInput((input, key) => {
+    if (key.escape) props.onBack?.();
     if (input === 'q') (props.onBack ?? props.onQuit)();
     if (input === 'Q') props.onQuit();
   });

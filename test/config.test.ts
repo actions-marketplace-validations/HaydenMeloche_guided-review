@@ -11,6 +11,9 @@ import {
   loadUserConfig,
   loadThemeSetting,
   loadViewSetting,
+  loadGlyphSetting,
+  loadTipsSeen,
+  saveTipSeen,
   parseRepoConfig,
   PRESET_MODELS,
   presetUserConfig,
@@ -117,6 +120,41 @@ describe('user config', () => {
     expect(() => loadUserConfig()).toThrow(/"modelParams" must be an object of strings/);
   });
 
+  it('validates effort and fastMode, at the top level and in a role', () => {
+    const file = configFile();
+    fs.writeFileSync(file, JSON.stringify({ provider: 'anthropic', model: 'm', effort: 'high', fastMode: false, roles: { qa: { effort: 'max', fastMode: true } } }));
+    expect(loadUserConfig()).toEqual({ provider: 'anthropic', model: 'm', effort: 'high', fastMode: false, roles: { qa: { effort: 'max', fastMode: true } } });
+    fs.writeFileSync(file, JSON.stringify({ provider: 'anthropic', effort: 'extreme' }));
+    expect(() => loadUserConfig()).toThrow(UserConfigError);
+    expect(() => loadUserConfig()).toThrow(/unknown effort "extreme" \(expected low, medium, high, xhigh, max\)/);
+    fs.writeFileSync(file, JSON.stringify({ provider: 'anthropic', roles: { narration: { effort: 2 } } }));
+    expect(() => loadUserConfig()).toThrow(/roles.narration: unknown effort 2/);
+    fs.writeFileSync(file, JSON.stringify({ provider: 'anthropic', roles: { qa: { fastMode: 'yes' } } }));
+    expect(() => loadUserConfig()).toThrow(/roles.qa: "fastMode" must be true or false/);
+  });
+
+  it("lets a role's effort win over the top-level one, which applies to roles without their own", () => {
+    const routing = { provider: 'anthropic' as const, model: 'big', effort: 'high' as const, roles: { narration: { model: 'small', effort: 'low' as const }, briefing: { model: 'small' } } };
+    expect(configForRole(routing, 'narration').effort).toBe('low');
+    expect(configForRole(routing, 'briefing').effort).toBe('high');
+    expect(configForRole(routing, 'qa').effort).toBe('high');
+  });
+
+  it('presets low effort for the briefing and narration on Claude, OpenAI, and Codex, and none for Q&A', () => {
+    for (const provider of ['anthropic', 'claude-code', 'bedrock', 'vertex', 'openai', 'codex'] as const) {
+      const config = presetUserConfig(provider, PRESET_MODELS[provider]!);
+      expect(configForRole(config, 'briefing').effort).toBe('low');
+      expect(configForRole(config, 'narration').effort).toBe('low');
+      expect(configForRole(config, 'qa').effort).toBeUndefined();
+      expect(config.effort).toBeUndefined();
+      expect(config.fastMode).toBeUndefined();
+    }
+    for (const provider of ['cursor'] as const) {
+      const config = presetUserConfig(provider, PRESET_MODELS[provider]!);
+      expect(configForRole(config, 'narration').effort).toBeUndefined();
+    }
+  });
+
   it('routes OpenAI briefing and narration to Luna, Q&A to Sol', () => {
     const file = configFile();
     const config = presetUserConfig('openai', PRESET_MODELS.openai!, { apiKeyEnv: 'OPENAI_API_KEY' });
@@ -155,6 +193,31 @@ describe('user config', () => {
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ provider: 'openai', apiKeyEnv: 'KEY', custom: { a: 1 }, hideWhitespace: false });
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     expect(loadViewSetting('hideWhitespace')).toBe(false);
+  });
+
+  it('remembers first-run tips shown, without touching the rest of the config', () => {
+    const file = configFile();
+    expect(loadTipsSeen()).toEqual([]);
+    saveTipSeen('first-chapter');
+    expect(fs.existsSync(file)).toBe(false); // no config yet: nothing is created
+    fs.writeFileSync(file, '{"provider":"none"}\n');
+    saveTipSeen('first-chapter');
+    saveTipSeen('first-chapter');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ provider: 'none', tipsSeen: ['first-chapter'] });
+    expect(loadTipsSeen()).toEqual(['first-chapter']);
+    fs.writeFileSync(file, '{"tipsSeen":"all"}\n');
+    expect(() => loadTipsSeen()).toThrow(/"tipsSeen" must be a list of tip names/);
+  });
+
+  it('reads the glyph set without a provider: unicode by default, or ascii', () => {
+    const file = configFile();
+    expect(loadGlyphSetting()).toBe('unicode');
+    fs.writeFileSync(file, '{"glyphs":"ascii"}\n');
+    expect(loadGlyphSetting()).toBe('ascii');
+    fs.writeFileSync(file, '{"provider":"openai","glyphs":"ascii"}\n');
+    expect(loadUserConfig().glyphs).toBe('ascii');
+    fs.writeFileSync(file, '{"glyphs":"emoji"}\n');
+    expect(() => loadGlyphSetting()).toThrow(/unknown glyphs "emoji" \(expected unicode or ascii\)/);
   });
 
   it('reads and saves the color theme without a provider and leaves the rest of the config alone', () => {

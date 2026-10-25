@@ -1,0 +1,60 @@
+ ‹b›Keys‹/›‹dim› · chapter‹/›
+ ‹b,dim›Move       ‹/›‹cyan›n / p         ‹/›Next or previous hunk (n marks it read), on into the next chapter
+ ‹b,dim›           ‹/›‹cyan›N / P, ] / [  ‹/›Next or previous chapter, including optional chapters
+ ‹b,dim›           ‹/›‹cyan›j / k, J / K  ‹/›Move by line (or 10 lines) inside the hunk
+
+ ‹b,dim›Comment    ‹/›‹cyan›c / C         ‹/›Comment on the selected line or range (on your draft: edit it) / on the …
+ ‹b,dim›           ‹/›‹cyan›v             ‹/›Start or end a range selection
+ ‹b,dim›           ‹/›‹cyan›In a comment  ‹/›@ people/code (@callers: @tests: @threads: …) · ctrl+x deletes your draft
+ ‹b,dim›           ‹/›‹cyan›^T            ‹/›In a comment: suggest a code change with AI
+
+ ‹b,dim›Threads    ‹/›‹cyan›e             ‹/›Read existing review threads on the selected line inline
+ ‹b,dim›           ‹/›‹cyan›y             ‹/›Reply to an existing review thread on the selected line
+
+ ‹b,dim›Ask        ‹/›‹cyan›a             ‹/›Ask the model about the selection
+
+ ‹b,dim›View       ‹/›‹cyan›t             ‹/›Focus the test pane (narrow terminals: toggle source/tests)
+ ‹dim›           ‹/›‹cyan,b›tab / shift+tab‹/›Move focus between the chapter list, the explanation, the code, and the…
+ ‹b,dim›           ‹/›‹cyan›Focused list  ‹/›j/k choose · enter open the chapter · esc back to the code
+ ‹b,dim›           ‹/›‹cyan›Focused explanation‹/›j/k scroll · enter read it all · esc back to the code
+ ‹b,dim›           ‹/›‹cyan›Focused tests ‹/›n/p test · j/k line · c comment · a ask · t/Esc back to source
+ ‹b,dim›           ‹/›‹cyan›d             ‹/›Chapter diagram (select a node to jump to its code)
+ ‹b,dim›           ‹/›‹cyan›+ / -         ‹/›Show 10 more or fewer lines of the file around the hunk
+
+ ‹b,dim›Read       ‹/›‹cyan›x / z / u     ‹/›Mark the hunk skipped / deferred / unread
+ ‹b,dim›           ‹/›‹cyan›f             ‹/›Cycle Guided, Risk first, Small first, and File order
+ ‹b,dim›           ‹/›‹cyan›D             ‹/›Re-review: switch between only new and changed hunks and the full review
+
+ ‹b,dim›Settings   ‹/›‹cyan›S             ‹/›Split view (old beside new) or inline
+ ‹b,dim›           ‹/›‹cyan›w             ‹/›Hide or show whitespace-only changes
+ ‹b,dim›           ‹/›‹cyan›r             ‹/›Raw unified diff for the hunk
+ ‹b,dim›           ‹/›‹cyan›T             ‹/›Hide or show the test pane beside the code
+ ‹b,dim›           ‹/›‹cyan›U             ‹/›Expand or collapse possible test gaps in the explanation
+ ‹b,dim›           ‹/›‹cyan›m             ‹/›Move the hunk to another chapter
+ ‹b,dim›           ‹/›‹cyan›i             ‹/›Team checklist for this chapter
+ ‹b,dim›           ‹/›‹cyan›R             ‹/›Rebuild the tour on a newer PR head after the author pushes
+ ‹b,dim›           ‹/›‹cyan›o             ‹/›Open the hunk in your coding agent (set in gr config)
+ ‹b,dim›           ‹/›‹cyan›L             ‹/›Color theme (previews as you move through the list)
+ ‹b,dim›           ‹/›‹cyan›\             ‹/›Show or hide the chapter list beside the chapter (wide terminals)
+
+ ‹b,dim›Go         ‹/›‹cyan›:             ‹/›Command palette: every action here, and go to a file or chapter
+ ‹b,dim›           ‹/›‹cyan›b / s         ‹/›Briefing / submit screen
+ ‹b,dim›           ‹/›‹cyan›esc / q, Q    ‹/›Back to the briefing (esc first clears a range) / quit (progress is save…
+
+ ‹b,dim›Everywhere ‹/›‹cyan›esc           ‹/›close what is open, or go back a level
+ ‹b,dim›           ‹/›‹cyan›q             ‹/›go up a level
+ ‹b,dim›           ‹/›‹cyan›Q             ‹/›quit
+ ‹b,dim›           ‹/›‹cyan›?             ‹/›these keys
+
+
+
+
+
+
+
+
+
+
+
+
+  ‹cyan,b›esc‹/› close

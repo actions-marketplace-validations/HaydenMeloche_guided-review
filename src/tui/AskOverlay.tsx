@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text } from './themed.js';
 import type { Hunk } from '../types.js';
 import { TextInput } from './TextInput.js';
@@ -8,6 +8,8 @@ import type { AgentContext } from '../agent/types.js';
 import { line, MdLineView, renderMarkdown, wrapSpans, type MdLine } from './markdown.js';
 import { wrap } from './nav.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
+import { Working } from './Spinner.js';
+import { Hints } from './KeyBar.js';
 
 // Streamed text is applied at most this often (about 30 fps): each update re-renders Ink,
 // which costs far more than parsing the token.
@@ -16,7 +18,19 @@ export const ASK_FLUSH_MS = 33;
 // Ask the agent beside the current review context. Answers stream in place, and each
 // question joins a thread so follow-ups keep the earlier questions and answers in view.
 // Without an agent it says why (aiOff) and takes no question.
-export function AskOverlay(props: { hunk?: Hunk; lineIdx?: number; endIdx?: number; target: string; agent?: AgentContext; aiOff?: string; width: number; height: number; onClose: () => void }) {
+export function AskOverlay(props: {
+  hunk?: Hunk;
+  lineIdx?: number;
+  endIdx?: number;
+  context?: string;
+  placeholder?: string;
+  target: string;
+  agent?: AgentContext;
+  aiOff?: string;
+  width: number;
+  height: number;
+  onClose: () => void;
+}) {
   const [q, setQ] = useState('');
   const [turns, setTurns] = useState<AskTurn[]>([]);
   const [busy, setBusy] = useState(false);
@@ -59,7 +73,7 @@ export function AskOverlay(props: { hunk?: Hunk; lineIdx?: number; endIdx?: numb
     setBusy(true);
     abort.current = new AbortController();
     try {
-      const r = await ask({ ...props.agent, question, history, hunk: props.hunk, lineIdx: props.lineIdx, endIdx: props.endIdx, onText, signal: abort.current.signal });
+      const r = await ask({ ...props.agent, question, history, hunk: props.hunk, lineIdx: props.lineIdx, endIdx: props.endIdx, context: props.context, onText, signal: abort.current.signal });
       // The final flush always lands, so the complete answer is shown.
       flush();
       if (r.value) setAnswer(() => r.value);
@@ -119,10 +133,38 @@ export function AskOverlay(props: { hunk?: Hunk; lineIdx?: number; endIdx?: numb
           onSubmit={(question) => void submit(question)}
           width={inner}
           maxRows={2}
-          placeholder={turns.length ? 'ask a follow-up…' : 'e.g. "why is this nullable?" or "what calls this?"'}
+          placeholder={turns.length ? 'ask a follow-up…' : (props.placeholder ?? 'e.g. "why is this nullable?" or "what calls this?"')}
         />
       )}
-      <Text dimColor>{!props.agent ? 'esc: close' : busy ? 'thinking… (esc to stop)' : turns.length ? 'enter: follow up · ↑/↓: scroll · esc: close' : 'enter: ask · esc: close'}</Text>
+      {busy && props.agent ? (
+        // Until the answer starts, a spinner and the seconds so far; once it streams, the answer
+        // shows the progress itself.
+        turns.at(-1)?.answer ? (
+          <Text dimColor>answering · esc stops it</Text>
+        ) : (
+          <Text>
+            <Working label="thinking" color="magenta" />
+            <Text dimColor> · esc stops it</Text>
+          </Text>
+        )
+      ) : (
+        <Hints
+          keys={
+            !props.agent
+              ? [['esc', 'close']]
+              : turns.length
+                ? [
+                    ['enter', 'follow up'],
+                    ['↑/↓', 'scroll'],
+                    ['esc', 'close'],
+                  ]
+                : [
+                    ['enter', 'ask'],
+                    ['esc', 'close'],
+                  ]
+          }
+        />
+      )}
     </Box>
   );
 }

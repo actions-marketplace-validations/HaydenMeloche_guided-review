@@ -5,9 +5,9 @@ import { detectCodingAgents, detectGitHub, detectProviders } from '../src/detect
 import { checkModels, distinctModels } from '../src/agent/check.js';
 import { cleanLabel, cursorOption, defaultParams, findVariant, KNOWN_MODELS, listModels, type ModelOption } from '../src/agent/models.js';
 import { configForRole, formatModel, routingIdentity } from '../src/agent/types.js';
-import { buildConfig, githubConfig, githubDefaults, githubProblems, modelDefaults, modelNotes, modelProblems, modelReady, replacesOverrides, type SetupResult } from '../src/setup.js';
+import { buildConfig, githubConfig, githubDefaults, githubProblems, modelDefaults, modelNotes, modelProblems, modelReady, offersFastMode, replacesOverrides, type SetupResult } from '../src/setup.js';
 import { NO_PROVIDER, PRESET_MODELS, presetUserConfig, type UserConfig } from '../src/config.js';
-import { providerRows, SetupWizard, type Detected } from '../src/tui/SetupWizard.js';
+import { Form, providerRows, SetupWizard, type Detected, type Field } from '../src/tui/SetupWizard.js';
 import { terminalPalette, themeList } from '../src/tui/theme.js';
 import { waitFor } from './helpers/waitFor.js';
 
@@ -125,6 +125,57 @@ describe('setup answers', () => {
     expect(replacesOverrides(current, 'anthropic')).toBe(false);
     current.roles!.narration = { model: 'claude-haiku-5-5', toolCalling: false };
     expect(replacesOverrides(current, 'anthropic')).toBe(true);
+  });
+
+  it('presets low effort for summaries and keeps effort and fast mode set by hand while the provider stays', () => {
+    const current: UserConfig = presetUserConfig('anthropic', { fast: 'claude-haiku-5-5', strong: 'claude-opus-5-5' });
+    expect(current.roles).toMatchObject({ briefing: { effort: 'low' }, narration: { effort: 'low' } });
+    expect(current.roles!.qa).not.toHaveProperty('effort');
+    current.roles!.narration!.effort = 'medium';
+    current.roles!.qa = { ...current.roles!.qa, fastMode: true };
+    expect(replacesOverrides(current, 'anthropic')).toBe(false);
+    const same = buildConfig(current, modelDefaults('anthropic', current as never), undefined, undefined);
+    expect(same.roles).toMatchObject({ briefing: { effort: 'low' }, narration: { effort: 'medium' }, qa: { fastMode: true } });
+    const other = buildConfig(current, modelDefaults('openai', current as never), undefined, undefined);
+    // Another provider starts from its own preset, not the effort set by hand.
+    expect(other.roles?.narration?.effort).toBe('low');
+    expect(other.roles?.qa).not.toHaveProperty('fastMode');
+  });
+
+  it('presets low effort for OpenAI and Codex summaries and keeps priority processing set by hand', () => {
+    for (const provider of ['openai', 'codex'] as const) {
+      const current: UserConfig = presetUserConfig(provider, PRESET_MODELS[provider]!);
+      expect(current.roles).toMatchObject({ briefing: { effort: 'low' }, narration: { effort: 'low' } });
+      expect(current.roles!.qa).not.toHaveProperty('effort');
+      expect(current).not.toHaveProperty('fastMode');
+      current.roles!.qa = { ...current.roles!.qa, effort: 'xhigh', fastMode: true };
+      const same = buildConfig(current, modelDefaults(provider, current as never), undefined, undefined);
+      expect(same.roles).toMatchObject({ narration: { effort: 'low' }, qa: { effort: 'xhigh', fastMode: true } });
+    }
+  });
+
+  it('asks about fast mode for Q&A with Anthropic, OpenAI, and Codex, starting at no', () => {
+    for (const provider of ['anthropic', 'openai', 'codex'] as const) {
+      const a = modelDefaults(provider, undefined);
+      expect(a.qaFastMode).toBe(false);
+      expect(buildConfig(undefined, a, undefined, undefined).roles?.qa).not.toHaveProperty('fastMode');
+      const on = buildConfig(undefined, { ...a, qaFastMode: true }, undefined, undefined);
+      expect(on.roles?.qa?.fastMode).toBe(true);
+      expect(on.roles?.narration).not.toHaveProperty('fastMode');
+      // The saved answer is where setup starts next time, and no turns it off again, even when
+      // fastMode was set at the top level by hand.
+      expect(modelDefaults(provider, on as never).qaFastMode).toBe(true);
+      const off = buildConfig({ ...on, fastMode: true }, { ...modelDefaults(provider, on as never), qaFastMode: false }, undefined, undefined);
+      expect(configForRole(off as never, 'qa').fastMode).toBe(false);
+    }
+    // Other providers keep a hand-set fastMode, since setup doesn't ask.
+    expect(offersFastMode('cursor')).toBe(false);
+  });
+
+  it('leaves effort and fast mode out of what the tour cache compares', () => {
+    const routing = presetUserConfig('anthropic', PRESET_MODELS.anthropic!);
+    const tuned = { ...routing, fastMode: true, roles: { ...routing.roles, narration: { ...routing.roles!.narration, effort: 'high' as const } } };
+    expect(routingIdentity(tuned as never)).toBe(routingIdentity(routing as never));
   });
 
   it("doesn't let one task inherit the other's Cursor variant", () => {
@@ -327,6 +378,12 @@ describe('setup wizard', () => {
     expect(other.map((r) => r.value)).toEqual(expect.arrayContaining(['openai-compatible', NO_PROVIDER]));
   });
 
+  it('puts no model right after the recommended providers, and leaves out one that is off for now', () => {
+    const { other } = providerRows([]);
+    expect(other.map((r) => r.value)).toEqual(['anthropic', 'openai', 'cursor', NO_PROVIDER, 'codex', 'openai-compatible', 'bedrock', 'vertex']);
+    expect([...new Set(other.map((r) => r.group))]).toEqual(['Recommended', 'Without a model', 'Other']);
+  });
+
   async function wizard(detected: Detected, env: NodeJS.ProcessEnv, current?: UserConfig, models: ModelOption[] = []) {
     const listModelsFn = vi.fn(async (): Promise<ModelOption[]> => models);
     const onDone = vi.fn<(r: SetupResult) => void>();
@@ -351,7 +408,7 @@ describe('setup wizard', () => {
 
   it('takes a first run from the welcome card to a saved config in a few Enters', async () => {
     const { ui, onDone, checkModelsFn } = await wizard(codexFound, {});
-    await waitFor(() => expect(ui.lastFrame()).toContain('turns a pull request into a guided tour'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('turns a pull request into a tour'));
     ui.stdin.write(ENTER);
     await waitFor(() => expect(ui.lastFrame()).toContain('Color theme'));
     ui.stdin.write(ENTER);
@@ -417,6 +474,11 @@ describe('setup wizard', () => {
     ui.stdin.write('\u001B[D');
     await waitFor(() => expect(ui.lastFrame()).toContain('◀ claude-opus-5-5 ▶'));
     ui.stdin.write(ENTER);
+    // Fast mode for Q&A starts off; → turns it on.
+    await waitFor(() => expect(ui.lastFrame()).toContain('◀ off: standard speed and price ▶'));
+    ui.stdin.write('\u001B[C');
+    await waitFor(() => expect(ui.lastFrame()).toContain('◀ on: faster answers, about double the price (Opus only) ▶'));
+    ui.stdin.write(ENTER);
     await keepAgent(ui);
     await waitFor(() => expect(ui.lastFrame()).toContain('GitHub access'));
     expect(ui.lastFrame()).toContain('is not installed');
@@ -425,6 +487,7 @@ describe('setup wizard', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('API URL'));
     ui.stdin.write(ENTER);
     await waitFor(() => expect(ui.lastFrame()).toContain('Ready to save'));
+    expect(ui.lastFrame()).toContain('Q&A: claude-opus-5-5, fast mode');
     await waitFor(() => expect(ui.lastFrame()).toContain('signed in to GitHub as octocat'));
     ui.stdin.write(ENTER);
     await waitFor(() => expect(onDone).toHaveBeenCalled());
@@ -433,10 +496,36 @@ describe('setup wizard', () => {
       provider: 'anthropic',
       apiKey: 'sk-ant-secret',
       model: 'claude-opus-5-5',
-      roles: { briefing: { model: 'claude-sonnet-5-5' }, qa: { model: 'claude-opus-5-5' } },
+      roles: { briefing: { model: 'claude-sonnet-5-5' }, qa: { model: 'claude-opus-5-5', fastMode: true } },
       github: { tokenEnv: 'GITHUB_TOKEN' },
     });
     expect(listModelsFn).not.toHaveBeenCalled();
+    ui.unmount();
+  });
+
+  it('starts every value in the same column, with or without arrows', async () => {
+    const options = [
+      { value: 'a', label: 'off: standard' },
+      { value: 'b', label: 'on' },
+    ];
+    const fields: Field[] = [
+      { id: 'fast', label: 'Briefing and narration', kind: 'select', value: 'gpt-6-luna', options: [{ value: 'gpt-6-luna', label: '' }] },
+      { id: 'strong', label: 'Q&A', kind: 'select', value: 'gpt-6.1-sol', options: [{ value: 'gpt-6.1-sol', label: '' }], tight: true },
+      { id: 'mode', label: '  Fast mode', kind: 'choice', value: 'a', options },
+      { id: 'env', label: 'Variable', kind: 'text', value: 'OPENAI_API_KEY' },
+    ];
+    const ui = render(<Form fields={fields} width={80} onChange={() => {}} onSubmit={() => {}} onBack={() => {}} />);
+    const column = (text: string) =>
+      ui
+        .lastFrame()!
+        .split('\n')
+        .find((l) => l.includes(text))!
+        .indexOf(text);
+    // The focused select, an unfocused choice (no arrows), and plain text all line up.
+    const at = column('gpt-6-luna ▶');
+    expect(column('gpt-6.1-sol')).toBe(at);
+    expect(column('off: standard')).toBe(at);
+    expect(column('OPENAI_API_KEY')).toBe(at);
     ui.unmount();
   });
 
@@ -477,6 +566,9 @@ describe('setup wizard', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('◀ gpt-6-sol ▶'));
     ui.stdin.write(ENTER);
     ui.stdin.write(ENTER);
+    await waitFor(() => expect(ui.lastFrame()).toContain('◀ off: standard speed and price ▶'));
+    expect(ui.lastFrame()).toContain('or on: priority processing, faster answers at a higher price');
+    ui.stdin.write(ENTER);
     await keepAgent(ui);
     await waitFor(() => expect(ui.lastFrame()).toContain('Ready to save'));
     ui.stdin.write(ENTER);
@@ -502,9 +594,9 @@ describe('setup wizard', () => {
     ui.stdin.write(DOWN); // the summaries model
     await waitFor(() => expect(ui.lastFrame()).toContain('◀ grok-4.7 ▶'));
     // The preset's variant: low effort, fast, 256k.
-    expect(ui.lastFrame()).toMatch(/Context\s+‹ 256K ›/);
-    expect(ui.lastFrame()).toMatch(/Effort\s+‹ Low ›/);
-    expect(ui.lastFrame()).toMatch(/Fast\s+‹ fast \(costs more\) ›/);
+    expect(ui.lastFrame()).toMatch(/Context\s+256K$/m);
+    expect(ui.lastFrame()).toMatch(/Effort\s+Low$/m);
+    expect(ui.lastFrame()).toMatch(/Fast\s+fast \(costs more\)$/m);
     ui.stdin.write(DOWN); // Context
     await waitFor(() => expect(ui.lastFrame()).toContain('◀ 256K ▶'));
     expect(ui.lastFrame()).toContain('500K (Max Mode)');
@@ -523,7 +615,7 @@ describe('setup wizard', () => {
     for (let i = 0; i < 5; i++) ui.stdin.write(ENTER); // the Q&A model and its three parameters
     await keepAgent(ui);
     await waitFor(() => expect(ui.lastFrame()).toContain('Ready to save'));
-    expect(ui.lastFrame()).toContain('Summaries and narration: grok-4.7 (256k, high)');
+    expect(ui.lastFrame()).toContain('Briefing and narration: grok-4.7 (256k, high)');
     expect(ui.lastFrame()).toContain('Q&A: grok-4.7 (256k, high)');
     ui.stdin.write(ENTER);
     await waitFor(() => expect(onDone).toHaveBeenCalled());
@@ -555,8 +647,8 @@ describe('setup wizard', () => {
     expect(ui.lastFrame()).not.toContain('Effort');
     ui.stdin.write('\u001B[C');
     // Grok's default is Max Mode at 500k; setup starts it on the same settings at 256k.
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/Context\s+‹ 256K ›/));
-    expect(ui.lastFrame()).toMatch(/Effort\s+‹ High ›/);
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/Context\s+256K$/m));
+    expect(ui.lastFrame()).toMatch(/Effort\s+High$/m);
     ui.unmount();
   });
 
@@ -584,7 +676,7 @@ describe('setup wizard', () => {
     ui.stdin.write(ENTER);
     await keepAgent(ui);
     await waitFor(() => expect(ui.lastFrame()).toContain('Provider: openai-compatible (http://localhost:1234/v1)'));
-    expect(ui.lastFrame()).toContain('Summaries and narration: gemma4');
+    expect(ui.lastFrame()).toContain('Briefing and narration: gemma4');
     ui.stdin.write(ENTER);
     await waitFor(() => expect(onDone).toHaveBeenCalled());
     const result = onDone.mock.calls[0][0];
@@ -659,14 +751,14 @@ describe('setup wizard', () => {
     ui.stdin.write(DOWN); // the summaries model, a text field while there is no list
     await waitFor(() => expect(ui.lastFrame()).toContain('listing your models failed: network down'));
     ui.stdin.write('\u0015'); // Ctrl+U clears it
-    await waitFor(() => expect(ui.lastFrame()).not.toMatch(/Summaries and narration\s+grok/));
+    await waitFor(() => expect(ui.lastFrame()).not.toMatch(/Briefing and narration\s+grok/));
     ui.stdin.write('grok-4.7');
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/Summaries and narration\s+grok-4\.7/));
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/Briefing and narration\s+grok-4\.7/));
     ui.stdin.write(ENTER);
     ui.stdin.write(ENTER);
     await keepAgent(ui);
     await waitFor(() => expect(ui.lastFrame()).toContain('Ready to save'));
-    expect(ui.lastFrame()).toContain('Summaries and narration: grok-4.7 (256k, low, fast)');
+    expect(ui.lastFrame()).toContain('Briefing and narration: grok-4.7 (256k, low, fast)');
     ui.stdin.write(ENTER);
     await waitFor(() => expect(onDone).toHaveBeenCalled());
     const result = onDone.mock.calls[0][0];
@@ -748,7 +840,7 @@ describe('setup wizard', () => {
     const current = presetUserConfig('codex', { fast: 'gpt-6-luna', strong: 'gpt-6.1-sol' });
     const { ui, onDone } = await wizard(codexFound, {}, current);
     await waitFor(() => expect(ui.lastFrame()).toContain('Provider: codex'));
-    expect(ui.lastFrame()).not.toContain('turns a pull request into a guided tour');
+    expect(ui.lastFrame()).not.toContain('turns a pull request into a tour');
     ui.stdin.write('q');
     await waitFor(() => expect(onDone).toHaveBeenCalledWith({ kind: 'cancelled' }));
     ui.unmount();

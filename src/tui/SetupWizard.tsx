@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { render, useApp, useInput, useWindowSize } from 'ink';
 import { Box, Text, ThemeContext, useSelected, useThemePreview } from './themed.js';
 import { loadPalette, terminalPalette, themeList, TERMINAL_THEME, type Palette, type ThemeInfo } from './theme.js';
@@ -8,7 +8,7 @@ import { pad, truncate, wrap } from './nav.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
 import { detectCodingAgents, detectGitHub, detectProviders, LOOKED_FOR, type GitHubFinding, type ProviderFinding } from '../detect.js';
 import { CODING_AGENTS, CUSTOM_AGENT, customCommandProblem, DEFAULT_CODING_AGENT, PROMPT_PLACEHOLDER, type CodingAgent, type CodingAgentSetting } from '../codingAgent.js';
-import { checkModels, type ModelCheck } from '../agent/check.js';
+import { CHECK_MS, checkModels, type ModelCheck } from '../agent/check.js';
 import { defaultParams, findVariant, KNOWN_MODELS, listModels, LISTS_MODELS, type ModelOption } from '../agent/models.js';
 import { NO_PROVIDER, type GitHubConfig, type UserConfig } from '../config.js';
 import {
@@ -23,6 +23,7 @@ import {
   modelNotes,
   modelProblems,
   modelReady,
+  offersFastMode,
   previousRouting,
   PROVIDER_CHOICES,
   replacesOverrides,
@@ -34,6 +35,7 @@ import {
   type SetupResult,
 } from '../setup.js';
 import { agentRouting } from '../config.js';
+import { SCREEN_RENDER } from './renderOptions.js';
 
 // gr's setup, full screen: a welcome card, the color theme (so every later screen is already
 // in it), the model provider with what detection found marked, its details when something is
@@ -97,6 +99,7 @@ interface ProviderRow {
   finding?: ProviderFinding;
   unavailable?: string;
   recommended?: boolean;
+  group?: string; // the heading it is listed under among the choices
   missing?: string; // what detection looked for and didn't find
 }
 
@@ -106,13 +109,18 @@ export const rowKey = (row: ProviderRow): string => (row.finding?.baseUrl ? `${r
 
 export function providerRows(found: ProviderFinding[], detected = true): { found: ProviderRow[]; other: ProviderRow[] } {
   const choice = (v: ProviderChoice) => PROVIDER_CHOICES.find((c) => c.value === v)!;
-  const foundRows = found.map((f) => ({ ...choice(f.provider), finding: f }));
+  const foundRows = found.filter((f) => !choice(f.provider).unavailable).map((f) => ({ ...choice(f.provider), finding: f }));
   const isFound = (v: ProviderChoice) => found.some((f) => f.provider === v);
-  // A local server found doesn't rule out a remote compatible endpoint.
-  const other = PROVIDER_CHOICES.filter((c) => c.value === 'openai-compatible' || c.value === NO_PROVIDER || !isFound(c.value)).map((c) => ({
+  // A local server found doesn't rule out a remote compatible endpoint. A provider that is off
+  // for now is left out rather than shown as a choice that refuses.
+  const rest = PROVIDER_CHOICES.filter((c) => !c.unavailable && (c.value === 'openai-compatible' || c.value === NO_PROVIDER || !isFound(c.value))).map((c) => ({
     ...c,
-    missing: detected && c.value !== NO_PROVIDER && !c.unavailable && !isFound(c.value) ? LOOKED_FOR[c.value] : undefined,
+    group: c.recommended ? 'Recommended' : c.value === NO_PROVIDER ? 'Without a model' : 'Other',
+    missing: detected && c.value !== NO_PROVIDER && !isFound(c.value) ? LOOKED_FOR[c.value] : undefined,
   }));
+  // Recommended first, then no model at all (the free way to try gr), then the rest.
+  const order = ['Recommended', 'Without a model', 'Other'];
+  const other = order.flatMap((g) => rest.filter((r) => r.group === g));
   return { found: foundRows, other };
 }
 
@@ -160,7 +168,7 @@ export function SetupWizard(props: WizardProps) {
 
   const width = columns - 2;
   const height = rows - 2;
-  const steps: [Step, string][] = [['theme', 'Theme'], ['provider', 'Model'], ['agent', 'Agent'], ...(needsGitHub ? ([['github', 'GitHub']] as [Step, string][]) : []), ['finish', 'Finish']];
+  const steps: [Step, string][] = [['theme', 'Theme'], ['provider', 'Model'], ['agent', 'Coding agent'], ...(needsGitHub ? ([['github', 'GitHub']] as [Step, string][]) : []), ['finish', 'Finish']];
   const stepIndex = steps.findIndex(([s]) => s === (step === 'details' ? 'provider' : step));
   const body = height - 1;
 
@@ -300,13 +308,13 @@ function Welcome(props: WizardProps & { width: number; height: number; onStart: 
           <>
             <Box width={textW}>
               <Text>
-                Guided Review turns a pull request into a guided tour: chapters that follow the code's flow, tests beside each change, and risk flags, with a briefing and narration from a model if you
-                connect one. Nothing posts to GitHub until you submit your review.
+                Guided Review turns a pull request into a tour: a briefing that says what it does, then chapters of related changes that follow the code's flow, each read one hunk at a time with its
+                tests beside it. With a model, each chapter is narrated too. Nothing posts to GitHub until you submit your review.
               </Text>
             </Box>
             <Text> </Text>
             <Box width={textW}>
-              <Text dimColor>Let's set you up: a color theme, a model, and GitHub access. It takes about a minute, and gr config changes it any time.</Text>
+              <Text dimColor>Let's set you up: a color theme, a model, your coding agent, and GitHub access. It takes about a minute, and gr config changes it any time.</Text>
             </Box>
           </>
         ) : (
@@ -423,8 +431,12 @@ function ProviderStep(props: { width: number; height: number; detected?: Detecte
       )}
       {found.map((r, i) => line(r, i))}
       <Text> </Text>
-      <Text dimColor> {found.length ? 'Other choices' : 'Choices'}</Text>
-      {other.map((r, i) => line(r, found.length + i))}
+      {other.map((r, i) => (
+        <Fragment key={rowKey(r)}>
+          {r.group !== other[i - 1]?.group ? <Text dimColor> {r.group}</Text> : null}
+          {line(r, found.length + i)}
+        </Fragment>
+      ))}
       <Text> </Text>
       <Para text={notice || row.about} width={props.width} color={notice ? 'yellow' : undefined} dim={!notice} />
       <Box flexGrow={1} />
@@ -602,7 +614,10 @@ export function Form(props: { fields: Field[]; width: number; onChange: (id: str
     if (typed) props.onChange(field.id, field.value + typed);
   });
 
-  const labelW = Math.min(28, Math.max(...fields.map((f) => f.label.length)) + 2);
+  // Only the focused field shows arrows, and the leading one hangs in the gap before its value, so
+  // every value's text starts in the same column; the gap leaves a space before an arrow.
+  const arrowed = (f: Field) => f.kind === 'choice' || f.kind === 'select';
+  const labelW = Math.min(28, Math.max(...fields.map((f) => f.label.length + (arrowed(f) ? 3 : 2))));
   const valueW = Math.max(10, props.width - labelW - 4);
   return (
     <Box flexDirection="column" width={props.width}>
@@ -618,7 +633,7 @@ export function Form(props: { fields: Field[]; width: number; onChange: (id: str
             <Text wrap="truncate">
               <Text color={here ? 'cyan' : undefined} bold={here}>
                 {` ${here ? '›' : ' '} `}
-                {pad(f.label, labelW)}
+                {pad(f.label, labelW - (here && arrowed(f) ? 2 : 0))}
               </Text>
               {f.kind === 'select' ? (
                 <SelectValue field={f} here={here} width={valueW} />
@@ -639,11 +654,7 @@ export function Form(props: { fields: Field[]; width: number; onChange: (id: str
                     </Text>
                   </Text>
                 ) : (
-                  <Text>
-                    <Text dimColor>‹ </Text>
-                    {tail}
-                    <Text dimColor> ›</Text>
-                  </Text>
+                  <Text>{tail}</Text>
                 )
               ) : (
                 <Text>
@@ -743,6 +754,12 @@ function answerKey(a: ModelAnswers, env: NodeJS.ProcessEnv): string | undefined 
   if (a.keySource === 'env') return env[a.apiKeyEnv.replace(/^\$/, '')] || undefined;
   return undefined;
 }
+
+const FAST_MODE_LABELS = {
+  anthropic: 'on: faster answers, about double the price (Opus only)',
+  openai: 'on: priority processing, faster answers at a higher price',
+  codex: 'on: priority processing, faster answers that use up your Codex limits sooner',
+};
 
 function DetailsStep(props: {
   width: number;
@@ -858,17 +875,29 @@ function DetailsStep(props: {
     }));
   };
   for (const [role, label, about] of [
-    ['fast', 'Summaries and narration', 'A fast model: it writes the briefing and every chapter.'],
+    ['fast', 'Briefing and narration', 'A fast model: it writes the briefing and every chapter.'],
     ['strong', 'Q&A', 'A strong model: it answers your questions with ? during a tour.'],
   ] as const) {
     const params = paramFields(role);
     fields.push({ ...modelField(role, label, about), tight: params.length > 0 }, ...params);
   }
+  if (offersFastMode(a.provider)) {
+    fields.push({
+      id: 'qaFastMode',
+      label: 'Q&A fast mode',
+      kind: 'choice',
+      value: a.qaFastMode ? 'yes' : 'no',
+      options: [
+        { value: 'no', label: 'off: standard speed and price' },
+        { value: 'yes', label: FAST_MODE_LABELS[a.provider as keyof typeof FAST_MODE_LABELS] },
+      ],
+    });
+  }
 
   const notes = modelNotes(a, props.env);
   return (
     <Box flexDirection="column" width={props.width} height={props.height}>
-      <StepTitle width={props.width} title={name} about="Summaries and narration suit a fast model, Q&A a strong one. Enter moves on; the last Enter continues." />
+      <StepTitle width={props.width} title={name} about="The briefing and narration suit a fast model, Q&A a strong one. Enter moves on; the last Enter continues." />
       <Form
         width={props.width}
         fields={fields}
@@ -876,6 +905,7 @@ function DetailsStep(props: {
         onSubmit={props.onDone}
         onChange={(id, value) => {
           if (id === 'toolCalling') return props.onChange({ ...a, toolCalling: value === 'yes' });
+          if (id === 'qaFastMode') return props.onChange({ ...a, qaFastMode: value === 'yes' });
           // Another model starts on its own default variant.
           // Another model starts on its own default variant. A typed one (no list) keeps the
           // variant setup started with when it is that model, so it never falls back to Max Mode.
@@ -1000,6 +1030,16 @@ function FinishStep(props: {
   }, [key, round]);
   const checking = (hasModel && !checks.models) || (!!props.config.github && !checks.github);
   const spin = useSpinner(checking);
+  // Seconds the model check has run, against its limit: a slow first answer reads as progress.
+  const [started, setStarted] = useState(Date.now());
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => setStarted(Date.now()), [key, round]);
+  useEffect(() => {
+    if (!checking) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [checking]);
+  const waited = Math.max(0, Math.floor((now - started) / 1000));
   const failed = !!checks.models?.some((m) => !m.ok) || checks.github?.ok === false;
 
   useInput((input, key) => {
@@ -1032,7 +1072,10 @@ function FinishStep(props: {
             ),
           )
         ) : (
-          <Text color="cyan"> {spin} Sending a test request to your model…</Text>
+          <Text color="cyan">
+            {' '}
+            {spin} Sending a test request to your model… <Text dimColor>{`${waited}s of up to ${CHECK_MS / 1000}s`}</Text>
+          </Text>
         )
       ) : (
         <Text dimColor> No model: tours use static analysis only. Run gr config to add one later.</Text>
@@ -1096,7 +1139,7 @@ export async function runSetupWizard(opts: { firstRun: boolean; current?: UserCo
         app.unmount();
       }}
     />,
-    { alternateScreen: true, exitOnCtrlC: false },
+    { ...SCREEN_RENDER, exitOnCtrlC: false },
   );
   // stdin stays unref'd: gr config then exits, and a tour or the editor after it takes stdin itself.
   await app.waitUntilExit();

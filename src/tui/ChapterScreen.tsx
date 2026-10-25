@@ -1,35 +1,58 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useInput } from 'ink';
-import { Box, Text, usePreviewing, useTheme } from './themed.js';
-import { SURFACES } from './theme.js';
-import type { Chapter, ChapterOrder, DiffFile, DiffLine, Draft, DraftAnchor, ExistingThread, Hunk, ReactionContent, ReadState, TestLink, ThreadComment, Tour } from '../types.js';
-import { MdLineView, line, renderMarkdown, restyle, type MdLine } from './markdown.js';
-import { ChecklistPanel } from './Panels.js';
-import { changedLineCount, chapterState, ORDER_LABEL, pad, progress, riskMark, stateMark, stateOf, truncate, wrap, type States } from './nav.js';
+import { useInput } from './input.js';
+import { Box, Text } from './themed.js';
+import type { Chapter, ChapterOrder, Draft, DraftAnchor, ExistingThread, Hunk, ReactionContent, ReadState, ThreadComment, Tour } from '../types.js';
+import { ChecklistPanel, Reader } from './Panels.js';
+import { firstHunk, hunkPosition, lockPairOfHunk, nextPos, opensOnSummary, pad, pageOf, prevPos, progress, stateOf, summaryHunkIds, type States } from './nav.js';
 import { DiagramView } from './DiagramView.js';
-import { CommentEditor, LABEL_COLOR, type SetComposer } from './CommentEditor.js';
+import { CommentEditor, type SetComposer } from './CommentEditor.js';
 import { INLINE_ROWS, inlineComposerSlot } from './AiSuggestion.js';
 import { ThreadView } from './ThreadView.js';
 import { AskOverlay } from './AskOverlay.js';
-import { highlightDiffLines, highlightSourceLines, type HunkHighlights, type SyntaxSpan } from './highlight.js';
-import { highlightHunkCached, hunkHighlightKey, peekHunkHighlights } from './highlightCache.js';
-import { codePaneWidths, MIN_SPLIT_WIDTH } from './paneWidths.js';
-import { ReviewPopup } from './ReviewPopup.js';
+import { MIN_SPLIT_WIDTH } from './paneWidths.js';
 import type { AgentContext } from '../agent/types.js';
-import { sanitizeTerminal } from '../util/sanitize.js';
-import { foldedLines, pairChangedLines, wordDiff, type CharRange, type Fold } from '../diff/lines.js';
-import { isSpecialKind } from '../analysis/special.js';
-import { safeReadFile } from '../analysis/safeRead.js';
-import { fileLines, headFor, withContext } from '../diff/context.js';
-import { KeyBar } from './KeyBar.js';
+import { KeyBar, type Hint } from './KeyBar.js';
 import { initComposer, isLineAnchor, sameAnchor, type ComposerEnv, type ComposerState, type ReferenceServices } from './composer.js';
 import { generateSuggestion } from '../agent/suggest.js';
+import { safe } from './chapter/text.js';
+import { cursorNotes } from './chapter/lineNotes.js';
+import { useMentions } from './chapter/mentions.js';
+import { linkedTests } from './chapter/linkedTests.js';
+import { SourcePane } from './chapter/SourcePane.js';
+import { TestPane } from './chapter/TestPane.js';
+import { ChapterList, ChapterStrip, ChapterTitle, CollapsedSummary, EmptyChapter, Explanation, Header, LockfileChanges, MoveList, StatusRow } from './chapter/parts.js';
+import { HelpPopup } from './Help.js';
+import { ReviewPopup } from './ReviewPopup.js';
+import { reviewLegend } from './legend.js';
+import { anchorLines, crossesContext, describeAnchor, lineAnchor, newDraft, selectedCode, selRange, testLineAnchor } from './chapter/selection.js';
+import { CONTEXT_STEP, useFoldedCursor, useFolds, useHunkView } from './chapter/hunkView.js';
+import { barEnd, barKeys, PALETTE_HINT, chapterHelp, keyAction, paletteCommands, type Action, type KeyCtx, type View } from './chapter/keys.js';
+import { CommandPalette, type PaletteItem } from './CommandPalette.js';
+import { explanation } from './chapter/guide.js';
+import { lockListLines, lockPage } from './chapter/lockList.js';
+import { unboundKey, useFlash } from './flash.js';
+import { plural } from './plural.js';
+import { chapterLayout, overlaySlots, type OverlayKind } from './chapter/layout.js';
+import { G } from './glyphs.js';
+import { hunkKeys } from '../review/hunkState.js';
+import { WIDE } from './breakpoints.js';
+import { EndCard } from './chapter/EndCard.js';
+import { EVENT_TEXT, suggestVerdict } from '../review/submit.js';
 
 export { KeyBar };
 
+// "src/x.ts:27–31": an open range, by its lines on the side they are on.
+function rangeLabel(hunk: Hunk, sel: [number, number]): string {
+  const at = (i: number) => hunk.lines[i]?.newLine ?? hunk.lines[i]?.oldLine;
+  const [a, b] = [at(sel[0]), at(sel[1])];
+  return `${hunk.file}:${a === b ? a : `${a}–${b}`}`;
+}
+
 export type AgentCtx = AgentContext;
 
-type Overlay = 'none' | 'diagram' | 'comment' | 'thread' | 'reply' | 'ask' | 'move' | 'help' | 'checklist' | 'delete';
+// The open overlay, holding the state only it uses: a comment's draft and composer, the move list's selection.
+type Overlay = { kind: 'none' } | { kind: 'comment'; draft: Draft; composer: ComposerState } | { kind: 'move'; sel: number } | { kind: Exclude<OverlayKind, 'none' | 'comment' | 'move'> };
+const NONE: Overlay = { kind: 'none' };
 
 // v1.1 features that need the worktree, the repo config or the store.
 export interface Services {
@@ -40,37 +63,11 @@ export interface Services {
   loadMentionUsers?: () => Promise<string[]>;
 }
 
-const clean = (s: string) => sanitizeTerminal(s.replace(/\t/g, '  '));
-const safe = sanitizeTerminal;
-const codeChunks = (text: string, width: number) => {
-  const code = clean(text);
-  const size = Math.max(1, width);
-  return code.match(new RegExp(`.{1,${size}}`, 'g')) ?? [''];
-};
-
-// The head's lines of a hunk's file, for expanding its context, or why there are none to show.
-function headOf(hunk: Hunk, files: DiffFile[], root?: string): { lines: string[] } | { reason: string } {
-  const file = files.find((f) => f.path === hunk.file);
-  if (!file || file.status === 'added') return { reason: 'No context to add: this file is new, so the hunk already shows all of it.' };
-  if (file.status === 'deleted') return { reason: 'No context to add: this file is deleted in the PR.' };
-  if (file.binary) return { reason: 'No context to add: this is a binary file.' };
-  if (!root) return { reason: 'Context can be expanded once the checkout is ready.' };
-  const text = safeReadFile(root, hunk.file);
-  if (text === undefined) return { reason: 'Can’t read more of this file: it is over 1 MB, or not a plain file in the checkout.' };
-  const lines = headFor(hunk, fileLines(text));
-  return lines ? { lines } : { reason: 'No context to add: the file has changed since the diff was taken.' };
+// A view setting App owns and saves, or, when it passes none (tests), one the screen keeps.
+function useSetting(value: boolean | undefined, toggle: (() => void) | undefined, initial: boolean): [boolean, () => void] {
+  const [own, setOwn] = useState(initial);
+  return [value ?? own, toggle ?? (() => setOwn((v) => !v))];
 }
-
-const CONTEXT_STEP = 10; // lines + and - add or remove on each side of a hunk
-
-const COVERAGE = {
-  tested: { mark: '●', color: 'green', text: 'tested' },
-  partial: { mark: '◐', color: 'yellow', text: 'partly tested' },
-  untested: { mark: '○', color: 'red', text: 'untested' },
-  'n/a': { mark: ' ', color: 'gray', text: '' },
-} as const;
-
-const LINK_TEXT = { coverage: 'coverage run', 'name-match': 'name match', naming: 'naming guess' } as const;
 
 export function ChapterScreen(props: {
   tour: Tour;
@@ -82,14 +79,16 @@ export function ChapterScreen(props: {
   hi: number;
   order: ChapterOrder;
   deltaOnly: boolean;
-  banner?: string;
+  banner?: string; // a notice that needs a decision (the author pushed); esc folds it into the header
+  busy?: string; // background work, shown quietly in the header
   agent?: AgentCtx;
   aiOff?: string; // why the agent is absent
   width: number;
   height: number;
   active?: boolean;
   setPos: (ci: number, hi: number) => void;
-  setState: (h: Hunk, s: ReadState) => void;
+  // Marks hunks read, skipped, deferred or unread, all in one store write.
+  setState: (hunks: Hunk[], s: ReadState) => void;
   saveDraft: (d: Draft) => void;
   deleteDraft: (d: Draft) => void;
   replyToThread?: (thread: ExistingThread, body: string) => Promise<void>;
@@ -100,6 +99,11 @@ export function ChapterScreen(props: {
   toggleWhitespace?: () => void;
   splitDiff?: boolean; // old and new side by side; the screen keeps its own when unset
   toggleSplit?: () => void;
+  sidebar?: boolean; // the chapter list beside the chapter, when wide; likewise
+  toggleSidebar?: () => void;
+  shortExplanation?: boolean; // the explanation cut to its first lines; likewise
+  toggleExplanation?: () => void;
+  takeTip?: (tip: string) => boolean; // true once per tip: show it (first-run tips)
   hideTestPane?: boolean; // keep linked tests out of the way (t still opens them); likewise
   toggleTestPane?: () => void;
   toggleDelta: () => void;
@@ -110,309 +114,139 @@ export function ChapterScreen(props: {
   onTheme?: () => void; // L: the color theme picker
   services?: Services;
   references?: ReferenceServices; // recent locations, repo index; tests may leave it out
-  back?: () => void; // q: back to the PR list; unset, q quits
   quit: () => void;
 }) {
   const { tour, chapters, states, ci, hi, width, height } = props;
   const chapter = chapters[ci];
   const diffHunk: Hunk | undefined = chapter && hi >= 0 ? tour.hunks[chapter.hunkIds[hi]] : undefined;
   const svc = props.services;
-  // Context the reader expanded around the hunk (+ and -), read from the checkout's head. Keyed
-  // on the hunk, so moving to another hunk starts it unexpanded.
-  const [expand, setExpand] = useState({ id: '', above: 0, below: 0 });
-  const headLines = useMemo(() => {
-    const head = diffHunk && expand.id === diffHunk.id ? headOf(diffHunk, tour.files, svc?.root) : undefined;
-    return head && 'lines' in head ? head.lines : undefined;
-  }, [diffHunk, tour.files, svc?.root, expand.id]);
-  const neighbours = useMemo(() => {
-    const ids = diffHunk ? (tour.files.find((f) => f.path === diffHunk.file)?.hunkIds ?? []) : [];
-    const at = diffHunk ? ids.indexOf(diffHunk.id) : -1;
-    const prev = at > 0 ? tour.hunks[ids[at - 1]] : undefined;
-    const next = at >= 0 ? tour.hunks[ids[at + 1]] : undefined;
-    return { prevEnd: prev?.lines.findLast((l) => l.newLine !== undefined)?.newLine, nextStart: next?.lines.find((l) => l.newLine !== undefined)?.newLine };
-  }, [diffHunk, tour.files, tour.hunks]);
-  // The hunk as shown: the diff's hunk plus any expanded context, with the same id and content hash.
-  const hunk = useMemo(() => (diffHunk && headLines ? withContext(diffHunk, headLines, expand.above, expand.below, neighbours).hunk : diffHunk), [diffHunk, headLines, expand, neighbours]);
-  const [cursor, setCursor] = useState(0);
-  const [anchor, setAnchor] = useState<number | null>(null);
-  const [scroll, setScroll] = useState(0);
-  const [raw, setRaw] = useState(false);
-  const [ownHideWhitespace, setOwnHideWhitespace] = useState(true);
-  const ignoreWhitespace = props.hideWhitespace ?? ownHideWhitespace;
-  const [testFocus, setTestFocus] = useState(false);
-  const [testIdx, setTestIdx] = useState(0);
-  const [testCursor, setTestCursor] = useState(0);
-  const [testScroll, setTestScroll] = useState(0);
+  const { flash, show: setFlash, dismiss: dismissFlash } = useFlash();
+  const view = useHunkView(diffHunk, tour, svc?.root, setFlash);
+  const { hunk, cursor, anchor, setAnchor, scroll, setScroll, raw, setRaw, testFocus, setTestFocus, testIdx, setTestIdx, testCursor, setTestCursor, testScroll, setTestScroll, growContext } = view;
+  const [ignoreWhitespace, toggleWhitespace] = useSetting(props.hideWhitespace, props.toggleWhitespace, true);
+  const [wantSplit, toggleSplit] = useSetting(props.splitDiff, props.toggleSplit, false);
+  const [hideTests, toggleTestPane] = useSetting(props.hideTestPane, props.toggleTestPane, false);
+  const [sidebar, toggleSidebar] = useSetting(props.sidebar, props.toggleSidebar, true);
+  const [shortExplanation, toggleExplanation] = useSetting(props.shortExplanation, props.toggleExplanation, false);
   const [showUntested, setShowUntested] = useState(false);
-  const [overlay, setOverlay] = useState<Overlay>('none');
-  const [pending, setPending] = useState<Draft | null>(null);
-  const [moveSel, setMoveSel] = useState(0);
+  const [overlay, setOverlay] = useState<Overlay>(NONE);
+  const close = () => setOverlay(NONE);
+  const show = (kind: Exclude<OverlayKind, 'none' | 'comment' | 'move'>) => setOverlay({ kind });
   const [summarySel, setSummarySel] = useState(0);
-  const [flash, setFlash] = useState('');
-  const [ownSplit, setOwnSplit] = useState(false);
-  const wantSplit = props.splitDiff ?? ownSplit;
-  const [ownHideTests, setOwnHideTests] = useState(false);
-  const hideTests = props.hideTestPane ?? ownHideTests;
-  // The open composer's working state (see composer.ts).
+  // Which pane has the keys besides the code and the tests (which keep their own testFocus):
+  // the chapter list or the explanation. Tab moves it; Esc brings it back to the code.
+  const [paneFocus, setPaneFocus] = useState<'code' | 'list' | 'explain'>('code');
+  const [listSel, setListSel] = useState(0);
+  const [explainScroll, setExplainScroll] = useState(0);
+  // Esc folds the banner into a tag in the header; a new notice unfolds it.
+  const [folded, setFolded] = useState<string>();
+  const banner = props.banner && props.banner !== folded ? props.banner : undefined;
   const ev = props.references;
-  const [composer, setComposer] = useState<ComposerState>();
-  const setComposerState: SetComposer = (f) => setComposer((c) => (c ? f(c) : c));
-  // The pipeline fills tour.mentionUsers only if the collaborator list arrived in time; fetch it
-  // (memoized in gh.ts) the first time an editor that offers @mentions opens.
-  const [lateMentions, setLateMentions] = useState<string[]>();
-  const wantsMentions = overlay === 'comment' || overlay === 'reply' || overlay === 'thread';
-  useEffect(() => {
-    const load = svc?.loadMentionUsers;
-    if (!wantsMentions || !load || tour.mentionUsers !== undefined || lateMentions !== undefined) return;
-    let live = true;
-    load().then(
-      (users) => void (live && setLateMentions(users)),
-      () => undefined,
-    );
-    return () => {
-      live = false;
-    };
-  }, [wantsMentions, svc?.loadMentionUsers, tour.mentionUsers, lateMentions]);
-  const mentionUsers = tour.mentionUsers ?? lateMentions;
-  const mentions = useMemo(
-    () =>
-      [...new Set([tour.author, ...(tour.existingReviews ?? []).map((r) => r.author), ...tour.existingThreads.flatMap((t) => t.comments.map((c) => c.author)), ...(mentionUsers ?? [])])].filter(
-        (name) => name !== 'ghost',
-      ),
-    [tour.author, tour.existingReviews, tour.existingThreads, mentionUsers],
-  );
-  const relevantTests = useMemo(() => hunk?.tests.filter((t) => t.source !== 'naming') ?? [], [hunk]);
-  const selectedTest = relevantTests[testIdx];
-  const testFile = hunk?.covers?.file ?? selectedTest?.testFile;
-  const testCodeLines: DiffLine[] = useMemo(
-    () =>
-      hunk?.covers
-        ? hunk.covers.lines.map((text, i) => ({ kind: 'ctx', text, newLine: hunk.covers!.startLine + i }))
-        : selectedTest?.diffHunks?.length
-          ? selectedTest.diffHunks.flatMap((diff) => diff.lines)
-          : (selectedTest?.lines.map((text, i) => ({ kind: 'ctx', text, newLine: selectedTest.startLine + i })) ?? []),
-    [hunk, selectedTest],
-  );
+  // The open composer's working state (see composer.ts).
+  const setComposerState: SetComposer = (f) => setOverlay((o) => (o.kind === 'comment' ? { ...o, composer: f(o.composer) } : o));
+  const mentions = useMentions(tour, overlay.kind === 'comment' || overlay.kind === 'reply' || overlay.kind === 'thread', svc?.loadMentionUsers);
+  const linked = useMemo(() => linkedTests(hunk, testIdx), [hunk, testIdx]);
+  const { tests: relevantTests, selected: selectedTest, file: testFile, lines: testCodeLines } = linked;
 
-  const wide = width >= 180;
-  const roomForTests = width >= 130; // tests can sit beside the code
-  const listWidth = wide ? 32 : 0;
-  const mainWidth = width - listWidth - (wide ? 1 : 0);
-  const hasLinkedTests = !!hunk && (relevantTests.length > 0 || !!hunk.covers);
-  const paneWidths = useMemo(
-    () =>
-      codePaneWidths(
-        mainWidth - 1,
-        hunk?.lines.map((line) => line.text) ?? [],
-        testCodeLines.map((line) => line.text),
-        testFocus ? 'test' : 'source',
-        wantSplit,
-      ),
-    [mainWidth, hunk, testCodeLines, testFocus, wantSplit],
-  );
-  // A split diff too narrow to read beside the tests stacks them instead: t still opens them.
-  const testsStacked = roomForTests && hasLinkedTests && !hideTests && wantSplit && paneWidths.source < MIN_SPLIT_WIDTH;
-  // While the comment's @ list is open the pane holding it takes the full width, so the list
-  // and its code preview sit side by side; the other pane comes back when the list closes.
-  const listWide = overlay === 'comment' && !!composer?.listOpen;
-  const sideBySide = roomForTests && hasLinkedTests && !hideTests && !testsStacked && !listWide;
-  // Stacked, only one pane shows at a time, so whichever is visible gets the full width.
-  const srcWidth = sideBySide ? paneWidths.source : mainWidth;
-  const testWidth = sideBySide ? paneWidths.test : mainWidth;
-  const splitView = wantSplit && !raw && srcWidth >= MIN_SPLIT_WIDTH;
+  const hasLinkedTests = linked.any;
+  const collapsedView = opensOnSummary(chapter) && hi < 0;
+  const summaryIds = useMemo(() => (chapter ? summaryHunkIds(chapter) : []), [chapter]);
+  const filesByPath = useMemo(() => new Map(tour.files.map((f) => [f.path, f])), [tour.files]);
+  // A lockfile pair's manifest page lists the lockfile's package changes under the diff.
+  const at = chapter && hunk ? hunkPosition(chapter, hi) : undefined;
+  const lockList = useMemo(() => (chapter && hunk ? lockPage(tour, chapter, hunk.id) : undefined), [tour, chapter, hunk]);
+  const plan = chapterLayout({
+    width,
+    height,
+    banner: !!banner,
+    hunkLines: hunk?.lines,
+    testLines: testCodeLines,
+    linkedTests: hasLinkedTests,
+    collapsedHunks: collapsedView ? summaryIds.length : undefined,
+    testFocus,
+    split: wantSplit,
+    hideTests,
+    raw,
+    sidebar,
+    short: shortExplanation,
+    explainScroll,
+    listOpen: overlay.kind === 'comment' && !!overlay.composer.listOpen,
+    lockRows: lockList ? (w) => lockListLines(lockList, w - 1).length : undefined,
+    explain: (w) => (chapter ? explanation({ tour, chapter, hunk, hi, collapsed: collapsedView, files: filesByPath, confirms: svc?.confirms, linkedTests: hasLinkedTests, showUntested }, w) : []),
+  });
+  const { wide, listWidth, mainWidth, sideBySide, srcWidth, splitView, bodyHeight, askHeight } = plan;
 
-  const partner = useMemo(() => (hunk ? pairChangedLines(hunk.lines) : []), [hunk]);
-  // Removed lines folded into the line replacing them; the cursor steps over them.
-  // Split, every removed line with a replacement sits beside it, on the replacement's row.
-  const hidden = useMemo(() => {
-    const folds = hunk ? foldedLines(hunk.lines, partner, ignoreWhitespace) : new Map<number, Fold>();
-    if (splitView && hunk) for (const [i, p] of partner.entries()) if (p >= 0 && hunk.lines[i].kind === 'del' && !folds.has(i)) folds.set(i, 'beside');
-    return folds;
-  }, [hunk, partner, ignoreWhitespace, splitView]);
-  const visibleLine = (i: number, dir: 1 | -1) => {
-    const n = hunk?.lines.length ?? 0;
-    for (let j = i; j >= 0 && j < n; j += dir) if (!hidden.has(j)) return j;
-    for (let j = i; j >= 0 && j < n; j -= dir) if (!hidden.has(j)) return j;
-    return i;
-  };
-  const moveCursor = (by: number) => setCursor((c) => visibleLine(Math.max(0, Math.min((hunk?.lines.length ?? 1) - 1, c + by)), by > 0 ? 1 : -1));
+  const { partner, hidden } = useFolds(hunk, ignoreWhitespace, splitView);
+  const moveCursor = useFoldedCursor(view, hidden, partner);
   const cursorLine = hunk?.lines[cursor];
-  const threadsOn = (l: DiffLine | undefined) => (hunk && l ? threadAt(tour.existingThreads, hunk.file, l.kind === 'del' ? l.oldLine : l.newLine, l.kind === 'del' ? 'LEFT' : 'RIGHT') : []);
-  // Split, a removed line's threads are on the row it shares with its replacement.
-  const cursorThreads = [...threadsOn(cursorLine), ...(hidden.get(partner[cursor]) === 'beside' ? threadsOn(hunk?.lines[partner[cursor]]) : [])];
-  // Unposted drafts on the selected line, likewise; E and X act on the newest.
-  const draftsOn = (l: DiffLine | undefined) => (hunk && l ? draftsAt(props.drafts, hunk, l.kind === 'del' ? l.oldLine : l.newLine, l.kind === 'del' ? 'LEFT' : 'RIGHT').filter((d) => !d.posted) : []);
-  const cursorDraft = [...draftsOn(cursorLine), ...(hidden.get(partner[cursor]) === 'beside' ? draftsOn(hunk?.lines[partner[cursor]]) : [])]
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-    .at(-1);
-  // Reset per-hunk view state when the hunk changes; the test side jumps to the matching case.
-  useEffect(() => {
-    // The first real change: not a folded line, nor a line that only changed whitespace.
-    const first = hunk
-      ? Math.max(
-          0,
-          hunk.lines.findIndex((l, i) => l.kind !== 'ctx' && !hidden.has(i) && hidden.get(partner[i]) !== 'whitespace'),
-          hunk.lines.findIndex((l, i) => l.kind !== 'ctx' && !hidden.has(i)),
-        )
-      : 0;
-    setCursor(first);
-    setAnchor(null);
-    setScroll(0);
-    setTestIdx(0);
-    setTestCursor(0);
-    setTestScroll(0);
-    setTestFocus(false);
-    setRaw(false);
-    // Keyed on the id: the hunk object is replaced as narration streams in, and folds changing
-    // are handled by the effect below, neither of which should reset the view.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hunk?.id]);
-  // Folding a line moves a cursor or range end off it onto its replacement. Updaters, so a
-  // cursor the hunk reset just placed is the one checked.
-  useEffect(() => {
-    setCursor((c) => (hidden.has(c) ? partner[c] : c));
-    setAnchor((a) => (a !== null && hidden.has(a) ? partner[a] : a));
-  }, [hidden, partner]);
+  const { threads: cursorThreads, draft: cursorDraft } = cursorNotes(hunk, cursor, hidden, partner, tour.existingThreads, props.drafts);
   useEffect(() => {
     setSummarySel(0);
     setShowUntested(false);
   }, [chapter?.id]);
+  useEffect(() => setExplainScroll(0), [chapter?.id, hunk?.id]);
+  // First-run tips, one at a time in the status row, each shown once: how to move on the first
+  // hunk, and how to read a review thread the first time one is on screen.
+  // A thread's line and originalLine are optional (an outdated or file thread may have neither).
+  const hunkHasThreads =
+    !!hunk &&
+    tour.existingThreads.some((t) => t.path === hunk.file && hunk.lines.some((l) => (t.line !== undefined && l.newLine === t.line) || (t.originalLine !== undefined && l.oldLine === t.originalLine)));
   useEffect(() => {
-    if (!flash) return;
-    const t = setTimeout(() => setFlash(''), 2500);
-    return () => clearTimeout(t);
-  }, [flash]);
+    if (!hunk || flash) return;
+    if (props.takeTip?.('first-chapter')) setFlash('Tip: n marks this hunk read and moves on; ? lists every key.', 'tip');
+    else if (hunkHasThreads && props.takeTip?.('first-thread')) setFlash(`Tip: ${G.thread} marks a review thread: e reads it, y replies.`, 'tip');
+    // A tip is a one-off on arriving at a hunk.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hunk?.id]);
 
-  const collapsedView = !!chapter && chapter.collapsed && hi < 0;
+  // An explanation that arrives while its hunk is on screen says so for a moment.
+  const narration = hunk?.narration;
+  const [updated, setUpdated] = useState(false);
+  const seen = useRef<{ id?: string; text?: string }>({});
+  useEffect(() => {
+    const changed = seen.current.id === hunk?.id && seen.current.text !== narration && !!narration;
+    seen.current = { id: hunk?.id, text: narration };
+    if (!changed) return;
+    setUpdated(true);
+    const t = setTimeout(() => setUpdated(false), 3000);
+    return () => clearTimeout(t);
+  }, [hunk?.id, narration]);
+
   const prog = useMemo(() => progress(tour, states), [tour, states]);
   const delta = useMemo(() => new Set(tour.rereview?.newHunkIds ?? []), [tour.rereview]);
-  const filesByPath = useMemo(() => new Map(tour.files.map((f) => [f.path, f])), [tour.files]);
   // On a re-review showing only changes, the chapter list keeps the whole tour and greys what it leaves out.
   const listed = props.deltaOnly && props.allChapters ? props.allChapters : chapters;
   const unchangedHunks = props.deltaOnly && chapter ? (props.allChapters?.find((c) => c.id === chapter.id)?.hunkIds.length ?? 0) - chapter.hunkIds.length : 0;
-  const chapterStrip = useMemo(
-    () =>
-      wide
-        ? ''
-        : listed
-            .map((c) => {
-              const shown = chapters.find((d) => d.id === c.id);
-              return c.id === chapter?.id ? `[${c.title}]` : shown ? stateMark(chapterState(tour, shown, states)).mark : '·';
-            })
-            .join(' '),
-    [wide, listed, chapters, chapter?.id, tour, states],
-  );
 
   // ---------- navigation ----------
-  const firstHunk = (c: number) => (chapters[c]?.collapsed ? -1 : 0);
-  // n/p never step into optional chapters (import-only changes); ]/[ and the chapter list still reach them.
-  const nextChapter = () => chapters.findIndex((c, i) => i > ci && !c.optional);
-  const prevChapter = () => chapters.findLastIndex((c, i) => i < ci && !c.optional);
+  const go = (to: { ci: number; hi: number } | undefined) => void (to && props.setPos(to.ci, to.hi));
+  // A lockfile pair's hunks, read with its last manifest page still unread: marking that page
+  // marks them too, as the summary page does for folded lockfiles.
+  const pairedLocks = (h: Hunk | undefined): Hunk[] => {
+    const pair = lockPairOfHunk(chapter, h?.id);
+    if (!h || !pair) return [];
+    const othersDone = pair.hunkIds.every((id) => id === h.id || !tour.hunks[id] || stateOf(states, tour.hunks[id]) !== 'unread');
+    return othersDone ? pair.lockHunkIds.map((id) => tour.hunks[id]).filter((l) => l && stateOf(states, l) === 'unread') : [];
+  };
   const next = (mark?: ReadState) => {
-    if (hunk && mark) props.setState(hunk, mark);
+    if (hunk && mark) props.setState([hunk, ...pairedLocks(hunk)], mark);
     if (!chapter) return;
-    if (!collapsedView && hi < chapter.hunkIds.length - 1) return props.setPos(ci, hi + 1);
-    const nc = nextChapter();
-    if (nc >= 0) return props.setPos(nc, firstHunk(nc));
-    const optional = chapters.some((c) => c.optional);
-    setFlash(`End of the tour.${optional ? ' Import-only changes are optional (] to open them).' : ''} Press s to review your drafts and submit.`);
-  };
-  const prev = () => {
-    if (hi > 0) return props.setPos(ci, hi - 1);
-    if (hi === 0 && chapter?.collapsed) return props.setPos(ci, -1);
-    const pci = prevChapter();
-    if (pci >= 0) {
-      const pc = chapters[pci];
-      return props.setPos(pci, pc.collapsed ? -1 : pc.hunkIds.length - 1);
-    }
+    const to = nextPos(chapters, ci, hi);
+    if (to) return go(to);
+    // The last hunk: a card says what the review comes to, and s submits it.
+    show('end');
   };
 
-  // Shows `by` more lines of context on each side of the hunk, or fewer when negative, keeping the
-  // cursor on its line.
-  const growContext = (by: number) => {
-    if (!diffHunk) return;
-    const head = headLines ? { lines: headLines } : headOf(diffHunk, tour.files, svc?.root);
-    if ('reason' in head) return setFlash(head.reason);
-    const { lines } = head;
-    const now = expand.id === diffHunk.id ? expand : { above: 0, below: 0 };
-    const before = withContext(diffHunk, lines, now.above, now.below, neighbours);
-    const after = withContext(diffHunk, lines, Math.max(0, now.above + by), Math.max(0, now.below + by), neighbours);
-    if (by > 0 && after.above === before.above && after.below === before.below) return setFlash('No more context: the hunk reaches the file’s edges or its neighbouring hunks.');
-    const shift = after.above - before.above;
-    const last = after.hunk.lines.length - 1;
-    setCursor((c) => Math.max(0, Math.min(last, c + shift)));
-    setAnchor((a) => (a === null ? null : Math.max(0, Math.min(last, a + shift))));
-    setExpand({ id: diffHunk.id, above: after.above, below: after.below });
-  };
-
-  const selRange = (): [number, number] => {
-    if (anchor === null) return [cursor, cursor];
-    return [Math.min(anchor, cursor), Math.max(anchor, cursor)];
-  };
-
-  const newDraft = (a: DraftAnchor): Draft => ({
-    id: `d_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-    repo: tour.repo,
-    pr: tour.pr,
-    headSha: tour.headSha,
-    anchor: a,
-    label: 'question',
-    body: '',
-    posted: false,
-    createdAt: new Date().toISOString(),
-  });
-
-  // The selected lines a comment can attach to: expanded context at the ends is left out.
-  const anchorLines = (h: Hunk): DiffLine[] => {
-    const [a, b] = selRange();
-    return h.lines.slice(a, b + 1).filter((l) => !l.expanded);
-  };
-  // A selection with expanded context between commentable lines spans two of GitHub's hunks,
-  // which GitHub will not take one comment across.
-  const crossesContext = (h: Hunk): boolean => {
-    const [a, b] = selRange();
-    const sel = h.lines.slice(a, b + 1);
-    const first = sel.findIndex((l) => !l.expanded);
-    const last = sel.findLastIndex((l) => !l.expanded);
-    return first >= 0 && sel.slice(first, last + 1).some((l) => l.expanded);
-  };
-  // The code under the selection, prefilled as a suggestion: exactly the lines it replaces.
-  const selectedCode = (): string | undefined =>
-    testFocus
-      ? testCodeLines[testCursor]?.text
-      : hunk
-        ? anchorLines(hunk)
-            .filter((l) => l.kind !== 'del')
-            .map((l) => l.text)
-            .join('\n')
-        : undefined;
-
-  const lineAnchor = (h: Hunk): DraftAnchor | undefined => {
-    const lines = anchorLines(h);
-    const right = lines.filter((l) => l.newLine !== undefined && l.kind !== 'del');
-    const side: 'LEFT' | 'RIGHT' = right.length ? 'RIGHT' : 'LEFT';
-    const nums = side === 'RIGHT' ? right.map((l) => l.newLine!) : lines.map((l) => l.oldLine!).filter((n) => n !== undefined);
-    if (!nums.length) return undefined;
-    const start = Math.min(...nums);
-    const end = Math.max(...nums);
-    return start === end ? { type: 'line', hunkId: h.id, file: h.file, line: end, side } : { type: 'range', hunkId: h.id, file: h.file, startLine: start, line: end, side };
-  };
+  const sel = selRange(cursor, anchor);
+  const draft = (a: DraftAnchor) => newDraft(tour, a);
 
   const saveDraft = (d: Draft) => {
     const edited = props.drafts.some((x) => x.id === d.id);
     props.saveDraft(d);
     setAnchor(null);
-    setOverlay('none');
-    setComposer(undefined);
-    setFlash(`Draft ${edited ? 'updated' : 'saved'} (${d.label}). Nothing posts until you submit.`);
-  };
-
-  const describeAnchor = (d: Draft): string => {
-    const a = d.anchor;
-    if (a.type === 'line') return `${a.file}:${a.line}`;
-    if (a.type === 'range') return `${a.file}:${a.startLine}-${a.line}`;
-    if (a.type === 'chapter') return `flow "${chapters.find((c) => c.id === a.chapterId)?.title ?? a.chapterId}"`;
-    return `diagram node "${chapter?.diagram?.nodes.find((n) => n.id === a.nodeId)?.label ?? a.nodeId}"`;
+    close();
+    if (!edited && props.takeTip?.('first-draft')) return setFlash(`Tip: drafts stay on your machine until you submit them all at once with s.`, 'tip');
+    setFlash(`Draft ${edited ? 'updated' : 'saved'} (${d.label}). Nothing posts until you submit.`, 'info');
   };
 
   // ---------- references: composer, recent locations ----------
@@ -438,341 +272,365 @@ export function ChapterScreen(props: {
     repoIndex: ev?.repoIndex,
   };
   const openComposer = (d: Draft) => {
-    setPending(d);
-    setComposer(initComposer(d, { index: ev?.repoIndex?.() }));
-    setOverlay('comment');
+    setOverlay({ kind: 'comment', draft: d, composer: initComposer(d, { index: ev?.repoIndex?.() }) });
     if (isLineAnchor(d.anchor)) noteRecent.current?.({ path: d.anchor.file, line: d.anchor.line, why: 'comment' });
   };
 
   // ---------- input ----------
+  const keyView: View = testFocus ? 'tests' : collapsedView ? 'collapsed' : 'code';
+  const keyCtx: KeyCtx = {
+    hunk: !!hunk,
+    chapter: !!chapter,
+    agent: !!props.agent,
+    selecting: anchor !== null,
+    threads: cursorThreads.length > 0,
+    reply: !!props.replyToThread,
+    draft: !!cursorDraft,
+    tests: hasLinkedTests,
+    diagram: !!(chapter?.diagram || tour.overview),
+    done: prog.read + prog.skipped === prog.total,
+    split: splitView,
+    rereview: !!tour.rereview,
+    deltaOnly: props.deltaOnly,
+    rebase: !!props.rebase,
+    theme: !!props.onTheme,
+  };
+  const lastTestLine = Math.max(0, testCodeLines.length - 1);
+  const stepTest = (by: number) => {
+    const n = relevantTests.length;
+    setTestScroll(0);
+    setTestCursor(0);
+    setTestIdx((i) => (n ? (i + by + n) % n : 0));
+  };
+  const actions: Record<Action, () => void> = {
+    briefing: () => props.openBriefing(),
+    quit: () => props.quit(),
+    // Tests
+    leaveTests: () => setTestFocus(false),
+    testDown: () => setTestCursor((i) => Math.min(lastTestLine, i + 1)),
+    testUp: () => setTestCursor((i) => Math.max(0, i - 1)),
+    testPageDown: () => setTestCursor((i) => Math.min(lastTestLine, i + 10)),
+    testPageUp: () => setTestCursor((i) => Math.max(0, i - 10)),
+    nextTest: () => stepTest(1),
+    prevTest: () => stepTest(-1),
+    commentTest: () => {
+      const a = testLineAnchor(tour.hunks, testFile, testCodeLines[testCursor]);
+      if (!a) return setFlash('This test line is outside the PR diff, so GitHub cannot attach a line comment.');
+      openComposer(draft(a));
+    },
+    askTest: () => show('ask'),
+    // A collapsed chapter's summary
+    summaryDown: () => setSummarySel((s) => Math.min(summaryIds.length - 1, s + 1)),
+    summaryUp: () => setSummarySel((s) => Math.max(0, s - 1)),
+    expand: () => void (summaryIds[summarySel] ? props.setPos(ci, chapter.hunkIds.indexOf(summaryIds[summarySel])) : undefined),
+    skipChapter: () => {
+      const ids = chapter.hunkIds;
+      props.setState(
+        ids.map((id) => tour.hunks[id]).filter((h) => h && stateOf(states, h) === 'unread'),
+        'skipped',
+      );
+      setFlash(`Skipped ${plural(ids.length, 'hunk')} in "${chapter.title}".`, 'info');
+      next();
+    },
+    // Code
+    next: () => {
+      if (!collapsedView && hunk && chapter) {
+        const locks = pairedLocks(hunk);
+        const p = progress(tour, { ...states, ...Object.fromEntries([hunk, ...locks].flatMap(hunkKeys).map((k) => [k, 'read'])) }, chapter.hunkIds);
+        const withLocks = locks.length ? ` with its ${plural(locks.length, 'lockfile hunk')}` : '';
+        setFlash(`${G.read} hunk ${at?.n} read${withLocks} · ${p.read + p.skipped}/${p.total} in this chapter`, 'info');
+      }
+      // Folded hunks are read as their summary: n on it marks them read.
+      if (collapsedView && chapter?.folded?.length) {
+        const unread = summaryIds.map((id) => tour.hunks[id]).filter((h) => h && stateOf(states, h) === 'unread');
+        if (unread.length) props.setState(unread, 'read');
+        if (unread.length) setFlash(`${G.read} lockfile summary read · ${plural(unread.length, 'hunk')}`, 'info');
+      }
+      next(collapsedView ? undefined : 'read');
+    },
+    prev: () => go(prevPos(chapters, ci, hi)),
+    nextChapter: () => go(ci < chapters.length - 1 ? { ci: ci + 1, hi: firstHunk(chapters, ci + 1) } : undefined),
+    prevChapter: () => go(ci > 0 ? { ci: ci - 1, hi: firstHunk(chapters, ci - 1) } : undefined),
+    down: () => moveCursor(1),
+    up: () => moveCursor(-1),
+    pageDown: () => moveCursor(10),
+    pageUp: () => moveCursor(-10),
+    range: () => setAnchor((a) => (a === null ? cursor : null)),
+    // Esc closes the innermost thing: an open range, else the chapter, back to the briefing.
+    escape: () => (anchor !== null ? setAnchor(null) : banner ? setFolded(banner) : props.openBriefing()),
+    skip: () => next('skipped'),
+    defer: () => {
+      setFlash('Deferred: it stays on the submit screen as unread work.', 'info');
+      next('deferred');
+    },
+    unread: () => props.setState([hunk!], 'unread'),
+    raw: () => setRaw((r) => !r),
+    whitespace: toggleWhitespace,
+    split: () => {
+      if (!wantSplit && srcWidth < MIN_SPLIT_WIDTH) setFlash('Split view needs a wider terminal; showing it once there is room.');
+      toggleSplit();
+    },
+    testPane: () => {
+      if (!hasLinkedTests) return setFlash('No test exercises this hunk.');
+      toggleTestPane();
+    },
+    moreContext: () => growContext(CONTEXT_STEP),
+    lessContext: () => growContext(-CONTEXT_STEP),
+    untested: () => setShowUntested((shown) => !shown),
+    focusTests: () => (hasLinkedTests ? setTestFocus(true) : setFlash('No test exercises this hunk.')),
+    comment: () => {
+      // c on a line that holds your draft edits it.
+      if (anchor === null && cursorDraft) return openComposer(cursorDraft);
+      if (crossesContext(hunk!, sel)) return setFlash('This range crosses dimmed lines outside the PR’s diff: GitHub can’t take one comment across them. Select one side.');
+      const a = lineAnchor(hunk!, sel);
+      if (!a && anchorLines(hunk!, sel).length === 0) return setFlash('This is context outside the PR’s diff: GitHub can’t take a comment on it.');
+      if (!a) return setFlash('Nothing to anchor a comment to here.');
+      openComposer(draft(a));
+    },
+    reply: () => (cursorThreads.length ? show('reply') : setFlash('No review thread on this line. Move to a commented line and press y.')),
+    thread: () => (cursorThreads.length ? show('thread') : setFlash('No review thread on this line. Move to a commented line and press e.')),
+    palette: () => show('palette'),
+    sidebar: () => (width >= WIDE ? toggleSidebar() : setFlash(`The chapter list needs ${WIDE} columns; this terminal has ${width}.`)),
+    explanation: () => toggleExplanation(),
+    commentFlow: () => openComposer(draft({ type: 'chapter', chapterId: chapter.id })),
+    ask: () => {
+      if (hunk && cursorLine?.newLine !== undefined) noteRecent.current?.({ path: hunk.file, line: cursorLine.newLine, why: 'ask' });
+      if (collapsedView || hunk) show('ask');
+      else setFlash('Nothing to ask about here.');
+    },
+    diagram: () => (keyCtx.diagram ? show('diagram') : setFlash('No diagram for this chapter.')),
+    move: () => setOverlay({ kind: 'move', sel: ci }),
+    order: () => props.toggleOrder(),
+    delta: () => props.toggleDelta(),
+    rebase: () => props.rebase?.(),
+    openInAgent: () => props.openInAgent(hunk, chapter),
+    submit: () => props.openSubmit(),
+    help: () => show('help'),
+    checklist: () => {
+      if (!chapter?.checklist?.length) return setFlash('No team checklist applies to this chapter (.guided-review.json → checklists).');
+      if (svc) show('checklist');
+      else setFlash('The checklist opens once the checkout is ready.');
+    },
+    theme: () => props.onTheme?.(),
+  };
+  // The panes Tab moves between, in screen order: the chapter list, the explanation, the code, and
+  // the tests, each only when it is on screen.
+  const panes = [...(wide ? ['list' as const] : []), ...(plan.explainLines.length ? ['explain' as const] : []), 'code' as const, ...(hasLinkedTests && hunk ? ['tests' as const] : [])];
+  // A focused pane that leaves the screen (a narrower terminal, \ hiding the list, a hunk with no
+  // explanation) hands focus back to the code, so its keys never act on something unseen.
+  if (paneFocus !== 'code' && !panes.includes(paneFocus)) setPaneFocus('code'); // React re-renders before committing
+  const focusNow = testFocus ? 'tests' : paneFocus;
+  const focusPane = (p: (typeof panes)[number]) => {
+    setTestFocus(p === 'tests');
+    setPaneFocus(p === 'tests' ? 'code' : p);
+    if (p === 'list')
+      setListSel(
+        Math.max(
+          0,
+          listed.findIndex((c) => c.id === chapter?.id),
+        ),
+      );
+  };
   useInput(
     (input, key) => {
-      if (input === 'b') return props.openBriefing();
-      if (testFocus) {
-        if (key.escape || input === 't') {
-          setTestFocus(false);
-          return;
+      // A held message has been seen once a key is pressed.
+      dismissFlash();
+      if (key.tab) {
+        const at = Math.max(0, panes.indexOf(focusNow));
+        return focusPane(panes[(at + (key.shift ? panes.length - 1 : 1)) % panes.length]);
+      }
+      if (paneFocus === 'list' && !testFocus) {
+        if (input === 'j' || key.downArrow) return setListSel((s) => Math.min(listed.length - 1, s + 1));
+        if (input === 'k' || key.upArrow) return setListSel((s) => Math.max(0, s - 1));
+        if (key.return) {
+          const target = chapters.findIndex((c) => c.id === listed[listSel]?.id);
+          focusPane('code');
+          return target >= 0 ? props.setPos(target, firstHunk(chapters, target)) : setFlash('That chapter has no changes in this re-review.');
         }
-        if (input === 'j' || key.downArrow) return setTestCursor((i) => Math.min(Math.max(0, testCodeLines.length - 1), i + 1));
-        if (input === 'k' || key.upArrow) return setTestCursor((i) => Math.max(0, i - 1));
-        if (input === 'J' || key.pageDown) return setTestCursor((i) => Math.min(Math.max(0, testCodeLines.length - 1), i + 10));
-        if (input === 'K' || key.pageUp) return setTestCursor((i) => Math.max(0, i - 10));
-        if (input === 'n' || input === 'p' || key.tab) {
-          const n = relevantTests.length;
-          setTestScroll(0);
-          setTestCursor(0);
-          return setTestIdx((i) => (n ? (i + (input === 'p' ? n - 1 : 1)) % n : 0));
-        }
-        if (input === 'c') {
-          const line = testCodeLines[testCursor];
-          const side = line?.kind === 'del' ? 'LEFT' : 'RIGHT';
-          const lineNo = side === 'LEFT' ? line?.oldLine : line?.newLine;
-          const target = Object.values(tour.hunks).find(
-            (candidate) =>
-              candidate.file === testFile && candidate.lines.some((l) => !l.expanded && (side === 'LEFT' ? l.kind !== 'add' && l.oldLine === lineNo : l.kind !== 'del' && l.newLine === lineNo)),
-          );
-          if (!target || lineNo === undefined || !testFile) return setFlash('This test line is outside the PR diff, so GitHub cannot attach a line comment.');
-          return openComposer(newDraft({ type: 'line', hunkId: target.id, file: testFile, line: lineNo, side }));
-        }
-        if (input === '?') return setOverlay('ask');
-        if (input === 'q') return (props.back ?? props.quit)();
-        if (input === 'Q') return props.quit();
-        return;
+        if (key.escape) return focusPane('code');
       }
-      if (collapsedView) {
-        const ids = chapter.hunkIds;
-        if (input === 'j' || key.downArrow) return setSummarySel((s) => Math.min(ids.length - 1, s + 1));
-        if (input === 'k' || key.upArrow) return setSummarySel((s) => Math.max(0, s - 1));
-        if (key.return || input === 'e') return ids.length ? props.setPos(ci, summarySel) : undefined;
-        if (input === 'x') {
-          for (const id of ids) if (stateOf(states, tour.hunks[id]) === 'unread') props.setState(tour.hunks[id], 'skipped');
-          setFlash(`Skipped ${ids.length} hunk(s) in "${chapter.title}".`);
-          return next();
-        }
+      if (paneFocus === 'explain' && !testFocus) {
+        if (input === 'j' || key.downArrow) return setExplainScroll((s) => Math.min(plan.explainMaxScroll, s + 1));
+        if (input === 'k' || key.upArrow) return setExplainScroll((s) => Math.max(0, s - 1));
+        if (input === 'J' || key.pageDown) return setExplainScroll((s) => Math.min(plan.explainMaxScroll, s + 5));
+        if (input === 'K' || key.pageUp) return setExplainScroll((s) => Math.max(0, s - 5));
+        if (key.return) return show('reader');
+        if (key.escape) return focusPane('code');
       }
-      if (input === 'n') return next(collapsedView ? undefined : 'read');
-      if (input === 'p') return prev();
-      if (input === ']') return ci < chapters.length - 1 ? props.setPos(ci + 1, firstHunk(ci + 1)) : undefined;
-      if (input === '[') return ci > 0 ? props.setPos(ci - 1, firstHunk(ci - 1)) : undefined;
-      if (hunk && (input === 'j' || key.downArrow)) return moveCursor(1);
-      if (hunk && (input === 'k' || key.upArrow)) return moveCursor(-1);
-      if (hunk && (input === 'J' || key.pageDown)) return moveCursor(10);
-      if (hunk && (input === 'K' || key.pageUp)) return moveCursor(-10);
-      if (input === 'v' && hunk) return setAnchor((a) => (a === null ? cursor : null));
-      if (key.escape) return setAnchor(null);
-      if (input === 'x' && hunk) return next('skipped');
-      if (input === 'z' && hunk) {
-        setFlash('Deferred: it stays on the submit screen as unread work.');
-        return next('deferred');
-      }
-      if (input === 'u' && hunk) return props.setState(hunk, 'unread');
-      if (input === 'r' && hunk) return setRaw((r) => !r);
-      if (input === 'w') return props.toggleWhitespace ? props.toggleWhitespace() : setOwnHideWhitespace((w) => !w);
-      if (input === 'S') {
-        if (!wantSplit && srcWidth < MIN_SPLIT_WIDTH) setFlash('Split view needs a wider terminal; showing it once there is room.');
-        return props.toggleSplit ? props.toggleSplit() : setOwnSplit((v) => !v);
-      }
-      if (input === 'T') {
-        if (!hasLinkedTests) return setFlash('No test exercises this hunk.');
-        return props.toggleTestPane ? props.toggleTestPane() : setOwnHideTests((v) => !v);
-      }
-      if ((input === '+' || input === '=') && hunk) return growContext(CONTEXT_STEP);
-      if (input === '-' && hunk) return growContext(-CONTEXT_STEP);
-
-      if (input === 'U') return setShowUntested((shown) => !shown);
-      if (input === 't') {
-        const has = !!hunk && (hunk.tests.some((t) => t.source !== 'naming') || !!hunk.covers);
-        if (!has) return setFlash('No test exercises this hunk.');
-        return setTestFocus(true);
-      }
-      if (input === 'c' && hunk) {
-        if (crossesContext(hunk)) return setFlash('This range crosses dimmed lines outside the PR’s diff: GitHub can’t take one comment across them. Select one side.');
-        const a = lineAnchor(hunk);
-        if (!a && anchorLines(hunk).length === 0) return setFlash('This is context outside the PR’s diff: GitHub can’t take a comment on it.');
-        if (!a) return setFlash('Nothing to anchor a comment to here.');
-        return openComposer(newDraft(a));
-      }
-      if (input === 'y' && hunk && props.replyToThread) {
-        if (!cursorThreads.length) return setFlash('No review thread on this line. Move to a commented line and press y.');
-        return setOverlay('reply');
-      }
-      if (input === 'e' && hunk) {
-        if (!cursorThreads.length) return setFlash('No review thread on this line. Move to a commented line and press e.');
-        return setOverlay('thread');
-      }
-      if (input === 'E' && hunk) {
-        if (!cursorDraft) return setFlash('No draft on this line. Move to a line with ✎ and press E.');
-        return openComposer(cursorDraft);
-      }
-      if (input === 'X' && hunk) {
-        if (!cursorDraft) return setFlash('No draft on this line. Move to a line with ✎ and press X.');
-        return setOverlay('delete');
-      }
-      if (input === 'C' && chapter) return openComposer(newDraft({ type: 'chapter', chapterId: chapter.id }));
-      if (input === '?') {
-        if (hunk && cursorLine?.newLine !== undefined) noteRecent.current?.({ path: hunk.file, line: cursorLine.newLine, why: 'ask' });
-        return collapsedView || hunk ? setOverlay('ask') : setFlash('Nothing to ask about here.');
-      }
-      if (input === 'd') return chapter?.diagram || tour.overview ? setOverlay('diagram') : setFlash('No diagram for this chapter.');
-      if (input === 'm' && hunk) {
-        setMoveSel(ci);
-        return setOverlay('move');
-      }
-      if (input === 'f') return props.toggleOrder();
-      if (input === 'D' && tour.rereview) return props.toggleDelta();
-      if (input === 'R' && props.rebase) return props.rebase();
-      if (input === 'o') return props.openInAgent(hunk, chapter);
-      if (input === 's') return props.openSubmit();
-      if (input === 'h') return setOverlay('help');
-      if (input === 'i') {
-        if (!chapter?.checklist?.length) return setFlash('No team checklist applies to this chapter (.guided-review.json → checklists).');
-        return svc ? setOverlay('checklist') : setFlash('The checklist opens once the checkout is ready.');
-      }
-      if (input === 'L' && props.onTheme) return props.onTheme();
-      if (input === 'q') return (props.back ?? props.quit)();
-      if (input === 'Q') return props.quit();
+      const action = keyAction(keyView, keyCtx, input, key);
+      if (action) return actions[action]();
+      const none = unboundKey(input, key);
+      if (none) setFlash(none, 'quiet');
     },
-    { isActive: props.active !== false && overlay === 'none' },
+    { isActive: props.active !== false && overlay.kind === 'none' },
   );
 
   useInput(
     (input, key) => {
-      if (overlay === 'help') return setOverlay('none');
-      if (overlay === 'move') {
-        if (key.escape) return setOverlay('none');
-        if (input === 'j' || key.downArrow) return setMoveSel((s) => Math.min(chapters.length - 1, s + 1));
-        if (input === 'k' || key.upArrow) return setMoveSel((s) => Math.max(0, s - 1));
+      if (overlay.kind === 'move') {
+        if (key.escape) return close();
+        const move = (by: number) => setOverlay((o) => (o.kind === 'move' ? { ...o, sel: Math.max(0, Math.min(chapters.length - 1, o.sel + by)) } : o));
+        if (input === 'j' || key.downArrow) return move(1);
+        if (input === 'k' || key.upArrow) return move(-1);
         if (key.return && hunk) {
-          props.moveHunk(hunk, chapters[moveSel].id);
-          setFlash(`Moved to "${chapters[moveSel].title}".`);
-          return setOverlay('none');
+          props.moveHunk(hunk, chapters[overlay.sel].id);
+          setFlash(`Moved to "${chapters[overlay.sel].title}".`, 'info');
+          return close();
         }
       }
     },
-    { isActive: props.active !== false && (overlay === 'help' || overlay === 'move') },
-  );
-
-  useInput(
-    (input) => {
-      if (input === 'y' && cursorDraft) {
-        props.deleteDraft(cursorDraft);
-        setFlash(`Draft deleted (${cursorDraft.label}).`);
-      }
-      setOverlay('none');
-    },
-    { isActive: props.active !== false && overlay === 'delete' },
+    { isActive: props.active !== false && overlay.kind === 'move' },
   );
 
   if (!chapter) {
-    if (overlay !== 'none') setOverlay('none'); // see overlayShown below
-    return (
-      <Box flexDirection="column">
-        <Text>{props.deltaOnly ? 'Nothing changed since your last review. Press D to show the whole tour.' : 'This PR has no changes to review.'}</Text>
-        <KeyBar
-          width={width}
-          keys={[
-            ['D', 'whole tour'],
-            ['s', 'submit'],
-            ['b', 'briefing'],
-            ...((props.back
-              ? [
-                  ['q', 'PR list'],
-                  ['Q', 'quit'],
-                ]
-              : [['q', 'quit']]) as [string, string][]),
-          ]}
-        />
-      </Box>
-    );
-  }
-
-  // The key bar shows only keys that do something here, most useful first; the rest are under h.
-  const barKeys = (): [string, string][] => {
-    const ask: [string, string][] = props.agent ? [['?', 'ask']] : [];
-    if (testFocus) return [['n/p', 'test'], ['c', 'comment'], ...ask];
-    const submit: [string, string][] = prog.read + prog.skipped === prog.total ? [['s', 'submit']] : [];
-    if (collapsedView) return [...submit, ['enter', 'expand'], ['n/p', 'next/prev'], ['C', 'comment on flow'], ['x', 'skip chapter'], [']/[', 'chapter']];
-    const selecting = anchor !== null;
-    return [
-      ...submit,
-      ['n/p', 'hunk'],
-      ['c', selecting ? 'comment on range' : 'comment'],
-      ...(cursorThreads.length ? ([['e', 'thread'], ...(props.replyToThread ? [['y', 'reply']] : [])] as [string, string][]) : []),
-      ...(cursorDraft
-        ? ([
-            ['E', 'edit draft'],
-            ['X', 'delete draft'],
-          ] as [string, string][])
-        : []),
-      ...ask,
-      ['v', selecting ? 'end range' : 'range'],
-      [']/[', 'chapter'],
-      ...(showTests ? ([['t', 'tests']] as [string, string][]) : []),
-      ...(chapter?.diagram || tour.overview ? ([['d', 'diagram']] as [string, string][]) : []),
-      ['x', 'skip'],
-      ['+/-', 'context'],
-      ['S', splitView ? 'inline' : 'split'],
-    ];
-  };
-
-  // ---------- layout ----------
-  // The guide (narration and notes) sits beside the code on wide terminals and
-  // above it on narrow ones. Tests show under the guide only when a test actually
-  // exercises the hunk; a filename-only guess becomes a one-line hint.
-  const configFile = (chapter.kind === 'config' || isSpecialKind(chapter.kind)) && hunk ? filesByPath.get(hunk.file) : undefined;
-  // A narrated collapsed chapter (lockfiles) shares one narration across its hunks: show it above the file list.
-  const sharedNarration = collapsedView ? chapter.hunkIds.map((id) => tour.hunks[id]?.narration).find(Boolean) : undefined;
-  const narration = hunk?.narration ?? (collapsedView ? [sharedNarration, chapter.summary].filter(Boolean).join('\n\n') : (configFile?.summary ?? configFile?.kindReason));
-  const chapterNotes: string[] = [];
-  if (chapter.linkedHunkIds.length && hi <= 0) chapterNotes.push(`Also uses ${chapter.linkedHunkIds.length} hunk(s) shown in an earlier chapter.`);
-  if (chapter.lowConfidence) chapterNotes.push('Some flow links use naming guesses: low confidence.');
-  if (hi <= 0 && chapter.checklist?.length) {
-    const open = chapter.checklist.filter((c) => !svc?.confirms[c.id]).length;
-    if (open) chapterNotes.push(`Team checklist: ${open} item(s) to confirm (i). ${chapter.checklist.filter((c) => c.status === 'fail').length} flagged by the agent.`);
+    if (overlay.kind !== 'none') close(); // see slots.shown below
+    return <EmptyChapter deltaOnly={props.deltaOnly} width={width} />;
   }
 
   // Linked tests that are not beside the code (a narrow terminal, T, or a split diff) get a tab
   // saying they are there and how to open them.
   const testDrawer =
-    hasLinkedTests && !sideBySide && !testFocus && !collapsedView ? `◂ ${hunk.covers ? 'code it covers' : `${relevantTests.length} test${relevantTests.length === 1 ? '' : 's'}`}` : undefined;
-  const nameGuess = hunk?.tests.find((t) => t.source === 'naming');
-  const showTests = hasLinkedTests;
-
-  const headerRows = 1 + (props.banner ? 1 : 0) + (wide ? 0 : 1);
-  const titleRows = 2;
-  const footerRows = 3;
-  // The explanation is its own large section above the code: narration, the author's note,
-  // notes on the chapter or hunk, and the no-test hint. It takes what it needs, up to about
-  // half the screen; the code gets the rest. Tests sit beside the code only when relevant.
-  const avail = height - headerRows - titleRows - footerRows;
-  const explainW = mainWidth - 4; // border + padding
-  const hint = hunk && !showTests ? noTestHint(hunk, nameGuess?.testFile) : undefined;
-  const untestedBranches = hi <= 0 ? chapter.untestedBranches : [];
-  const testGapSummary = [hint ? 'No linked test' : '', untestedBranches.length ? `${untestedBranches.length} possible untested behavior${untestedBranches.length === 1 ? '' : 's'}` : '']
-    .filter(Boolean)
-    .join(' · ');
-  const explainAll: GuideLine[] = [
-    ...guideLines(narration, !!hunk?.narrationInferred, chapterNotes, explainW, tour.mode, !!hunk),
-    ...(testGapSummary
-      ? [
-          [],
-          line(truncate(`○ ${testGapSummary} · U: ${showUntested ? 'hide' : 'details'}`, explainW), { color: 'red' }),
-          ...(showUntested
-            ? [
-                ...(hint ? wrap(safe(hint), explainW).map((t) => line(t, { dim: true })) : []),
-                ...untestedBranches.flatMap((b) => wrap(safe(`Untested: ${b}`), explainW).map((t) => line(t, { color: 'yellow' }))),
-              ]
-            : []),
-        ]
-      : []),
-  ];
-  const codeNeed = collapsedView ? Math.min(chapter.hunkIds.length, 10) : Math.min((hunk?.lines.length ?? 0) + 1, 14);
-  const explainMax = Math.max(4, Math.max(Math.floor(avail * 0.5), avail - codeNeed - 3) - 3);
-  const explainLines = explainAll.length > explainMax ? [...explainAll.slice(0, explainMax - 1), line('… more than fits: widen or heighten the terminal', { dim: true })] : explainAll;
-  const explainRows = explainLines.length ? explainLines.length + 3 : 0; // title + top/bottom border
-  const bodyHeight = Math.max(6, avail - explainRows);
-  const codeWidth = srcWidth;
+    hunk && hasLinkedTests && !sideBySide && !testFocus && !collapsedView ? `◂ ${hunk.covers ? 'code it covers' : `${relevantTests.length} test${relevantTests.length === 1 ? '' : 's'}`}` : undefined;
   // The composer sits under the commented line, growing while its AI line is open. Its state is
   // ours, so it survives moving between the inline slot and the popup.
-  const editAnchor = composer?.anchor ?? pending?.anchor;
-  const lineComment = overlay === 'comment' && pending && editAnchor && isLineAnchor(editAnchor);
-  const inlineSourceComment = lineComment && !testFocus;
-  const inlineTestComment = lineComment && testFocus;
-  const threadHeight = Math.min(Math.max(6, bodyHeight - 2), Math.max(8, Math.floor(bodyHeight * 0.7)));
+  const slots = overlaySlots(plan, {
+    overlay: overlay.kind,
+    testFocus,
+    threadsHere: cursorThreads.length > 0,
+    commentOpen: overlay.kind === 'comment',
+    lineComment: overlay.kind === 'comment' && isLineAnchor(overlay.composer.anchor),
+    checklist: !!chapter.checklist && !!svc,
+  });
+  // An open overlay owns the keyboard through its own useInput. One with nowhere to show would
+  // leave no handler active, so close it.
+  if (overlay.kind !== 'none' && !slots.shown) close(); // React re-renders before committing
 
-  const overlayNode = (() => {
-    if (overlay === 'diagram') {
+  // A lockfile pair's package list sits under the diff, unless a comment, thread or question
+  // open under a line needs the room.
+  const lockShown = lockList && plan.lockHeight > 0 && !slots.sourceInline ? lockList : undefined;
+
+  // The palette: this view's commands, then every chapter and every changed file to go to.
+  const paletteItems = (): PaletteItem[] => {
+    const commands = paletteCommands(keyView, keyCtx).map((c) => ({ label: c.label, key: c.key, run: () => actions[c.action]() }));
+    const toChapter = chapters.map((c, i) => ({ label: `Go to chapter ${i + 1}: ${c.title}`, detail: plural(c.hunkIds.length, 'hunk'), run: () => props.setPos(i, firstHunk(chapters, i)) }));
+    const toFile: PaletteItem[] = [];
+    for (const f of tour.files) {
+      const ci = chapters.findIndex((c) => c.hunkIds.some((id) => tour.hunks[id]?.file === f.path));
+      if (ci < 0) continue;
+      const c = chapters[ci];
+      const hi = c.hunkIds.findIndex((id) => tour.hunks[id]?.file === f.path);
+      // A collapsed chapter, or a folded lockfile hunk, is read as its summary; a paired lockfile, on its manifest's page.
+      const page = pageOf(c, hi);
+      toFile.push({ label: `Go to ${f.path}`, detail: `chapter ${ci + 1} · ${page < 0 ? 'summary' : `hunk ${hunkPosition(c, page).n}`}`, run: () => props.setPos(ci, page) });
+    }
+    return [...commands, ...toChapter, ...toFile];
+  };
+
+  // The diagram, the move list, the checklist, and a chapter or node comment float over the
+  // screen, which stays in view around them: the diagram's job is to orient you in that code.
+  const floating = (() => {
+    if (slots.popup === 'diagram') {
       const g = chapter.diagram ?? tour.overview!;
-      return (
-        <DiagramView
-          graph={g}
-          width={mainWidth}
-          height={height - 4}
-          onClose={() => setOverlay('none')}
-          onJump={(hid) => {
-            const c = chapters.findIndex((ch) => ch.hunkIds.includes(hid));
-            if (c >= 0) props.setPos(c, chapters[c].hunkIds.indexOf(hid));
-            setOverlay('none');
-          }}
-          onComment={(nodeId) => openComposer(newDraft({ type: 'node', chapterId: chapter.id, nodeId }))}
-        />
-      );
+      return {
+        tone: 'reading' as const,
+        width: Math.max(40, Math.floor(width * 0.85)),
+        height: Math.max(10, Math.floor(height * 0.8)),
+        node: (w: number, h: number) => (
+          <DiagramView
+            graph={g}
+            width={w}
+            height={h}
+            onClose={() => close()}
+            onJump={(hid) => {
+              const c = chapters.findIndex((ch) => ch.hunkIds.includes(hid));
+              if (c >= 0) props.setPos(c, chapters[c].hunkIds.indexOf(hid));
+              close();
+            }}
+            onComment={(nodeId) => openComposer(draft({ type: 'node', chapterId: chapter.id, nodeId }))}
+          />
+        ),
+      };
     }
-    if (overlay === 'comment' && pending && !inlineSourceComment && !inlineTestComment) return commentEditor(mainWidth, height - headerRows - footerRows);
-    if (overlay === 'move') {
-      return (
-        <Box flexDirection="column" borderStyle="round" paddingX={1}>
-          <Text bold>Move this hunk to…</Text>
-          {chapters.map((c, i) => (
-            <Text key={c.id} inverse={i === moveSel}>
-              {truncate(`${c.title}`, mainWidth - 6)}
-            </Text>
-          ))}
-          <Text dimColor>enter: move · esc: cancel</Text>
-        </Box>
-      );
+    if (slots.popup === 'comment' && overlay.kind === 'comment')
+      return { tone: 'input' as const, width: Math.min(96, width - 4), height: overlay.composer.ai ? Math.min(30, height - 4) : 18, node: (w: number, h: number) => commentEditor(w, h) };
+    if (overlay.kind === 'reader')
+      return {
+        tone: 'reading' as const,
+        width: Math.min(110, width - 4),
+        height: height - 4,
+        node: (w: number, h: number) => <Reader title={`${chapter.title}${hunk ? ` · ${hunk.file}` : ''}`} lines={plan.explainAll} width={w} height={h} onClose={close} />,
+      };
+    if (overlay.kind === 'end') {
+      const p = progress(tour, hunk ? { ...states, ...Object.fromEntries(hunkKeys(hunk).map((k) => [k, stateOf(states, hunk) === 'unread' ? 'read' : stateOf(states, hunk)])) } : states);
+      const verdict = suggestVerdict(tour, props.drafts, states);
+      const pending = props.drafts.filter((d) => !d.posted).length;
+      const optional = chapters.some((c) => c.optional);
+      return {
+        tone: 'decision' as const,
+        width: Math.min(72, width - 4),
+        height: 9 + Math.min(3, verdict.reasons.length) + (optional ? 1 : 0),
+        node: () => (
+          <EndCard
+            read={p.read}
+            skipped={p.skipped}
+            deferred={p.deferred}
+            unread={p.unread}
+            drafts={pending}
+            verdict={EVENT_TEXT[verdict.event]}
+            reasons={verdict.reasons.slice(0, 3)}
+            optional={optional}
+            onSubmit={() => {
+              close();
+              props.openSubmit();
+            }}
+            onOptional={() => {
+              close();
+              const oi = chapters.findIndex((c) => c.optional);
+              if (oi >= 0) props.setPos(oi, firstHunk(chapters, oi));
+            }}
+            onClose={close}
+            onQuit={props.quit}
+          />
+        ),
+      };
     }
-    if (overlay === 'checklist' && chapter.checklist && svc) {
-      return <ChecklistPanel items={chapter.checklist} confirms={svc.confirms} width={mainWidth} onToggle={svc.setConfirm} onClose={() => setOverlay('none')} />;
+    if (overlay.kind === 'palette')
+      return {
+        tone: 'input' as const,
+        width: Math.min(90, width - 4),
+        height: Math.min(height - 4, 22),
+        node: (w: number, h: number) => <CommandPalette items={paletteItems()} width={w} height={h} onClose={close} />,
+      };
+    if (overlay.kind === 'move')
+      return { tone: 'input' as const, width: Math.min(70, width - 4), height: chapters.length + 5, node: (w: number) => <MoveList chapters={chapters} sel={overlay.sel} width={w} /> };
+    if (slots.popup === 'checklist' && chapter.checklist && svc) {
+      const items = chapter.checklist;
+      return {
+        tone: 'input' as const,
+        width: Math.min(110, width - 4),
+        height: items.length * 2 + 4,
+        node: (w: number) => <ChecklistPanel items={items} confirms={svc.confirms} width={w} onToggle={svc.setConfirm} onClose={() => close()} />,
+      };
     }
-    return null;
+    return undefined;
   })();
 
   // The inline composer under a source or test line, `w` wide in a `pane` rows tall.
   const inlineComposer = (w: number, pane: number) => {
-    const slot = inlineComposerSlot(composer, tour, pane, w);
+    const slot = inlineComposerSlot(overlay.kind === 'comment' ? overlay.composer : undefined, tour, pane, w);
     return { node: commentEditor(w, INLINE_ROWS, slot.aiRows, slot.listRows), height: slot.height };
   };
 
   function commentEditor(w: number, h: number, aiRows?: number, listRows?: number) {
-    if (!pending || !composer) return null;
+    if (overlay.kind !== 'comment') return null;
+    const { draft: pending, composer } = overlay;
     const a = composer.anchor;
     return (
       <CommentEditor
         draft={pending}
-        target={safe(describeAnchor({ ...pending, anchor: a }))}
+        target={safe(describeAnchor(a, chapters, chapter))}
         hunk={isLineAnchor(a) ? tour.hunks[a.hunkId] : hunk}
-        selectedText={sameAnchor(a, pending.anchor) ? selectedCode() : undefined}
+        selectedText={sameAnchor(a, pending.anchor) ? (testFocus ? testCodeLines[testCursor]?.text : hunk ? selectedCode(hunk, sel) : undefined) : undefined}
         width={w}
         height={h}
         mentions={mentions}
@@ -781,117 +639,140 @@ export function ChapterScreen(props: {
         setState={setComposerState}
         aiRows={aiRows}
         listRows={listRows}
-        onCancel={() => setOverlay('none')}
+        onCancel={() => close()}
         onSave={saveDraft}
+        onDelete={
+          props.drafts.some((d) => d.id === pending.id)
+            ? () => {
+                props.deleteDraft(pending);
+                close();
+                setFlash(`Draft deleted (${pending.label}).`, 'info');
+              }
+            : undefined
+        }
       />
     );
   }
 
-  const askHeight = Math.min(14, Math.max(5, bodyHeight - 2));
   const askTestLine = testCodeLines[testCursor];
   const askContext = testFocus && hunk && testFile ? { ...hunk, file: testFile, header: selectedTest?.diffHunks?.[0]?.header ?? hunk.header, lines: testCodeLines } : hunk;
-  const askPanel =
-    overlay === 'ask' ? (
+  const askPanelAt = (w: number, h: number) =>
+    overlay.kind === 'ask' ? (
       <AskOverlay
         hunk={askContext}
-        lineIdx={testFocus ? testCursor : hunk ? selRange()[0] : undefined}
-        endIdx={testFocus ? testCursor : hunk ? selRange()[1] : undefined}
+        lineIdx={testFocus ? testCursor : hunk ? sel[0] : undefined}
+        endIdx={testFocus ? testCursor : hunk ? sel[1] : undefined}
         target={
           testFocus && testFile
             ? `${testFile}:${askTestLine?.newLine ?? askTestLine?.oldLine ?? ''}`
             : hunk
-              ? `${hunk.file}:${hunk.lines[selRange()[0]]?.newLine ?? hunk.lines[selRange()[0]]?.oldLine ?? ''}`
+              ? `${hunk.file}:${hunk.lines[sel[0]]?.newLine ?? hunk.lines[sel[0]]?.oldLine ?? ''}`
               : `chapter "${chapter.title}"`
         }
         agent={props.agent}
         aiOff={props.aiOff}
-        width={testFocus ? testWidth - (sideBySide ? 3 : 1) : hunk ? codeWidth - 1 : mainWidth}
-        height={askHeight}
-        onClose={() => setOverlay('none')}
+        width={w}
+        height={h}
+        onClose={() => close()}
+      />
+    ) : null;
+  const askPanel = askPanelAt(plan.askWidth, askHeight);
+  const threadAt = (w: number, h: number) => (
+    <ThreadView
+      threads={cursorThreads}
+      width={w}
+      height={h}
+      mentions={mentions}
+      startReply={overlay.kind === 'reply'}
+      onReply={props.replyToThread}
+      onReact={props.reactToComment}
+      onNotice={(text) => setFlash(text, 'info')}
+      onClose={() => close()}
+    />
+  );
+
+  const testPane =
+    plan.testPaneShown && hunk ? (
+      <TestPane
+        tests={relevantTests}
+        covers={hunk.covers}
+        idx={testIdx}
+        cursor={testCursor}
+        scroll={testScroll}
+        setScroll={setTestScroll}
+        focused={testFocus}
+        inline={slots.testInline === 'comment' ? inlineComposer(plan.testPane.inlineWidth, plan.testPane.height) : slots.testInline === 'ask' ? { node: askPanel, height: askHeight } : undefined}
+        width={plan.testPane.width}
+        height={plan.testPane.height}
       />
     ) : null;
 
-  // An open overlay owns the keyboard through its own useInput. One that renders nothing (its
-  // hunk or thread went away) would leave no handler active, so close it. Mirrors where the
-  // JSX below mounts each overlay.
-  const sourcePaneShown = !collapsedView && !!hunk && (sideBySide || !testFocus || !showTests);
-  const testPaneShown = !collapsedView && !!hunk && (sideBySide || (testFocus && showTests));
-  const threadInline = (overlay === 'thread' || overlay === 'reply') && cursorThreads.length > 0;
-  const overlayShown =
-    overlay === 'help' ||
-    (overlay === 'delete' && !!cursorDraft) ||
-    overlayNode !== null ||
-    (collapsedView && !!askPanel) ||
-    (sourcePaneShown && (threadInline || !!inlineSourceComment || (!!askPanel && !testFocus))) ||
-    (testPaneShown && (!!inlineTestComment || (testFocus && overlay === 'ask')));
-  if (overlay !== 'none' && !overlayShown) setOverlay('none'); // React re-renders before committing
-
   const screen = (
     <Box flexDirection="column" width={width} height={height}>
-      <Header tour={tour} prog={prog} order={props.order} deltaOnly={props.deltaOnly} width={width} />
-      {props.banner ? (
+      <Header
+        tour={tour}
+        prog={prog}
+        order={props.order}
+        deltaOnly={props.deltaOnly}
+        width={width}
+        busy={props.busy}
+        pushed={!!props.banner && !banner}
+        where={`chapter ${ci + 1}/${chapters.length}${hunk ? ` · hunk ${at?.n}/${at?.total}` : ''}`}
+      />
+      {banner ? (
         <Text backgroundColor="yellow" color="black">
-          {pad(` ${props.banner}`, width)}
+          {pad(` ${banner} · esc hides this`, width)}
         </Text>
       ) : null}
-      {!wide ? (
-        <Text dimColor wrap="truncate">
-          {truncate(`${ORDER_LABEL[props.order]} order · Chapter ${ci + 1}/${chapters.length}: ${chapterStrip}`, width)}
-        </Text>
-      ) : null}
+      {!wide ? <ChapterStrip tour={tour} chapters={chapters} ci={ci} hi={hunk ? hi : -1} order={props.order} width={width} /> : null}
       <Box flexDirection="row">
-        {wide ? <ChapterList tour={tour} chapters={chapters} listed={listed} states={states} current={chapter.id} width={listWidth} height={height - headerRows - footerRows} /> : null}
+        {wide ? (
+          <ChapterList
+            tour={tour}
+            chapters={chapters}
+            listed={listed}
+            states={states}
+            current={chapter.id}
+            focusedRow={focusNow === 'list' ? listSel : undefined}
+            width={listWidth}
+            height={plan.mainHeight}
+          />
+        ) : null}
         {wide ? <Box width={1} /> : null}
         <Box flexDirection="column" width={mainWidth}>
-          {overlayNode ?? (
-            <>
-              <ChapterTitle chapter={chapter} hunk={hunk} hi={hi} isNew={!!hunk && delta.has(hunk.id)} unchanged={unchangedHunks} width={mainWidth} states={states} drawer={testDrawer} />
-              {explainLines.length ? (
-                <Box flexDirection="column" flexShrink={0} borderStyle="round" borderColor={hunk?.narrationInferred ? 'gray' : 'blue'} paddingX={1} width={mainWidth}>
-                  <Text bold color={hunk?.narrationInferred ? 'gray' : 'blue'}>
-                    {collapsedView ? 'About this chapter' : 'Explanation'}
-                  </Text>
-                  {explainLines.map((l, i) => (
-                    <MdLineView key={i} line={l} />
-                  ))}
-                </Box>
-              ) : null}
-              {collapsedView ? (
-                <>
-                  <CollapsedSummary hunks={tour.hunks} files={filesByPath} chapter={chapter} states={states} sel={summarySel} width={mainWidth} height={bodyHeight - (askPanel ? askHeight : 0)} />
-                  {askPanel}
-                </>
-              ) : hunk ? (
-                <Box flexDirection={sideBySide ? 'row' : 'column'}>
-                  {sideBySide || !testFocus || !showTests ? (
+          <>
+            <ChapterTitle chapter={chapter} hunk={hunk} hi={hi} isNew={!!hunk && delta.has(hunk.id)} unchanged={unchangedHunks} width={mainWidth} states={states} drawer={testDrawer} />
+            <Explanation lines={plan.explainLines} inferred={!!hunk?.narrationInferred} collapsed={collapsedView} updated={updated} focused={focusNow === 'explain'} width={mainWidth} />
+            {collapsedView ? (
+              <>
+                <CollapsedSummary
+                  hunks={tour.hunks}
+                  files={filesByPath}
+                  ids={summaryIds}
+                  states={states}
+                  sel={summarySel}
+                  width={mainWidth}
+                  height={bodyHeight - (slots.collapsedAsk ? askHeight : 0)}
+                />
+                {slots.collapsedAsk ? askPanel : null}
+              </>
+            ) : hunk ? (
+              <Box flexDirection={sideBySide ? 'row' : 'column'}>
+                {plan.sourcePaneShown ? (
+                  <Box flexDirection="column" flexShrink={0} width={srcWidth}>
                     <SourcePane
                       inline={
-                        threadInline
-                          ? {
-                              afterIdx: cursor,
-                              node: (
-                                <ThreadView
-                                  threads={cursorThreads}
-                                  width={codeWidth - 1}
-                                  height={threadHeight}
-                                  mentions={mentions}
-                                  startReply={overlay === 'reply'}
-                                  onReply={props.replyToThread}
-                                  onReact={props.reactToComment}
-                                  onClose={() => setOverlay('none')}
-                                />
-                              ),
-                              height: threadHeight,
-                            }
-                          : inlineSourceComment
-                            ? { afterIdx: selRange()[1], ...inlineComposer(codeWidth - 1, bodyHeight) }
-                            : askPanel && !testFocus
-                              ? { afterIdx: selRange()[1], node: askPanel, height: askHeight }
+                        slots.sourceInline === 'thread'
+                          ? { afterIdx: cursor, node: threadAt(srcWidth - 1, plan.threadHeight), height: plan.threadHeight }
+                          : slots.sourceInline === 'comment'
+                            ? { afterIdx: sel[1], ...inlineComposer(srcWidth - 1, bodyHeight) }
+                            : slots.sourceInline === 'ask'
+                              ? { afterIdx: sel[1], node: askPanel, height: askHeight }
                               : undefined
                       }
                       hunk={hunk}
                       cursor={cursor}
-                      range={anchor !== null ? selRange() : null}
+                      range={anchor !== null ? sel : null}
                       raw={raw}
                       split={splitView}
                       partner={partner}
@@ -904,843 +785,89 @@ export function ChapterScreen(props: {
                       root={svc?.root}
                       headSha={tour.headSha}
                       baseSha={tour.baseSha}
-                      width={codeWidth}
-                      height={bodyHeight}
+                      width={srcWidth}
+                      height={lockShown ? plan.sourceHeight : bodyHeight}
                     />
-                  ) : null}
-                  {sideBySide ? <Box width={1} /> : null}
-                  {sideBySide ? (
-                    <Box
-                      flexDirection="column"
-                      width={testWidth}
-                      flexShrink={0}
-                      height={bodyHeight}
-                      borderStyle="single"
-                      borderTop={false}
-                      borderBottom={false}
-                      borderRight={false}
-                      borderColor="gray"
-                      paddingLeft={1}
-                    >
-                      <Text bold dimColor>
-                        Tests
-                      </Text>
-                      <TestPane
-                        tests={relevantTests}
-                        covers={hunk.covers}
-                        idx={testIdx}
-                        cursor={testCursor}
-                        scroll={testScroll}
-                        setScroll={setTestScroll}
-                        focused={testFocus}
-                        inline={inlineTestComment ? inlineComposer(testWidth - 3, bodyHeight - 1) : testFocus && overlay === 'ask' ? { node: askPanel, height: askHeight } : undefined}
-                        width={testWidth - 2}
-                        height={bodyHeight - 1}
-                      />
-                    </Box>
-                  ) : testFocus && showTests ? (
-                    <TestPane
-                      tests={relevantTests}
-                      covers={hunk.covers}
-                      idx={testIdx}
-                      cursor={testCursor}
-                      scroll={testScroll}
-                      setScroll={setTestScroll}
-                      focused={testFocus}
-                      inline={inlineTestComment ? inlineComposer(testWidth - 1, bodyHeight) : testFocus && overlay === 'ask' ? { node: askPanel, height: askHeight } : undefined}
-                      width={testWidth}
-                      height={bodyHeight}
-                    />
-                  ) : null}
-                </Box>
-              ) : (
-                <Text dimColor>This chapter has no hunks.</Text>
-              )}
-            </>
-          )}
+                    {lockShown ? <LockfileChanges lines={lockListLines(lockShown, srcWidth - 1, plan.lockHeight)} width={srcWidth} height={plan.lockHeight} /> : null}
+                  </Box>
+                ) : null}
+                {sideBySide ? <Box width={1} /> : null}
+                {sideBySide ? (
+                  <Box
+                    flexDirection="column"
+                    width={plan.testWidth}
+                    flexShrink={0}
+                    height={bodyHeight}
+                    borderStyle="single"
+                    borderTop={false}
+                    borderBottom={false}
+                    borderRight={false}
+                    borderColor="gray"
+                    paddingLeft={1}
+                  >
+                    {slots.side === 'thread' ? (
+                      threadAt(plan.testWidth - 2, bodyHeight)
+                    ) : slots.side === 'ask' ? (
+                      askPanelAt(plan.testWidth - 2, bodyHeight)
+                    ) : (
+                      <>
+                        <Text bold dimColor={!testFocus} color={testFocus ? 'cyan' : undefined}>
+                          Tests
+                        </Text>
+                        {testPane}
+                      </>
+                    )}
+                  </Box>
+                ) : (
+                  testPane
+                )}
+              </Box>
+            ) : (
+              <Text dimColor>This chapter has no hunks.</Text>
+            )}
+          </>
         </Box>
       </Box>
-      {overlay === 'delete' && cursorDraft ? (
-        <Text color="yellow" wrap="truncate">
-          {truncate(`Delete this draft? [${cursorDraft.label}] ${clean(cursorDraft.body).replace(/\s+/g, ' ')}`, width - 8)} y / n
-        </Text>
-      ) : (
-        <DraftLine drafts={props.drafts} hunk={hunk} cursor={cursor} flash={flash} width={width} describe={describeAnchor} />
-      )}
+      <StatusRow
+        drafts={props.drafts}
+        hunk={hunk}
+        cursor={cursor}
+        flash={flash}
+        range={anchor !== null && hunk ? rangeLabel(hunk, sel) : undefined}
+        position={hunk ? `hunk ${at?.n}/${at?.total} · line ${cursorLine?.newLine ?? cursorLine?.oldLine ?? ''}` : undefined}
+        width={width}
+      />
       <KeyBar
         width={width}
-        status={overlay === 'none' && hunk && !testFocus ? [raw && 'raw', splitView && 'split', ignoreWhitespace && 'whitespace hidden'].filter(Boolean).join(' · ') : undefined}
-        end={
-          overlay !== 'none'
+        status={overlay.kind === 'none' && hunk && !testFocus ? [raw && 'raw', splitView && 'split', ignoreWhitespace && 'whitespace hidden'].filter(Boolean).join(' · ') : undefined}
+        end={overlay.kind !== 'none' ? [] : [...(panes.length > 1 ? [['tab', 'pane'] as Hint] : []), ...barEnd(keyView, keyCtx)]}
+        extraEnd={overlay.kind !== 'none' ? [] : [PALETTE_HINT]}
+        keys={
+          overlay.kind !== 'none'
             ? []
-            : testFocus
+            : focusNow === 'list'
               ? [
-                  ['t/esc', 'back to code'],
-                  ['b', 'briefing'],
+                  ['j/k', 'choose'],
+                  ['enter', 'open chapter'],
                 ]
-              : [...((tour.rereview ? [['D', props.deltaOnly ? 'full review' : 'changes only']] : []) as [string, string][]), ['b', 'briefing'], ['h', 'all keys']]
+              : focusNow === 'explain'
+                ? [
+                    ['j/k', 'scroll'],
+                    ['enter', 'read it all'],
+                  ]
+                : barKeys(keyView, keyCtx)
         }
-        keys={overlay !== 'none' ? [] : barKeys()}
       />
     </Box>
   );
-  // Help floats over the screen, which stays visible around it.
-  if (overlay === 'help')
+  if (floating && props.active !== false)
     return (
-      <ReviewPopup background={screen} width={width} height={height} maxWidth={HELP_WIDTH} maxHeight={HELP_ROWS.length + 4}>
-        {(w, h) => <Help width={w} height={h} ai={!!props.agent} />}
+      <ReviewPopup background={screen} width={width} height={height} maxWidth={floating.width} maxHeight={floating.height} tone={floating.tone}>
+        {floating.node}
       </ReviewPopup>
     );
+  // Help floats over the screen, which stays visible around it.
+  if (overlay.kind === 'help' && props.active !== false)
+    return <HelpPopup background={screen} width={width} height={height} title="chapter" sections={chapterHelp(!!props.agent)} legend={reviewLegend()} onClose={close} />;
   return screen;
-}
-
-// ---------- pieces ----------
-
-const Header = React.memo(function Header(props: { tour: Tour; prog: ReturnType<typeof progress>; order: ChapterOrder; deltaOnly: boolean; width: number }) {
-  const { tour, prog, width } = props;
-  const barW = 16;
-  const filled = prog.totalLines ? Math.round((prog.readLines / prog.totalLines) * barW) : barW;
-  const meter = '█'.repeat(filled) + '░'.repeat(barW - filled);
-  const right = `${meter} ${prog.readLines}/${prog.totalLines} lines · ${prog.read + prog.skipped}/${prog.total} hunks · ${ORDER_LABEL[props.order]} order`;
-  // A re-review says which hunks it is showing, so the hidden ones are never a surprise.
-  const badge = !tour.rereview ? '' : props.deltaOnly ? 'changes only' : 'full review';
-  const repo = `${safe(tour.repo)} `;
-  const left = `#${tour.pr} ${safe(tour.title)}`;
-  return (
-    <Text wrap="truncate">
-      <Text color="cyan" bold>
-        {repo}
-      </Text>
-      <Text bold>{pad(left, Math.max(10, width - right.length - repo.length - (badge ? badge.length + 1 : 0) - 1))}</Text>{' '}
-      {badge ? (
-        <>
-          <Text color={props.deltaOnly ? 'yellow' : 'cyan'} bold>
-            {badge}
-          </Text>{' '}
-        </>
-      ) : null}
-      <Text color="green">{meter}</Text>
-      <Text dimColor>{right.slice(barW)}</Text>
-    </Text>
-  );
-});
-
-// `listed` is every chapter to show; one not in `chapters` (left out of a re-review) is greyed.
-const ChapterList = React.memo(function ChapterList(props: { tour: Tour; chapters: Chapter[]; listed: Chapter[]; states: States; current: string; width: number; height: number }) {
-  const { tour, chapters, listed, states, current, width } = props;
-  const at = listed.findIndex((c) => c.id === current);
-  const start = Math.max(0, Math.min(at - Math.floor(props.height / 2), listed.length - props.height));
-  return (
-    <Box flexDirection="column" width={width}>
-      {listed.slice(start, start + props.height).map((full) => {
-        const shown = chapters.find((d) => d.id === full.id);
-        const unchanged = !shown;
-        const c = shown ?? full;
-        const here = c.id === current;
-        const st = stateMark(chapterState(tour, c, states));
-        const rk = riskMark(Math.max(0, ...c.hunkIds.map((id) => tour.hunks[id]?.risk ?? 0)));
-        const p = progress(tour, states, c.hunkIds);
-        return (
-          <Text key={c.id} inverse={here} dimColor={unchanged || (c.collapsed && !here)}>
-            <Text color={unchanged ? undefined : st.color}>{st.mark}</Text>
-            <Text color={unchanged ? undefined : rk.color}>{rk.mark}</Text> {pad(safe(c.title), width - 9)}
-            <Text dimColor>{c.optional ? ' opt ' : `${String(p.read + p.skipped).padStart(2)}/${String(p.total).padEnd(2)}`}</Text>
-          </Text>
-        );
-      })}
-    </Box>
-  );
-});
-
-// `drawer`: a hint at the right end of the title row for linked tests that are not on screen.
-const ChapterTitle = React.memo(function ChapterTitle(props: { chapter: Chapter; hunk?: Hunk; hi: number; isNew: boolean; unchanged?: number; width: number; states: States; drawer?: string }) {
-  const { chapter, hunk, hi } = props;
-  const cov = hunk ? COVERAGE[hunk.coverage] : undefined;
-  const st = hunk ? stateMark(stateOf(props.states, hunk)) : undefined;
-  // A deleted file's hunk has no new lines: point at where it was.
-  const location = hunk ? `${hunk.file}:${hunk.newStart || hunk.oldStart}` : '';
-  return (
-    <Box flexDirection="column" flexShrink={0}>
-      <Box width={props.width}>
-        <Box flexShrink={1} flexGrow={1}>
-          <Text wrap="truncate">
-            <Text bold color="cyan">
-              {truncate(safe(chapter.title), Math.floor(props.width * 0.6))}
-            </Text>
-            {chapter.entryPoint ? <Text dimColor> · entry {safe(chapter.entryPoint)}</Text> : null}
-            {hunk ? (
-              <Text dimColor>
-                {' '}
-                · hunk {hi + 1}/{chapter.hunkIds.length}
-              </Text>
-            ) : null}
-            {props.unchanged ? <Text dimColor> · {props.unchanged} unchanged hidden</Text> : null}
-          </Text>
-        </Box>
-        {props.drawer ? (
-          <Box flexShrink={0}>
-            <Text color="cyan">
-              {` ${props.drawer} · `}
-              <Text bold>t</Text>
-            </Text>
-          </Box>
-        ) : null}
-      </Box>
-      {hunk ? (
-        <Text wrap="truncate">
-          {st ? <Text color={st.color}>{st.mark} </Text> : null}
-          {props.isNew ? (
-            <Text color="black" backgroundColor="yellow">
-              {' '}
-              NEW{' '}
-            </Text>
-          ) : null}
-          <Text> {safe(location)}</Text>
-          {cov && cov.text ? (
-            <Text color={cov.color}>
-              {'  '}
-              {cov.mark} {cov.text}
-            </Text>
-          ) : null}
-          {hunk.importOnly ? <Text dimColor> · imports only · optional</Text> : null}
-        </Text>
-      ) : (
-        <Text dimColor>{chapter.collapsed ? `${chapter.hunkIds.length} hunk(s), collapsed${chapter.optional ? ' · optional: not counted toward progress' : ''}` : ''}</Text>
-      )}
-    </Box>
-  );
-});
-
-function threadAt(threads: ExistingThread[], file: string, line?: number, side: 'LEFT' | 'RIGHT' = 'RIGHT') {
-  if (line === undefined) return [];
-  return threads.filter((t) => t.path === file && (side === 'LEFT' ? t.isOutdated && t.originalLine === line : t.line === line || (t.line === undefined && !t.isOutdated && t.originalLine === line)));
-}
-
-// Two moved blocks at most this many lines apart on both sides, going to the same place in the
-// same way, are one move split by a small edit and share one note.
-const SPLIT_GAP = 4;
-
-const movedNotes = new WeakMap<Hunk, Map<number, string>>();
-
-// Under the last line of a block moved within the PR: where the block was, or went, and how.
-function movedNote(hunk: Hunk, j: number): string | undefined {
-  let notes = movedNotes.get(hunk);
-  if (!notes) movedNotes.set(hunk, (notes = notesFor(hunk)));
-  return notes.get(j);
-}
-
-// The move notes of a hunk, by the index of the line each goes under.
-function notesFor(hunk: Hunk): Map<number, string> {
-  const ls = hunk.lines;
-  const alike = (a: DiffLine, b: DiffLine) => a.kind === b.kind && a.moved!.file === b.moved!.file && a.moved!.kind === b.moved!.kind && a.moved!.indent === b.moved!.indent;
-  // Runs of lines moved alike to consecutive lines of one file.
-  const blocks: [number, number][] = [];
-  ls.forEach((l, k) => {
-    const last = blocks.at(-1);
-    if (!l.moved) return;
-    if (last && last[1] === k - 1 && alike(ls[k - 1], l) && l.moved.line === ls[k - 1].moved!.line + 1) last[1] = k;
-    else blocks.push([k, k]);
-  });
-  // Blocks a small edit apart, landing in order a few lines apart, as one note.
-  const groups: [number, number][][] = [];
-  for (const b of blocks) {
-    const prev = groups.at(-1)?.at(-1);
-    const between = prev ? ls.slice(prev[1] + 1, b[0]) : [];
-    const [p, q] = prev ? [ls[prev[1]], ls[b[0]]] : [];
-    const split = prev && between.length <= SPLIT_GAP && alike(p!, q!) && q!.moved!.line > p!.moved!.line && q!.moved!.line - p!.moved!.line - 1 <= SPLIT_GAP;
-    if (split) groups.at(-1)!.push(b);
-    else groups.push([b]);
-  }
-  const notes = new Map<number, string>();
-  for (const g of groups) {
-    const [first, last] = [g[0][0], g.at(-1)![1]];
-    const l = ls[last];
-    const at = ls[first].moved!;
-    const n = g.reduce((t, [a, b]) => t + b - a + 1, 0);
-    const other = last - first + 1 - n;
-    const where = (p: { file: string; line: number }) => (p.file === hunk.file ? `line ${p.line}` : `${safe(p.file)}:${p.line}`);
-    const lines = `${n} line${n === 1 ? '' : 's'}`;
-    const gap = other ? `, split by ${other} other line${other === 1 ? '' : 's'}` : '';
-    const indent = at.indent ? `indent ${at.indent > 0 ? '+' : '−'}${Math.abs(at.indent)}` : '';
-    if (at.kind === 'reindented') {
-      notes.set(last, `↔ ${lines} re-indented in place${indent ? ` (${indent})` : ''}, ${l.kind === 'del' ? 'now' : 'was'} ${where(at)}${gap}`);
-      continue;
-    }
-    const also = (side: 'add' | 'del') => {
-      const places = at.also.filter((p) => p.side === side);
-      if (!places.length) return '';
-      const shown = places.slice(0, 2).map(where).join(', ');
-      return `; also ${side === 'add' ? 'added' : 'removed'} at ${shown}${places.length > 2 ? ` and ${places.length - 2} more` : ''}`;
-    };
-    notes.set(last, `↕ ${lines} ${at.kind} ${l.kind === 'del' ? (at.kind === 'merged' ? 'into' : 'to') : 'from'} ${where(at)}${indent ? `, ${indent}` : ''}${gap}${also('add')}${also('del')}`);
-  }
-  return notes;
-}
-
-function draftsAt(drafts: Draft[], hunk: Hunk, line?: number, side: 'LEFT' | 'RIGHT' = 'RIGHT') {
-  if (line === undefined) return [];
-  return drafts.filter((d) => (d.anchor.type === 'line' || d.anchor.type === 'range') && d.anchor.file === hunk.file && d.anchor.line === line && d.anchor.side === side);
-}
-
-// Syntax colors, plus a background on the `emphasis` ranges (the words a changed line changed).
-// Span and range offsets are into the whole line; `column` is where this chunk of it starts.
-function SyntaxText(props: { text: string; spans?: SyntaxSpan[]; column?: number; emphasis?: CharRange[]; emphasisColor?: string }) {
-  const { text } = props;
-  const column = props.column ?? 0;
-  const clip = (x: number) => Math.max(0, Math.min(text.length, x - column));
-  const spans = (props.spans ?? []).map((s) => ({ start: clip(s.start), end: clip(s.end), color: s.color })).filter((s) => s.end > s.start);
-  const emphasis = (props.emphasis ?? []).map(([s, e]) => [clip(s), clip(e)]).filter(([s, e]) => e > s);
-  const cuts = [...new Set([0, text.length, ...spans.flatMap((s) => [s.start, s.end]), ...emphasis.flat()])].sort((a, b) => a - b);
-  const parts: React.ReactNode[] = [];
-  for (let k = 0; k + 1 < cuts.length; k++) {
-    const [start, end] = [cuts[k], cuts[k + 1]];
-    const color = spans.find((s) => s.start <= start && end <= s.end)?.color;
-    const backgroundColor = emphasis.some(([s, e]) => s <= start && end <= e) ? props.emphasisColor : undefined;
-    parts.push(
-      <Text key={start} color={color} backgroundColor={backgroundColor}>
-        {text.slice(start, end)}
-      </Text>,
-    );
-  }
-  return <Text>{parts}</Text>;
-}
-
-const DIFF_BACKGROUND = { add: SURFACES.lineAdd, del: SURFACES.lineDel, ctx: undefined } as const;
-const WORD_BACKGROUND = { add: SURFACES.wordAdd, del: SURFACES.wordDel, ctx: undefined } as const;
-
-const SourcePane = React.memo(function SourcePane(props: {
-  inline?: { afterIdx: number; node: React.ReactNode; height: number }; // comment editor under the selected line
-  hunk: Hunk;
-  cursor: number;
-  range: [number, number] | null;
-  raw: boolean;
-  split: boolean; // old and new side by side
-  partner: number[]; // pairChangedLines(hunk.lines)
-  hidden: ReadonlyMap<number, Fold>; // removed lines folded into their replacement (foldedLines)
-  ignoreWhitespace: boolean;
-  scroll: number;
-  setScroll: (n: number) => void;
-  threads: ExistingThread[];
-  drafts: Draft[];
-  root?: string;
-  headSha: string;
-  baseSha: string;
-  width: number;
-  height: number;
-}) {
-  const { hunk, cursor, range, width, height } = props;
-  // Highlights depend on the hunk's identity and the shas, not on the hunk object: a tour
-  // update hands every hunk a new object, and that must not re-read and re-tokenize the file.
-  const request = { hunk, root: props.root, headSha: props.headSha, baseSha: props.baseSha };
-  const { syntax } = useTheme(); // a theme change re-renders with a new key
-  const previewing = usePreviewing();
-  const key = hunkHighlightKey(request, syntax);
-  const hunkKey = hunkHighlightKey(request, ''); // the same hunk in any theme
-  const [state, setState] = useState<{ key: string; hunkKey: string; value?: HunkHighlights }>(() => ({ key, hunkKey, value: peekHunkHighlights(request, syntax, previewing)?.value }));
-  const cached = state.key === key ? undefined : peekHunkHighlights(request, syntax, previewing);
-  if (cached && state.key !== key) setState({ key, hunkKey, value: cached.value });
-  // Another theme's colors for this hunk stay on screen until this theme's arrive.
-  const highlights = state.key === key || state.hunkKey === hunkKey ? state.value : undefined;
-  const latest = React.useRef({ request, syntax, previewing });
-  latest.current = { request, syntax, previewing };
-  useEffect(() => {
-    let active = true;
-    void highlightHunkCached(latest.current.request, latest.current.syntax, latest.current.previewing)
-      .catch(() => undefined)
-      .then((value) => {
-        if (active) setState((s) => (s.key === key && s.value === value ? s : { key, hunkKey, value }));
-      });
-    return () => {
-      active = false;
-    };
-  }, [key, hunkKey]);
-  // The changed words of each paired line, as ranges into its displayed (cleaned) text.
-  const words = useMemo(() => {
-    const out: (CharRange[] | undefined)[] = [];
-    props.partner.forEach((p, i) => {
-      if (p < i || hunk.lines[i].kind !== 'del') return;
-      const diff = wordDiff(clean(hunk.lines[i].text), clean(hunk.lines[p].text));
-      out[i] = diff?.a;
-      out[p] = diff?.b;
-    });
-    return out;
-  }, [hunk, props.partner]);
-  const rows = useMemo(() => {
-    const out: { idx: number; node: React.ReactNode }[] = [];
-    if (props.raw) {
-      out.push({ idx: -1, node: <Text color="cyan">{truncate(hunk.header, width)}</Text> });
-      hunk.lines.forEach((l, i) => {
-        const sign = l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ';
-        codeChunks(l.text, width - 2).forEach((code, part) => {
-          out.push({
-            idx: i,
-            node: (
-              <Text backgroundColor={DIFF_BACKGROUND[l.kind]}>
-                <Text color={l.kind === 'add' ? 'green' : l.kind === 'del' ? 'red' : undefined}>{part === 0 ? sign : ' '}</Text>
-                {code}
-              </Text>
-            ),
-          });
-        });
-      });
-      return out;
-    }
-    const reindentedOnly = (l: DiffLine, i: number) => l.kind === 'ctx' || props.hidden.get(i) === 'whitespace' || props.hidden.get(props.partner[i]) === 'whitespace';
-    if (props.ignoreWhitespace && hunk.lines.every(reindentedOnly)) out.push({ idx: -1, node: <Text dimColor>{truncate('  whitespace-only changes hidden · w to show', width)}</Text> });
-    // Review threads, drafts and a moved block's origin under line j, on rows of line i.
-    const notesUnder = (j: number, i: number) => {
-      const l = hunk.lines[j];
-      const line = l.kind === 'del' ? l.oldLine : l.newLine;
-      const threads = threadAt(props.threads, hunk.file, line, l.kind === 'del' ? 'LEFT' : 'RIGHT');
-      if (threads.length)
-        out.push({
-          idx: i,
-          node: (
-            <Text color="cyan">
-              {truncate(`         ┊ ${threads.length} review ${threads.length === 1 ? 'thread' : 'threads'} · ${threads.reduce((n, t) => n + t.comments.length, 0)} comments · e to read`, width)}
-            </Text>
-          ),
-        });
-      for (const d of draftsAt(props.drafts, hunk, line, l.kind === 'del' ? 'LEFT' : 'RIGHT')) {
-        out.push({
-          idx: i,
-          node: <Text color={LABEL_COLOR[d.label]}>{truncate(`         ✎ [${d.label}]${d.posted ? ' (posted)' : ''} ${clean(d.body).replace(/\s+/g, ' ')}`, width)}</Text>,
-        });
-      }
-      const moved = movedNote(hunk, j);
-      if (moved) out.push({ idx: i, node: <Text color="magenta">{truncate(`         ${moved}`, width)}</Text> });
-    };
-    if (props.split) {
-      // Old on the left, new on the right; a removed line shares its replacement's row.
-      const half = Math.max(8, Math.floor((width - 2) / 2));
-      const codeW = Math.max(1, half - 6);
-      const cells = (j: number | undefined, side: 'old' | 'new'): React.ReactNode[] => {
-        if (j === undefined) return [];
-        const l = hunk.lines[j];
-        const reindented = props.hidden.get(l.kind === 'del' ? j : props.partner[j]) === 'whitespace' && l.kind !== 'ctx';
-        const no = `${(side === 'old' ? l.oldLine : l.newLine) ?? ''}`.padStart(4);
-        const sign = reindented ? '~' : l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ';
-        const color = reindented ? undefined : l.kind === 'add' ? 'green' : l.kind === 'del' ? 'red' : undefined;
-        const text = clean(l.text);
-        const emphasis = reindented || l.kind === 'ctx' ? undefined : words[j]?.filter(([s, e]) => !props.ignoreWhitespace || text.slice(s, e).trim());
-        return codeChunks(l.text, codeW).map((code, part) => (
-          <Text key={`${side}${part}`} backgroundColor={reindented ? undefined : DIFF_BACKGROUND[l.kind]} dimColor={l.expanded}>
-            <Text dimColor>{part === 0 ? no : '    '} </Text>
-            <Text color={color} dimColor={reindented}>
-              {part === 0 ? sign : ' '}
-            </Text>
-            <SyntaxText text={code} spans={highlights?.[j]} column={part * codeW} emphasis={emphasis} emphasisColor={WORD_BACKGROUND[l.kind]} />
-            {' '.repeat(Math.max(0, codeW - code.length))}
-          </Text>
-        ));
-      };
-      const blank = ' '.repeat(half);
-      hunk.lines.forEach((l, i) => {
-        if (props.hidden.has(i)) return;
-        const beside = l.kind === 'add' && props.hidden.has(props.partner[i]) ? props.partner[i] : undefined;
-        const left = cells(l.kind === 'add' ? beside : i, 'old');
-        const right = cells(l.kind === 'del' ? undefined : i, 'new');
-        for (let k = 0; k < Math.max(left.length, right.length); k++)
-          out.push({
-            idx: i,
-            node: (
-              <Text>
-                {left[k] ?? blank}
-                <Text dimColor>│</Text>
-                {right[k] ?? blank}
-              </Text>
-            ),
-          });
-        if (beside !== undefined) notesUnder(beside, i);
-        notesUnder(i, i);
-      });
-      return out;
-    }
-    hunk.lines.forEach((l, i) => {
-      if (props.hidden.has(i)) return;
-      // An added line whose removed partner is folded into it shows once, on a plain background:
-      // marked ~ when only whitespace changed, or + with just the added words in green.
-      const fold = props.hidden.get(props.partner[i]);
-      const reindented = fold === 'whitespace';
-      const kind = fold ? 'ctx' : l.kind;
-      const no = `${(fold ? hunk.lines[props.partner[i]].oldLine : l.oldLine) ?? ''}`.padStart(4) + ' ' + `${l.newLine ?? ''}`.padStart(4);
-      const sign = reindented ? '~' : l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ';
-      const color = reindented ? undefined : l.kind === 'add' ? 'green' : l.kind === 'del' ? 'red' : undefined;
-      const text = clean(l.text);
-      const emphasis = reindented || l.kind === 'ctx' ? undefined : words[i]?.filter(([s, e]) => !props.ignoreWhitespace || text.slice(s, e).trim());
-      codeChunks(l.text, width - 12).forEach((code, part) =>
-        out.push({
-          idx: i,
-          node: (
-            <Text backgroundColor={DIFF_BACKGROUND[kind]} dimColor={l.expanded}>
-              <Text dimColor>{part === 0 ? no : ' '.repeat(9)} </Text>
-              <Text color={color} dimColor={reindented}>
-                {part === 0 ? sign : ' '}
-              </Text>
-              <SyntaxText text={code} spans={highlights?.[i]} column={part * Math.max(1, width - 12)} emphasis={emphasis} emphasisColor={WORD_BACKGROUND[l.kind]} />
-            </Text>
-          ),
-        }),
-      );
-      notesUnder(i, i);
-    });
-    return out;
-  }, [hunk, props.raw, props.split, props.partner, props.hidden, props.ignoreWhitespace, words, props.threads, props.drafts, width, highlights]);
-
-  // Keep the cursor in view.
-  const cursorRow = rows.findIndex((r) => r.idx === cursor);
-  const cursorEnd = rows.findLastIndex((r) => r.idx === cursor);
-  let top = props.scroll;
-  if (cursorRow < top) top = cursorRow;
-  if (cursorEnd >= top + height) top = cursorEnd - height + 1;
-  top = Math.max(0, Math.min(top, Math.max(0, rows.length - height)));
-  useEffect(() => {
-    if (top !== props.scroll) props.setScroll(top);
-  });
-
-  const renderRow = (r: (typeof rows)[number], k: number) => {
-    const inRange = range && r.idx >= range[0] && r.idx <= range[1];
-    const first = rows[k - 1]?.idx !== r.idx;
-    const isCursor = r.idx === cursor && first;
-    return (
-      <Box key={k}>
-        <Text color={isCursor ? 'cyan' : inRange ? 'blue' : undefined}>{isCursor ? '▶' : inRange ? '┃' : ' '}</Text>
-        {r.node}
-      </Box>
-    );
-  };
-
-  if (props.inline) {
-    // Keep the commented line(s) in view with some context above, the editor right under them.
-    const avail = Math.max(2, height - props.inline.height);
-    const anchorRow = rows.reduce((last, r, i) => (r.idx <= props.inline!.afterIdx ? i : last), 0);
-    const start = Math.max(0, anchorRow - Math.max(1, Math.floor(avail * 0.6)) + 1);
-    const before = rows.slice(start, anchorRow + 1).map((r, k) => renderRow(r, start + k));
-    const after = rows.slice(anchorRow + 1, anchorRow + 1 + Math.max(0, avail - before.length)).map((r, k) => renderRow(r, anchorRow + 1 + k));
-    return (
-      <Box flexDirection="column" width={width} flexShrink={0} height={height} overflow="hidden">
-        {before}
-        <Box flexShrink={0} paddingLeft={1}>
-          {props.inline.node}
-        </Box>
-        {after}
-      </Box>
-    );
-  }
-
-  return (
-    <Box flexDirection="column" width={width} flexShrink={0} height={height} overflow="hidden">
-      {rows.slice(top, top + height).map((r, k) => renderRow(r, top + k))}
-      {rows.length > top + height ? <Text dimColor>{`  … ${rows.length - top - height} more`}</Text> : null}
-    </Box>
-  );
-});
-
-function TestPane(props: {
-  tests: TestLink[];
-  covers?: Hunk['covers'];
-  idx: number;
-  cursor: number;
-  scroll: number;
-  setScroll: (n: number) => void;
-  focused: boolean;
-  inline?: { node: React.ReactNode; height: number };
-  width: number;
-  height: number;
-}) {
-  const { width, height } = props;
-  const covers = props.covers;
-  const selected = covers ?? props.tests[props.idx];
-  const [highlights, setHighlights] = useState<HunkHighlights>();
-  const [diffHighlights, setDiffHighlights] = useState<(HunkHighlights | undefined)[]>();
-  // Keyed on the test's file and text, so a tour update with the same test code keeps its highlight.
-  const testFileName = covers?.file ?? props.tests[props.idx]?.testFile;
-  const { syntax } = useTheme();
-  const testKey = selected
-    ? `${testFileName}\0${'diffHunks' in selected && selected.diffHunks?.length ? selected.diffHunks.map((d) => d.lines.map((l) => l.kind + l.text).join('\n')).join('\0') : selected.lines.join('\n')}`
-    : '';
-  const highlightKey = `${syntax}\0${testKey}`;
-  const latest = React.useRef({ selected, file: testFileName, syntax, testKey });
-  latest.current = { selected, file: testFileName, syntax, testKey };
-  const shownTest = React.useRef('');
-  useEffect(() => {
-    let active = true;
-    // Another test clears its colors; another theme keeps the old ones until the new arrive.
-    if (shownTest.current !== latest.current.testKey) {
-      setHighlights(undefined);
-      setDiffHighlights(undefined);
-    }
-    shownTest.current = latest.current.testKey;
-    const { selected, file, syntax } = latest.current;
-    if (selected && file) {
-      if ('diffHunks' in selected && selected.diffHunks?.length) {
-        void Promise.all(selected.diffHunks.map((diff) => highlightDiffLines(file, diff.lines, undefined, syntax))).then((result) => {
-          if (active) setDiffHighlights(result);
-        });
-      } else {
-        void highlightSourceLines(file, selected.lines, syntax).then((result) => {
-          if (active) setHighlights(result);
-        });
-      }
-    }
-    return () => {
-      active = false;
-    };
-  }, [highlightKey]);
-  const lines: React.ReactNode[] = [];
-  let codeIndex = 0;
-  let cursorRow = -1;
-  const marker = () => {
-    const selected = props.focused && codeIndex === props.cursor;
-    if (selected) cursorRow = lines.length;
-    codeIndex++;
-    return <Text color={selected ? 'cyan' : undefined}>{selected ? '▶' : ' '}</Text>;
-  };
-  if (covers) {
-    lines.push(
-      <Text key="h" bold>
-        {truncate(`Covers (unchanged): ${covers.file}${covers.symbol ? ` › ${covers.symbol}` : ''}`, width)}
-      </Text>,
-    );
-    covers.lines.forEach((l, i) => {
-      const caret = marker();
-      codeChunks(l, width - 6).forEach((code, part) =>
-        lines.push(
-          <Text key={`c${i}_${part}`}>
-            {part === 0 ? caret : ' '}
-            <Text dimColor>{part === 0 ? String(covers.startLine + i).padStart(4) : ' '.repeat(4)} </Text>
-            <SyntaxText text={code} spans={highlights?.[i]} column={part * Math.max(1, width - 6)} />
-          </Text>,
-        ),
-      );
-    });
-  } else {
-    props.tests.forEach((t: TestLink, ti) => {
-      const active = ti === props.idx;
-      const guess = t.source === 'naming';
-      lines.push(
-        <Text key={`t${ti}`} inverse={active && props.focused} bold={active} dimColor={!active}>
-          {truncate(`${active ? '▸' : ' '} ${t.testName}`, width - 1)}
-        </Text>,
-      );
-      lines.push(
-        <Text key={`m${ti}`}>
-          {t.diffHunks?.length ? (
-            <Text bold color={t.testChange === 'new' ? 'green' : 'yellow'}>
-              {t.testChange === 'new' ? '● new' : '◐ modified'}
-            </Text>
-          ) : null}
-          <Text dimColor italic={guess}>
-            {truncate(
-              `  ${t.testFile}:${t.startLine} · ${LINK_TEXT[t.source]}${guess ? ' (guess)' : ''} · ${Math.round(t.confidence * 100)}%`,
-              width - (t.diffHunks?.length ? (t.testChange === 'new' ? 5 : 10) : 0),
-            )}
-          </Text>
-        </Text>,
-      );
-      if (active) {
-        if (t.diffHunks?.length) {
-          t.diffHunks.forEach((diff, di) => {
-            if (t.diffHunks!.length > 1)
-              lines.push(
-                <Text key={`h${ti}_${di}`} color="cyan">
-                  {truncate(diff.header, width)}
-                </Text>,
-              );
-            diff.lines.forEach((l, i) => {
-              const caret = marker();
-              const sign = l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ';
-              const color = l.kind === 'add' ? 'green' : l.kind === 'del' ? 'red' : undefined;
-              codeChunks(l.text, width - 12).forEach((code, part) =>
-                lines.push(
-                  <Text key={`d${ti}_${di}_${i}_${part}`}>
-                    {part === 0 ? caret : ' '}
-                    <Text backgroundColor={DIFF_BACKGROUND[l.kind]}>
-                      <Text dimColor>{part === 0 ? `${l.oldLine ?? ''}`.padStart(4) + ' ' + `${l.newLine ?? ''}`.padStart(4) : ' '.repeat(9)} </Text>
-                      <Text color={color}>{part === 0 ? sign : ' '}</Text>
-                      <SyntaxText text={code} spans={diffHighlights?.[di]?.[i]} column={part * Math.max(1, width - 12)} />
-                    </Text>
-                  </Text>,
-                ),
-              );
-            });
-          });
-        } else {
-          t.lines.forEach((l, i) => {
-            const caret = marker();
-            codeChunks(l, width - 6).forEach((code, part) =>
-              lines.push(
-                <Text key={`l${ti}_${i}_${part}`}>
-                  {part === 0 ? caret : ' '}
-                  <Text dimColor>{part === 0 ? String(t.startLine + i).padStart(4) : ' '.repeat(4)} </Text>
-                  <SyntaxText text={code} spans={highlights?.[i]} column={part * Math.max(1, width - 6)} />
-                </Text>,
-              ),
-            );
-          });
-        }
-      }
-    });
-  }
-  let top = Math.min(props.scroll, Math.max(0, lines.length - height));
-  if (cursorRow >= 0 && cursorRow < top) top = cursorRow;
-  if (cursorRow >= top + height) top = cursorRow - height + 1;
-  useEffect(() => {
-    if (top !== props.scroll) props.setScroll(top);
-  });
-  if (props.inline && cursorRow >= 0) {
-    const avail = Math.max(2, height - props.inline.height);
-    const start = Math.max(0, cursorRow - Math.max(1, Math.floor(avail * 0.6)) + 1);
-    const before = lines.slice(start, cursorRow + 1);
-    const after = lines.slice(cursorRow + 1, cursorRow + 1 + Math.max(0, avail - before.length));
-    return (
-      <Box flexDirection="column" width={width} height={height} overflow="hidden">
-        {before}
-        <Box flexShrink={0} paddingLeft={1}>
-          {props.inline.node}
-        </Box>
-        {after}
-      </Box>
-    );
-  }
-  return (
-    <Box flexDirection="column" width={width} height={height} overflow="hidden" borderStyle={undefined}>
-      {lines.slice(top, top + height)}
-    </Box>
-  );
-}
-
-// Renders only the visible window of a collapsed chapter, which can hold thousands of generated hunks.
-const CollapsedSummary = React.memo(function CollapsedSummary(props: {
-  hunks: Tour['hunks'];
-  files: Map<string, DiffFile>;
-  chapter: Chapter;
-  states: States;
-  sel: number;
-  width: number;
-  height: number;
-}) {
-  const { hunks, files, chapter, states, width } = props;
-  const total = chapter.hunkIds.length;
-  const top = Math.max(0, Math.min(props.sel - Math.floor(props.height / 2), total - props.height));
-  const rows = chapter.hunkIds.slice(top, top + Math.max(0, props.height)).map((id, k) => {
-    const i = top + k;
-    const h = hunks[id];
-    const f = h ? files.get(h.file) : undefined;
-    const st = stateMark(stateOf(states, h));
-    const summary = f?.summary ?? f?.kindReason ?? '';
-    return (
-      <Text key={id} inverse={i === props.sel}>
-        <Text color={st.color}>{st.mark}</Text> {pad(h?.file ?? id, Math.floor(width * 0.45))}{' '}
-        <Text dimColor>{truncate(`${summary} (+${f?.additions ?? 0}/-${f?.deletions ?? 0}, ${h ? changedLineCount(h) : 0} lines)`, Math.floor(width * 0.5))}</Text>
-      </Text>
-    );
-  });
-  return (
-    <Box flexDirection="column" height={props.height} overflow="hidden">
-      {rows}
-    </Box>
-  );
-});
-
-function DraftLine(props: { drafts: Draft[]; hunk?: Hunk; cursor: number; flash: string; width: number; describe: (d: Draft) => string }) {
-  const pending = props.drafts.filter((d) => !d.posted);
-  if (props.flash)
-    return (
-      <Text color="yellow" wrap="truncate">
-        {truncate(props.flash, props.width)}
-      </Text>
-    );
-  const l = props.hunk?.lines[props.cursor];
-  const here = props.hunk && l ? draftsAt(props.drafts, props.hunk, l.kind === 'del' ? l.oldLine : l.newLine, l.kind === 'del' ? 'LEFT' : 'RIGHT') : [];
-  const text = here.length ? `✎ ${here.map((d) => `[${d.label}] ${d.body.replace(/\s+/g, ' ')}`).join('  ')}` : `✎ ${pending.length} draft comment(s)`;
-  return (
-    <Text dimColor={!here.length} wrap="truncate">
-      {truncate(text, props.width)}
-    </Text>
-  );
-}
-
-const HELP_ROWS: [string, string][] = [
-  ['n / p', 'Next or previous hunk (n marks it read), on into the next chapter'],
-  ['j / k, J / K', 'Move by line (or 10 lines) inside the hunk'],
-  ['v', 'Start or end a range selection'],
-  ['] / [', 'Next or previous chapter'],
-  ['c / C', 'Comment on the selected line or range / on the whole flow'],
-  ['e', 'Read existing review threads on the selected line inline'],
-  ['y', 'Reply to an existing review thread on the selected line'],
-  ['E / X', 'Edit or delete your draft on the selected line'],
-  ['In a comment', '@ people/code (@callers: @tests: @threads: …)'],
-  ['  ^T', 'In a comment: suggest a code change with AI'],
-  ['?', 'Ask the agent about the selection'],
-  ['t', 'Focus the test pane (narrow terminals: toggle source/tests)'],
-  ['T', 'Hide or show the test pane beside the code'],
-  ['Focused tests', 'n/p test · j/k line · c comment · ? ask · t/Esc back to source'],
-  ['U', 'Expand or collapse possible test gaps in the explanation'],
-  ['d', 'Chapter diagram (select a node to jump to its code)'],
-  ['r', 'Raw unified diff for the hunk'],
-  ['S', 'Split view (old beside new) or inline'],
-  ['+ / -', 'Show 10 more or fewer lines of the file around the hunk'],
-  ['w', 'Hide or show whitespace-only changes'],
-  ['x / z / u', 'Mark the hunk skipped / deferred / unread'],
-  ['m', 'Move the hunk to another chapter'],
-  ['f', 'Cycle Guided, Risk first, Small first, and File order'],
-  ['D', 'Re-review: switch between only new and changed hunks and the full review'],
-  ['o', 'Open the hunk in your coding agent (set in gr config)'],
-  ['i', 'Team checklist for this chapter'],
-  ['b / s', 'Briefing / submit screen'],
-  ['L', 'Color theme (previews as you move through the list)'],
-  ['q / Q', 'Back to the PR list / quit (progress is saved)'],
-];
-const HELP_KEY_WIDTH = 15;
-const HELP_WIDTH = 2 + 2 + HELP_KEY_WIDTH + Math.max(...HELP_ROWS.map(([, v]) => v.length)); // border, padding, key column
-
-// Rows for keys that need the agent; left out when it is absent.
-const AI_HELP_KEYS = new Set(['  ^T', '?']);
-
-// The key reference, sized to the popup: descriptions truncate, and rows past its height are cut.
-function Help(props: { width: number; height: number; ai: boolean }) {
-  const inner = props.width - 2;
-  const all = props.ai ? HELP_ROWS : HELP_ROWS.filter(([k]) => !AI_HELP_KEYS.has(k)).map(([k, v]): [string, string] => [k, v.replace(' · ? ask', '')]);
-  const rows = all.slice(0, Math.max(0, props.height - 2));
-  return (
-    <Box flexDirection="column" paddingX={1}>
-      <Text bold>Keys</Text>
-      {rows.map(([k, v]) => (
-        <Text key={k} wrap="truncate">
-          <Text bold color="cyan">
-            {k.padEnd(HELP_KEY_WIDTH)}
-          </Text>
-          {truncate(v, Math.max(1, inner - HELP_KEY_WIDTH))}
-        </Text>
-      ))}
-      <Text dimColor>{rows.length < all.length ? `${all.length - rows.length} more on a taller terminal · ` : ''}any key to close</Text>
-    </Box>
-  );
-}
-
-type GuideLine = MdLine;
-
-// The guide's text: narration (inferred narration is quieter),
-// then notes on the chapter or hunk. All of it is Markdown: the agent writes `code`.
-function guideLines(narration: string | undefined, inferred: boolean, notes: string[], width: number, mode: Tour['mode'], hasHunk: boolean): GuideLine[] {
-  const out: GuideLine[] = [];
-  // Narration and notes are model output; renderMarkdown strips terminal controls.
-  if (narration) {
-    const md = renderMarkdown(narration, width);
-    out.push(...(inferred ? restyle(md, { dim: true, italic: true }) : md));
-    if (inferred) out.push(line('(the agent’s inference: not tied to visible code)', { dim: true, italic: true }));
-  } else if (hasHunk) {
-    out.push(line(mode === 'plain' ? 'Plain mode: no narration.' : 'Narration is still being written…', { dim: true }));
-  }
-  if (notes.length) {
-    out.push([]);
-    for (const n of notes) out.push(...restyle(renderMarkdown(n, width), { color: 'yellow' }));
-  }
-  return out;
-}
-
-function noTestHint(hunk: Hunk, nameGuess?: string): string | undefined {
-  if (hunk.coverage === 'n/a') return undefined;
-  return `No linked test case found for this code.${nameGuess ? ` Nearest test file by name: ${nameGuess}` : ''}`;
 }

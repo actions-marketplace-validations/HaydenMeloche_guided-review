@@ -15,9 +15,11 @@ import { buildReviewPayload } from '../src/review/submit.js';
 import { ChapterScreen } from '../src/tui/ChapterScreen.js';
 import { ThreadView } from '../src/tui/ThreadView.js';
 import { SubmitScreen } from '../src/tui/SubmitScreen.js';
-import { BriefingScreen } from '../src/tui/BriefingScreen.js';
+import { BriefingScreen, stripFileRefs } from '../src/tui/BriefingScreen.js';
+import { leadThenDim } from '../src/tui/chapter/guide.js';
 import { ORDER_SEQUENCE, positionAfterOrderChange, progress, sortChapters, type States } from '../src/tui/nav.js';
 import { waitFor } from './helpers/waitFor.js';
+import { hunkKeys } from '../src/review/hunkState.js';
 import { filesFor, hunkFromDiff, tour as makeTour } from './fixtures/tour.js';
 
 // Never reach GitHub from a test: confirming the submit screen posts through this.
@@ -81,9 +83,9 @@ function Harness(props: {
       width={props.width ?? 150}
       height={40}
       setPos={(ci, hi) => setPos({ ci, hi })}
-      setState={(h: Hunk, s: ReadState) =>
+      setState={(hs: Hunk[], s: ReadState) =>
         setStates((prev) => {
-          const next = { ...prev, [h.contentHash]: s };
+          const next = { ...prev, ...Object.fromEntries(hs.map((h) => [h.contentHash, s])) };
           props.onState(next);
           return next;
         })
@@ -125,7 +127,7 @@ describe('ChapterScreen', () => {
     tour.chapters[0] = { ...tour.chapters[0], hunkIds: [], collapsed: false, checklist: [{ id: 'k', item: 'Migrations reviewed', pattern: '**', status: 'unknown' }] };
     const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
     await waitFor(() => expect(ui.lastFrame()).toContain('This chapter has no hunks.'));
-    ui.stdin.write('?');
+    ui.stdin.write('a');
     await waitFor(() => expect(ui.lastFrame()).toContain('Nothing to ask about here.'));
     ui.stdin.write('i');
     await waitFor(() => expect(ui.lastFrame()).toContain('The checklist opens once the checkout is ready.'));
@@ -161,8 +163,8 @@ describe('ChapterScreen', () => {
     ];
     const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
     await waitFor(() => expect(ui.lastFrame()).toContain('● new'));
-    expect(ui.lastFrame()).toContain("+it('creates invoice'");
-    expect(ui.lastFrame()).toContain('+  expect(createInvoice())');
+    expect(ui.lastFrame()).toContain("+ it('creates invoice'");
+    expect(ui.lastFrame()).toContain('+   expect(createInvoice())');
     ui.unmount();
   });
 
@@ -179,7 +181,7 @@ describe('ChapterScreen', () => {
       const frame = ui.lastFrame()!;
       const row = frame.split('\n').find((line) => /│\s*Tests/.test(line));
       if (!row) throw new Error(frame);
-      return row.indexOf('│');
+      return row.search(/│\s*Tests/);
     };
     const shortBoundary = boundary();
     ui.stdin.write('t');
@@ -260,7 +262,7 @@ describe('ChapterScreen', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('expect(createInvoice())'));
     expect(ui.lastFrame()).not.toContain(second);
     ui.stdin.write('j');
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/▶\s*\s*2\s*\+/));
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/▶\s*2\s*│\s*\+/));
     ui.stdin.write('c');
     await waitFor(() => expect(ui.lastFrame()).toContain(`Comment on ${testFile}:2`));
     const commentRows = ui.lastFrame()!.split('\n');
@@ -276,7 +278,7 @@ describe('ChapterScreen', () => {
     await waitFor(() => expect(drafts).toHaveLength(1));
     expect(drafts[0].anchor).toEqual({ type: 'line', hunkId: 'test-hunk', file: testFile, line: 2, side: 'RIGHT' });
     expect(buildReviewPayload(tour, drafts, 'COMMENT', '').payload.comments[0]).toMatchObject({ path: testFile, line: 2, side: 'RIGHT' });
-    ui.stdin.write('?');
+    ui.stdin.write('a');
     await waitFor(() => expect(ui.lastFrame()).toContain(`Ask about ${testFile}:2`));
     const askRows = ui.lastFrame()!.split('\n');
     const askLine = askRows.findIndex((row) => row.includes(`Ask about ${testFile}:2`));
@@ -333,9 +335,18 @@ describe('ChapterScreen', () => {
     expect(ui.lastFrame()).toContain('@alice');
     ui.stdin.write('\t');
     await tick();
+    // Enter asks first; n goes back to the reply, and y posts it.
     ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Post this reply on'));
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('Post this reply on'));
+    expect(reply).toBe('');
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Post this reply on'));
+    ui.stdin.write('y');
     await waitFor(() => expect(reply).toBe('Agreed @alice'));
     await waitFor(() => expect(ui.lastFrame()).not.toContain('Reply to review thread'));
+    expect(ui.lastFrame()).toContain('Reply posted on');
     ui.stdin.write('y');
     await waitFor(() => expect(ui.lastFrame()).toContain('Reply to review thread'));
     expect(ui.lastFrame()).toContain(line.text.trim().slice(0, 20));
@@ -361,7 +372,7 @@ describe('ChapterScreen', () => {
     hunk.tests = [{ testFile: 'test/invoice.test.ts', testName: 'creates invoice', startLine: 1, lines: ['it("creates invoice", () => {})'], source: 'name-match', confidence: 0.65 }];
     let opened = 0;
     const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} onBriefing={() => opened++} />);
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/b\s+briefing/));
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/esc\s+back/));
     ui.stdin.write('b');
     await waitFor(() => expect(opened).toBe(1));
     ui.stdin.write('t');
@@ -399,12 +410,12 @@ describe('ChapterScreen', () => {
     const hunk = tour.hunks[chapter.hunkIds[0]];
     const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} agent={{ cwd: '/tmp' }} />);
     await tick();
-    ui.stdin.write('?');
+    ui.stdin.write('a');
     await waitFor(() => expect(ui.lastFrame()).toContain('Ask about'));
     expect(ui.lastFrame()).toContain(chapter.title);
     expect(ui.lastFrame()).toContain(hunk.file);
     expect(ui.lastFrame()).toContain(hunk.lines.find((line) => line.kind !== 'ctx')!.text.slice(0, 30));
-    expect(ui.lastFrame()).toContain('enter: ask');
+    expect(ui.lastFrame()).toContain('enter ask');
     ui.stdin.write('\u001b');
     await waitFor(() => expect(ui.lastFrame()).not.toContain('Ask about'));
     expect(ui.lastFrame()).toContain('hunk 1/');
@@ -429,12 +440,12 @@ describe('ChapterScreen', () => {
       />,
     );
     await tick();
-    ui.stdin.write('?');
+    ui.stdin.write('a');
     await tick();
     ui.stdin.write('why nullable');
     await tick();
     ui.stdin.write('\r');
-    await waitFor(() => expect(ui.lastFrame()).toContain('enter: follow up'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('enter follow up'));
     ui.stdin.write('who calls it');
     await tick();
     ui.stdin.write('\r');
@@ -481,9 +492,6 @@ describe('ChapterScreen', () => {
     const ui = render(<Harness tour={tour} onDraft={(d) => drafts.push(d)} onState={() => {}} onDelete={(d) => deleted.push(d)} />);
     await waitFor(() => expect(ui.lastFrame()).toContain('hunk 1/'));
 
-    ui.stdin.write('E');
-    await waitFor(() => expect(ui.lastFrame()).toContain('No draft on this line'));
-
     ui.stdin.write('c');
     await waitFor(() => expect(ui.lastFrame()).toContain('Comment on'));
     ui.stdin.write('first take');
@@ -492,7 +500,7 @@ describe('ChapterScreen', () => {
     await waitFor(() => expect(drafts).toHaveLength(1));
     await waitFor(() => expect(ui.lastFrame()).toContain('edit draft'));
 
-    ui.stdin.write('E');
+    ui.stdin.write('c');
     await waitFor(() => expect(ui.lastFrame()).toContain('first take'));
     ui.stdin.write('\t'); // question -> suggestion
     await tick();
@@ -505,15 +513,19 @@ describe('ChapterScreen', () => {
     expect(drafts[1].label).toBe('suggestion');
     expect(ui.lastFrame()).toContain('Draft updated');
 
-    ui.stdin.write('X');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Delete this draft?'));
-    ui.stdin.write('n');
-    await waitFor(() => expect(ui.lastFrame()).not.toContain('Delete this draft?'));
+    ui.stdin.write('c');
+    await waitFor(() => expect(ui.lastFrame()).toContain('first take revised'));
+    ui.stdin.write('\u0018');
+    await waitFor(() => expect(ui.lastFrame()).toContain('ctrl+x again to delete this draft'));
+    ui.stdin.write('\u001b');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('ctrl+x again'));
     expect(deleted).toHaveLength(0);
 
-    ui.stdin.write('X');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Delete this draft?'));
-    ui.stdin.write('y');
+    ui.stdin.write('c');
+    await waitFor(() => expect(ui.lastFrame()).toContain('first take revised'));
+    ui.stdin.write('\u0018');
+    await waitFor(() => expect(ui.lastFrame()).toContain('ctrl+x again to delete this draft'));
+    ui.stdin.write('\u0018');
     await waitFor(() => expect(deleted.map((d) => d.id)).toEqual([drafts[0].id]));
     await waitFor(() => expect(ui.lastFrame()).toContain('Draft deleted'));
     ui.unmount();
@@ -539,9 +551,9 @@ describe('ChapterScreen', () => {
           width={150}
           height={40}
           setPos={() => {}}
-          setState={(h, st) =>
+          setState={(hs, st) =>
             setS((p) => {
-              states = { ...p, [h.contentHash]: st };
+              states = { ...p, ...Object.fromEntries(hs.map((h) => [h.contentHash, st])) };
               return states;
             })
           }
@@ -562,6 +574,161 @@ describe('ChapterScreen', () => {
     ui.stdin.write('x');
     const ids = tour.chapters[collapsedIdx].hunkIds;
     await waitFor(() => expect(Object.values(states).filter((v) => v === 'skipped')).toHaveLength(ids.length));
+    ui.unmount();
+  });
+
+  it('opens the dependencies chapter on the lockfile summary, and n reads it and goes to the manifest', async () => {
+    const manifest = hunkFromDiff('package.json', '-    "zod": "^3.22.0",', '+    "zod": "^4.0.0",');
+    const lock = hunkFromDiff('pnpm-lock.yaml', '-  zod@3.22.0:', '+  zod@4.0.0:');
+    const lock2 = hunkFromDiff('pnpm-lock.yaml', '-  zod@3.22.0: {}', '+  zod@4.0.0: {}');
+    const t = makeTour([manifest, lock, lock2], [{ kind: 'dependencies', title: 'Dependencies and runtimes', hunkIds: [manifest.id, lock.id, lock2.id], folded: [lock.id, lock2.id] }], {
+      files: filesFor([manifest, lock, lock2]),
+    });
+    const states: States = {};
+    let writes = 0;
+    const moves: [number, number][] = [];
+    const ui = render(
+      <ChapterScreen
+        tour={t}
+        chapters={t.chapters}
+        states={{}}
+        drafts={[]}
+        ci={0}
+        hi={-1}
+        order="flow"
+        deltaOnly={false}
+        width={150}
+        height={40}
+        setPos={(ci, hi) => moves.push([ci, hi])}
+        setState={(hs, st) => {
+          writes++;
+          for (const h of hs) states[h.id] = st;
+        }}
+        saveDraft={() => {}}
+        deleteDraft={() => {}}
+        moveHunk={() => {}}
+        toggleOrder={() => {}}
+        toggleDelta={() => {}}
+        openSubmit={() => {}}
+        openBriefing={() => {}}
+        openInAgent={() => {}}
+        quit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('summary of 2 lockfile hunks · n for the other 1 hunk'));
+    expect(ui.lastFrame()).toContain('pnpm-lock.yaml');
+    ui.stdin.write('n');
+    await waitFor(() => expect(moves).toEqual([[0, 0]]));
+    // Every folded hunk is marked read in one write.
+    expect(states).toEqual({ [lock.id]: 'read', [lock2.id]: 'read' });
+    expect(writes).toBe(1);
+    ui.unmount();
+  });
+  it('goes to a folded lockfile from the palette on its summary page', async () => {
+    const manifest = hunkFromDiff('package.json', '-    "zod": "^3.22.0",', '+    "zod": "^4.0.0",');
+    const lock = hunkFromDiff('pnpm-lock.yaml', '-  zod@3.22.0:', '+  zod@4.0.0:');
+    const t = makeTour([manifest, lock], [{ kind: 'dependencies', title: 'Dependencies and runtimes', hunkIds: [manifest.id, lock.id], folded: [lock.id] }], { files: filesFor([manifest, lock]) });
+    const moves: [number, number][] = [];
+    const ui = render(
+      <ChapterScreen
+        tour={t}
+        chapters={t.chapters}
+        states={{}}
+        drafts={[]}
+        ci={0}
+        hi={0}
+        order="flow"
+        deltaOnly={false}
+        width={150}
+        height={40}
+        setPos={(ci, hi) => moves.push([ci, hi])}
+        setState={() => {}}
+        saveDraft={() => {}}
+        deleteDraft={() => {}}
+        moveHunk={() => {}}
+        toggleOrder={() => {}}
+        toggleDelta={() => {}}
+        openSubmit={() => {}}
+        openBriefing={() => {}}
+        openInAgent={() => {}}
+        quit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('package.json'));
+    ui.stdin.write(':');
+    await tick();
+    ui.stdin.write('go pnpm-lock');
+    await waitFor(() => expect(ui.lastFrame()).toContain('chapter 1 · summary'));
+    ui.stdin.write('\r');
+    await waitFor(() => expect(moves).toEqual([[0, -1]]));
+    ui.unmount();
+  });
+
+  it('shows a lockfile’s package changes under its manifests, and reading the last of them reads the lockfile', async () => {
+    const web = hunkFromDiff('apps/web/package.json', '-    "react": "^18.3.1",', '+    "react": "^19.0.0",');
+    const api = hunkFromDiff('apps/api/package.json', '-    "zod": "^3.22.0",', '+    "zod": "^4.0.0",');
+    const lock = hunkFromDiff('pnpm-lock.yaml', '-  react@18.3.1:', '+  react@19.0.0:', '-  scheduler@0.23.2:', '+  scheduler@0.25.0:');
+    const lock2 = hunkFromDiff('pnpm-lock.yaml', '-  zod@3.22.0:', '+  zod@4.0.0:');
+    const t = makeTour(
+      [web, api, lock, lock2],
+      [
+        {
+          kind: 'dependencies',
+          title: 'Dependencies and runtimes',
+          hunkIds: [web.id, api.id, lock.id, lock2.id],
+          lockPairs: [{ lockfile: 'pnpm-lock.yaml', hunkIds: [web.id, api.id], lockHunkIds: [lock.id, lock2.id] }],
+        },
+      ],
+      { files: filesFor([web, api, lock, lock2]) },
+    );
+    const marked: Record<string, ReadState> = {};
+    const states: States = {};
+    const moves: [number, number][] = [];
+    const screen = (hi: number) => (
+      <ChapterScreen
+        tour={t}
+        chapters={t.chapters}
+        states={{ ...states }}
+        drafts={[]}
+        ci={0}
+        hi={hi}
+        order="flow"
+        deltaOnly={false}
+        width={150}
+        height={40}
+        setPos={(ci, h) => moves.push([ci, h])}
+        setState={(hs, st) => {
+          for (const h of hs) {
+            marked[h.id] = st;
+            for (const k of hunkKeys(h)) states[k] = st;
+          }
+        }}
+        saveDraft={() => {}}
+        deleteDraft={() => {}}
+        moveHunk={() => {}}
+        toggleOrder={() => {}}
+        toggleDelta={() => {}}
+        openSubmit={() => {}}
+        openBriefing={() => {}}
+        openInAgent={() => {}}
+        quit={() => {}}
+      />
+    );
+    const ui = render(screen(0));
+    // The first page: its direct change, and the indirect ones.
+    await waitFor(() => expect(ui.lastFrame()).toContain('pnpm-lock.yaml · 3 package changes in the lockfile'));
+    expect(ui.lastFrame()).toMatch(/react +18\.3\.1 → 19\.0\.0 +major/);
+    expect(ui.lastFrame()).toContain('scheduler 0.23.2 → 0.25.0');
+    expect(ui.lastFrame()).not.toContain('zod 3.22.0');
+    ui.stdin.write('n');
+    await waitFor(() => expect(moves).toEqual([[0, 1]]));
+    expect(marked).toEqual({ [web.id]: 'read' });
+    ui.rerender(screen(1));
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/zod +3\.22\.0 → 4\.0\.0/));
+    expect(ui.lastFrame()).toContain('1 indirect change, listed on this lockfile’s first page');
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).toContain('hunk 2 read with its 2 lockfile hunks · 4/4 in this chapter'));
+    expect(marked).toEqual({ [web.id]: 'read', [api.id]: 'read', [lock.id]: 'read', [lock2.id]: 'read' });
     ui.unmount();
   });
 });
@@ -607,12 +774,12 @@ describe('ThreadView', () => {
     const ui = render(<ReactionsHarness />);
     ui.stdin.write('\t');
     await tick();
-    ui.stdin.write('a');
+    ui.stdin.write('+');
     await waitFor(() => expect(ui.lastFrame()).toContain('React to @bob'));
     ui.stdin.write('5');
     await waitFor(() => expect(reacted).toBe('node-2:HEART:false'));
     expect(ui.lastFrame()).toContain('❤️1*');
-    ui.stdin.write('a');
+    ui.stdin.write('+');
     await tick();
     ui.stdin.write('5');
     await waitFor(() => expect(reacted).toBe('node-2:HEART:true'));
@@ -713,6 +880,29 @@ describe('BriefingScreen and SubmitScreen', () => {
     expect(ui.lastFrame()).toContain('Please cover the error case.');
     ui.unmount();
   });
+  it('on your own PR, offers t to go back to its feedback', async () => {
+    const tour = fixtureTour();
+    let opened = 0;
+    const ui = render(
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        order="flow"
+        cycleOrder={() => {}}
+        states={{}}
+        width={140}
+        height={45}
+        onStart={() => {}}
+        onSubmit={() => {}}
+        onFeedback={() => opened++}
+        onQuit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('your feedback'));
+    ui.stdin.write('t');
+    await waitFor(() => expect(opened).toBe(1));
+    ui.unmount();
+  });
   it('shows the active chapter order and cycles it with f', async () => {
     const tour = fixtureTour();
     function OrderedBriefing() {
@@ -772,7 +962,7 @@ describe('BriefingScreen and SubmitScreen', () => {
     const ui = render(<ReReviewBriefing />);
     await waitFor(() => expect(ui.lastFrame()).toContain('Changes only:'));
     const frame = ui.lastFrame()!;
-    expect(frame).toContain(`1 of ${changed.hunkIds.length} hunk(s) changed`);
+    expect(frame).toContain(`1 of ${changed.hunkIds.length} changed`);
     expect(frame).toContain(unchanged.title);
     expect(frame).toContain('unchanged');
     // The re-review note sits just above the chapter list, not under the description.
@@ -833,7 +1023,7 @@ describe('BriefingScreen and SubmitScreen', () => {
       <BriefingScreen tour={tour} chapters={tour.chapters} order="flow" cycleOrder={() => {}} states={{}} width={140} height={45} onStart={() => {}} onSubmit={() => {}} onQuit={() => {}} />,
     );
     await tick();
-    ui.stdin.write('?');
+    ui.stdin.write('a');
     await waitFor(() => expect(ui.lastFrame()).toContain('Ask about the whole PR'));
     expect(ui.lastFrame()).toContain('Chapters');
     ui.unmount();
@@ -884,9 +1074,9 @@ describe('BriefingScreen and SubmitScreen', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('Suggested: Request changes'));
     expect(ui.lastFrame()).toContain('This drops the error.');
     ui.stdin.write('P');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Y / n'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('esc cancel'));
     ui.stdin.write('n'); // cancel: nothing posts
-    await waitFor(() => expect(ui.lastFrame()).not.toContain('Y / n'));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('esc cancel'));
     expect(ui.lastFrame()).not.toContain('Posting');
     ui.unmount();
   });
@@ -908,9 +1098,9 @@ describe('BriefingScreen and SubmitScreen', () => {
         onBack={() => {}}
       />,
     );
-    await waitFor(() => expect(ui.lastFrame()).toContain('Submit review'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('submit review'));
     ui.stdin.write('P');
-    await waitFor(() => expect(ui.lastFrame()).toContain('Y / n'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('esc cancel'));
     ui.stdin.write('\r');
     await waitFor(() => expect(posted).toBe('https://example.test/review/1'));
     ui.unmount();
@@ -1023,7 +1213,7 @@ describe('team checklist in the chapter screen', () => {
 
   it('i opens the team checklist and space confirms an item', async () => {
     const { ui, calls } = setup();
-    await waitFor(() => expect(ui.lastFrame()).toContain('Team checklist: 1 item(s) to confirm'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Team checklist: 1 item to confirm'));
     ui.stdin.write('i');
     await waitFor(() => expect(ui.lastFrame()).toContain('Migrations are reversible'));
     expect(ui.lastFrame()).toContain('down() is empty');
@@ -1076,7 +1266,7 @@ describe('lazy @mention users', () => {
     expect(loads).toBe(0);
     ui.stdin.write('c');
     await waitFor(() => expect(loads).toBe(1));
-    await waitFor(() => expect(ui.lastFrame()).toContain('enter: save draft'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('enter save'));
     ui.stdin.write('@zed');
     await waitFor(() => expect(ui.lastFrame()).toContain('zed-collaborator'));
     expect(loads).toBe(1);
@@ -1184,7 +1374,7 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     const guide = ui
       .lastFrame()!
       .split('\n')
-      .map((r) => r.split('│')[1] ?? '')
+      .map((r) => r.split('▎ ')[1] ?? '')
       .join(' ')
       .replace(/\s+/g, ' ');
     expect(guide).toContain('Nearest test file by name: src/x.test.ts');
@@ -1197,14 +1387,14 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     const h = hunkFromDiff('src/a.ts', ' if (x) {', '-go();', '-stop();', '+  go();', '+  halt();', ' }');
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
     const ui = render(screen(t));
-    await waitFor(() => expect(ui.lastFrame()).toContain('~  go();'));
-    expect(ui.lastFrame()).not.toContain('-go();');
-    expect(ui.lastFrame()).toContain('-stop();');
-    expect(ui.lastFrame()).toContain('+  halt();');
+    await waitFor(() => expect(ui.lastFrame()).toContain('~   go();'));
+    expect(ui.lastFrame()).not.toContain('- go();');
+    expect(ui.lastFrame()).toContain('- stop();');
+    expect(ui.lastFrame()).toContain('+   halt();');
     ui.stdin.write('w');
-    await waitFor(() => expect(ui.lastFrame()).toContain('-go();'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('- go();'));
     ui.stdin.write('w');
-    await waitFor(() => expect(ui.lastFrame()).not.toContain('-go();'));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('- go();'));
     ui.unmount();
   });
 
@@ -1212,10 +1402,10 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     const h = hunkFromDiff('src/a.ts', ' x', '-total = price;', '+total = price * qty;', ' y');
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
     const ui = render(screen(t));
-    await waitFor(() => expect(ui.lastFrame()).toContain('+total = price * qty;'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('+ total = price * qty;'));
     expect(ui.lastFrame()).not.toContain('-total = price;');
     // Old and new line numbers both show on the folded line.
-    expect(ui.lastFrame()).toMatch(/2 +2 \+total = price \* qty;/);
+    expect(ui.lastFrame()).toMatch(/2 +2 │ \+ total = price \* qty;/);
     ui.unmount();
   });
 
@@ -1223,13 +1413,15 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     const h = hunkFromDiff('src/a.ts', '-go();', '+stop();');
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
     const ui = render(screen(t, 0, 60));
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/h all keys\s*$/m));
-    expect(ui.lastFrame()).toContain('n/p hunk');
-    expect(ui.lastFrame()).not.toContain('e thread');
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/\? keys\s*$/m));
+    // Too narrow for any hint beside the modes and help: the bar says how many it left out.
+    expect(ui.lastFrame()).toMatch(/\+\d+ more/);
     expect(ui.lastFrame()).toContain('whitespace hidden');
     ui.stdin.write('w');
     await waitFor(() => expect(ui.lastFrame()).not.toContain('whitespace hidden'));
-    expect(ui.lastFrame()).toMatch(/h all keys\s*$/m);
+    expect(ui.lastFrame()).toContain('n/p hunk');
+    expect(ui.lastFrame()).not.toContain('e thread');
+    expect(ui.lastFrame()).toMatch(/\? keys\s*$/m);
     ui.unmount();
   });
 
@@ -1282,10 +1474,11 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('From the author'));
     expect(ui.lastFrame()).toContain('Adds invoices.');
     expect(ui.lastFrame()).not.toContain('template');
-    expect(ui.lastFrame()).toContain('See the doc (example.com).');
-    expect(ui.lastFrame()).toContain('r to read it all');
+    // Three lines on the briefing, and r for the rest.
+    expect(ui.lastFrame()).toMatch(/more lines · r read all/);
     ui.stdin.write('r');
     await waitFor(() => expect(ui.lastFrame()).toContain('from the author'));
+    expect(ui.lastFrame()).toContain('See the doc (example.com).');
     ui.unmount();
   });
 });
@@ -1318,11 +1511,121 @@ describe('split view, test pane toggle and expanded context', () => {
     />
   );
 
+  it('folds the push notice into the header on esc, then goes back to the briefing, and shows narration quietly', async () => {
+    const h = hunkFromDiff('src/a.ts', '-go();', '+stop();');
+    const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
+    let briefing = 0;
+    const ui = render(screen(t, { banner: '▲ The author pushed abcd1234', busy: 'narrating 3/7', openBriefing: () => briefing++ }));
+    await waitFor(() => expect(ui.lastFrame()).toContain('The author pushed abcd1234 · esc hides this'));
+    expect(ui.lastFrame()!.split('\n')[0]).toContain('narrating 3/7');
+    ui.stdin.write('\u001b');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('The author pushed'));
+    expect(ui.lastFrame()!.split('\n')[0]).toContain('↑ new head · R');
+    expect(briefing).toBe(0);
+    ui.stdin.write('\u001b');
+    await waitFor(() => expect(briefing).toBe(1));
+    ui.unmount();
+  });
+
+  it('moves focus with Tab: the chapter list opens a chapter, the explanation scrolls and opens whole', async () => {
+    const h1 = hunkFromDiff('src/a.ts', '-go();', '+stop();');
+    const h2 = hunkFromDiff('src/b.ts', '-x();', '+y();');
+    h1.narration = Array.from({ length: 40 }, (_, i) => `Sentence ${i}.`).join('\n\n');
+    const t = makeTour(
+      [h1, h2],
+      [
+        { hunkIds: [h1.id], title: 'First' },
+        { hunkIds: [h2.id], title: 'Second' },
+      ],
+      { files: filesFor([h1, h2]) },
+    );
+    const at: [number, number][] = [];
+    const ui = render(screen(t, { width: 150, height: 30, setPos: (ci, hi) => at.push([ci, hi]) }));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Sentence 0.'));
+    // From the code, Shift+Tab goes back to the explanation.
+    ui.stdin.write('\u001b[Z');
+    await waitFor(() => expect(ui.lastFrame()).toContain('j/k scroll'));
+    ui.stdin.write('j');
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/1 above/));
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('First · src/a.ts'));
+    expect(ui.lastFrame()).toContain('esc back');
+    ui.stdin.write('\u001b');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('First · src/a.ts'));
+    // Back once more is the chapter list: j and Enter open the second chapter.
+    ui.stdin.write('\u001b[Z');
+    await waitFor(() => expect(ui.lastFrame()).toContain('open chapter'));
+    ui.stdin.write('j');
+    await tick();
+    ui.stdin.write('\r');
+    await waitFor(() => expect(at).toContainEqual([1, 0]));
+    ui.unmount();
+  });
+
+  it('gives focus back to the code when the focused chapter list leaves the screen', async () => {
+    const h1 = hunkFromDiff('src/a.ts', '-go();', '+stop();');
+    const h2 = hunkFromDiff('src/b.ts', '-x();', '+y();');
+    const t = makeTour(
+      [h1, h2],
+      [
+        { hunkIds: [h1.id], title: 'First' },
+        { hunkIds: [h2.id], title: 'Second' },
+      ],
+      { files: filesFor([h1, h2]) },
+    );
+    const at: [number, number][] = [];
+    const props = { width: 150, height: 30, setPos: (ci: number, hi: number) => void at.push([ci, hi]) };
+    const ui = render(screen(t, props));
+    await waitFor(() => expect(ui.lastFrame()).toContain('First'));
+    // Shift+Tab back past the explanation, when there is one, to the chapter list.
+    for (let i = 0; i < 3 && !ui.lastFrame()!.includes('open chapter'); i++) {
+      ui.stdin.write('\u001b[Z');
+      await tick(40);
+    }
+    expect(ui.lastFrame()).toContain('open chapter');
+    ui.stdin.write('j');
+    await tick();
+    // The terminal narrows below the list's width: the list is gone, and so is its focus.
+    ui.rerender(screen(t, { ...props, width: 100 }));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('open chapter'));
+    ui.stdin.write('\r');
+    await tick();
+    expect(at).not.toContainEqual([1, 0]);
+    ui.unmount();
+  });
+
+  it('keeps the thread tip for a hunk with a thread on it, not a lineless thread elsewhere in the file', async () => {
+    const h = hunkFromDiff('src/a.ts', '-go();', '+stop();');
+    const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
+    t.existingThreads = [{ id: 'old', path: 'src/a.ts', isResolved: false, isOutdated: true, comments: [] }];
+    const seen = new Set<string>(['first-chapter']);
+    const takeTip = (tip: string) => (seen.has(tip) ? false : (seen.add(tip), true));
+    const ui = render(screen(t, { takeTip }));
+    await waitFor(() => expect(ui.lastFrame()).toContain('src/a.ts'));
+    await tick(40);
+    expect(ui.lastFrame()).not.toContain('Tip:');
+    expect(seen.has('first-thread')).toBe(false);
+    ui.unmount();
+  });
+
+  it('shows each first-run tip once, until a key is pressed', async () => {
+    const h = hunkFromDiff('src/a.ts', '-go();', '+stop();');
+    const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
+    const seen = new Set<string>();
+    const takeTip = (tip: string) => (seen.has(tip) ? false : (seen.add(tip), true));
+    const ui = render(screen(t, { takeTip }));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Tip: n marks this hunk read and moves on'));
+    ui.stdin.write('j');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('Tip:'));
+    expect([...seen]).toEqual(['first-chapter']);
+    ui.unmount();
+  });
+
   it('S shows the old line beside its replacement, and back', async () => {
     const h = hunkFromDiff('src/a.ts', ' keep();', '-const total = price;', '+const total = price * quantity - discount;', ' done();');
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
     const ui = render(screen(t));
-    await waitFor(() => expect(ui.lastFrame()).toContain('+const total = price * quantity'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('+ const total = price * quantity'));
     expect(
       ui
         .lastFrame()!
@@ -1335,7 +1638,7 @@ describe('split view, test pane toggle and expanded context', () => {
         ui
           .lastFrame()!
           .split('\n')
-          .some((r) => r.includes('-const total = price;') && r.includes('+const total = price * quantity')),
+          .some((r) => r.includes('- const total = price;') && r.includes('+ const total = price * quantity')),
       ).toBe(true),
     );
     expect(ui.lastFrame()).toContain('split');
@@ -1389,7 +1692,7 @@ describe('split view, test pane toggle and expanded context', () => {
         .lastFrame()!
         .split('\n')
         .find((r) => r.includes('▶')),
-    ).toContain('-old();');
+    ).toContain('- old();');
     for (let i = 0; i < 9; i++) ui.stdin.write('k');
     await tick();
     ui.stdin.write('c');
@@ -1424,7 +1727,7 @@ describe('split view, test pane toggle and expanded context', () => {
     h.lines[4].expanded = true;
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
     const ui = render(screen(t));
-    await waitFor(() => expect(ui.lastFrame()).toContain('+B();'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('+ B();'));
     ui.stdin.write('v');
     await tick();
     for (let i = 0; i < 5; i++) ui.stdin.write('j');
@@ -1453,7 +1756,7 @@ describe('split view, test pane toggle and expanded context', () => {
     const h = hunkFromDiff('src/big.txt', ' x();', '+y();', ' x();');
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
     const ui = render(screen(t, { services: { root, confirms: {}, setConfirm: () => {} } }));
-    await waitFor(() => expect(ui.lastFrame()).toContain('+y();'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('+ y();'));
     ui.stdin.write('+');
     await waitFor(() => expect(ui.lastFrame()).toContain('over 1 MB'));
     ui.unmount();
@@ -1465,7 +1768,7 @@ describe('split view, test pane toggle and expanded context', () => {
     const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h], {}, { 'src/new.ts': 'added' }) });
     // No checkout needed: a new file has no context whether or not one is ready.
     const ui = render(screen(t));
-    await waitFor(() => expect(ui.lastFrame()).toContain('+b();'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('+ b();'));
     ui.stdin.write('+');
     await waitFor(() => expect(ui.lastFrame()).toContain('this file is new'));
     ui.unmount();
@@ -1514,3 +1817,26 @@ describe('split view, test pane toggle and expanded context', () => {
 function movedTo(file: string, line: number): MovedTo {
   return { file, line, kind: 'moved', indent: 0, also: [] };
 }
+
+describe('stripFileRefs', () => {
+  it('drops the file references the briefing model cites, and keeps other parentheses', () => {
+    expect(stripFileRefs('Adds discount codes (src/server.ts:31-42; src/orders.ts:16-50; scripts/sales_report.py:14-28). It also ships 0.4.0 (README.md:18-29).')).toBe(
+      'Adds discount codes. It also ships 0.4.0.',
+    );
+    expect(stripFileRefs('Retries (up to three times) on failure.')).toBe('Retries (up to three times) on failure.');
+    // A dotted word in parentheses is prose unless it has a slash or a line number.
+    expect(stripFileRefs('Upgrade the runtime (Node.js) and pin the SDK (v2.3).')).toBe('Upgrade the runtime (Node.js) and pin the SDK (v2.3).');
+    expect(stripFileRefs('Renames helpers (e.g. foo.bar) in (lib/util.ts).')).toBe('Renames helpers (e.g. foo.bar) in.');
+  });
+});
+
+describe('leadThenDim', () => {
+  it('keeps the first sentence in the normal weight and dims the rest', () => {
+    expect(leadThenDim([[{ text: 'Adds a discount. Then taxes it.' }], [{ text: 'More.' }]])).toEqual([
+      [{ text: 'Adds a discount.' }, { text: ' Then taxes it.', dim: true }],
+      [{ text: 'More.', dim: true }],
+    ]);
+    // A period inside code is not the end of a sentence.
+    expect(leadThenDim([[{ text: 'Calls ' }, { text: 'a.b()', color: 'cyan' }, { text: ' twice. Once more.' }]])[0].at(-1)).toEqual({ text: ' Once more.', dim: true });
+  });
+});

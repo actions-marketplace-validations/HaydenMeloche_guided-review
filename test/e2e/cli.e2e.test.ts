@@ -15,8 +15,9 @@ describe('gr commands that print and exit', () => {
     const result = await runGr(box, ['--help']);
     expect(result.code).toBe(0);
     const { version } = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '../../package.json'), 'utf8')) as { version: string };
-    expect(result.stdout).toContain(`Guided Review ${version}: Review GitHub pull requests as a guided tour`);
+    expect(result.stdout).toContain(`Guided Review ${version}: Read a code change the way the code runs`);
     expect(result.stdout).toContain('$ gr review <number|URL>');
+    expect(result.stdout).toContain('$ gr feedback [number|URL]');
     expect(result.stdout).toContain('--no-agent');
   });
 
@@ -27,7 +28,7 @@ describe('gr commands that print and exit', () => {
   });
 
   it('refuses to start the tour without a terminal, before calling gh', async () => {
-    for (const args of [['preview', '--no-agent'], ['review', '12', '--no-agent'], ['review']]) {
+    for (const args of [['preview', '--no-agent'], ['review', '12', '--no-agent'], ['review'], ['feedback', '12', '--no-agent'], ['feedback']]) {
       const result = await runGr(box, args, fixtureRepo(box));
       expect(result.code).toBe(1);
       expect(result.stderr).toContain('interactive terminal app');
@@ -104,9 +105,17 @@ describe('gr commands that print and exit', () => {
 });
 
 describe('gr with a terminal', () => {
-  it('opens setup on the first run, and q leaves without saving', async () => {
+  it('says gh is signed out before first-run setup, for a command that needs GitHub', async () => {
     const session = startGr(box, ['review', '12'], { cwd: box.root });
-    await session.waitFor('turns a pull request into a guided tour');
+    await session.waitFor('gh is not signed in');
+    expect(session.screen()).toContain('gh auth login');
+    expect(await session.exited).toBe(1);
+    expect(fs.existsSync(path.join(box.env.GR_HOME!, 'config.json'))).toBe(false);
+  });
+
+  it('opens setup on the first run, and q leaves without saving', async () => {
+    const session = startGr(box, ['preview'], { cwd: fixtureRepo(box) });
+    await session.waitFor('turns a pull request into a tour');
     session.press('q');
     await session.waitFor('no config saved');
     expect(session.screen()).toContain('--no-agent');
@@ -115,14 +124,18 @@ describe('gr with a terminal', () => {
   });
 
   it('saves the first-run setup and carries on with the command', async () => {
-    const session = startGr(box, ['review', '12'], { cwd: box.root });
-    await session.waitFor('turns a pull request into a guided tour');
+    const session = startGr(box, ['preview'], { cwd: fixtureRepo(box) });
+    await session.waitFor('turns a pull request into a tour');
     session.press(KEY.enter);
     await session.waitFor('Color theme');
     session.press(KEY.enter);
     await session.waitFor('Model provider');
-    session.press('G'); // No AI model, last in the list
-    await session.waitFor('Static analysis only');
+    await session.waitFor('Nothing found on this machine');
+    // No AI model, after the three recommended providers.
+    for (const about of ['OpenAI models', "Cursor's models", 'Static analysis only']) {
+      session.press('j');
+      await session.waitFor(about);
+    }
     session.press(KEY.enter);
     await session.waitFor('Coding agent');
     session.press(KEY.enter);
@@ -133,9 +146,10 @@ describe('gr with a terminal', () => {
     await session.waitFor('Ready to save');
     expect(session.screen()).toContain('Provider: none');
     session.press(KEY.enter);
-    // Saved, then review 12 runs and stops at the fake gh.
-    await session.waitFor(/Saved .*config\.json/);
-    expect(await session.exited).toBe(1);
+    // Saved, then the preview opens.
+    await session.waitFor('Chapters · Guided order');
+    session.press('q');
+    expect(await session.exited).toBe(0);
     expect(JSON.parse(fs.readFileSync(path.join(box.env.GR_HOME!, 'config.json'), 'utf8'))).toMatchObject({ provider: 'none', chapterOrder: 'guide' });
   });
 
@@ -157,9 +171,28 @@ describe('gr with a terminal', () => {
     expect(await session.exited).toBe(0);
   });
 
+  it('draws the setup theme preview with the marks set in the config', async () => {
+    fs.mkdirSync(box.env.GR_HOME!, { recursive: true });
+    fs.writeFileSync(path.join(box.env.GR_HOME!, 'config.json'), JSON.stringify({ provider: 'none', glyphs: 'ascii' }));
+    const session = startGr(box, ['config'], { cwd: box.root });
+    await session.waitFor('Provider: none');
+    session.press(KEY.enter);
+    await session.waitFor('large pr: 1,240 changed lines');
+    expect(session.screen()).toContain('! large pr');
+    expect(session.screen()).not.toContain('▲');
+    session.press('q');
+  });
+
   it('explains a missing PR when the branch has none', async () => {
     const session = startGr(box, ['review', '--no-agent'], { cwd: fixtureRepo(box) });
     await session.waitFor('no PR given');
+    expect(await session.exited).toBe(1);
+  });
+
+  it('explains a missing PR for feedback when the branch has none', async () => {
+    const session = startGr(box, ['feedback', '--no-agent'], { cwd: fixtureRepo(box) });
+    await session.waitFor('no PR given');
+    await session.waitFor('feedback <number|URL>');
     expect(await session.exited).toBe(1);
   });
 

@@ -67,9 +67,9 @@ function describeRouting(config: AgentRouting): string[] {
   const qa = configForRole(config, 'qa');
   const lines = [`Provider: ${config.provider}${config.baseUrl ? ` (${config.baseUrl})` : ''}`];
   const show = (c: AgentConfig) => formatModel(c.model, c.modelParams);
-  if (show(briefing) === show(narration)) lines.push(`Summaries and narration: ${show(briefing)}`);
-  else lines.push(`Summaries: ${show(briefing)}`, `Narration: ${show(narration)}`);
-  lines.push(`Q&A: ${show(qa)}${qa.provider !== config.provider ? ` (${qa.provider})` : ''}`);
+  if (show(briefing) === show(narration)) lines.push(`Briefing and narration: ${show(briefing)}`);
+  else lines.push(`Briefing: ${show(briefing)}`, `Narration: ${show(narration)}`);
+  lines.push(`Q&A: ${show(qa)}${qa.fastMode ? ', fast mode' : ''}${qa.provider !== config.provider ? ` (${qa.provider})` : ''}`);
   lines.push(`API key: ${describeKey(config)}`);
   if (config.toolCalling === false) lines.push('Tool calling: off');
   return lines;
@@ -130,6 +130,7 @@ export interface ModelAnswers {
   strong: string; // Q&A
   fastParams?: Record<string, string>; // a Cursor model's variant
   strongParams?: Record<string, string>;
+  qaFastMode: boolean; // fast mode or priority processing for Q&A, where setup offers it
   baseUrl: string;
   toolCalling: boolean;
   keySource: KeySource;
@@ -139,6 +140,10 @@ export interface ModelAnswers {
 
 // Providers that take an API key from gr rather than a login or cloud credentials.
 export const takesKey = (p: ProviderChoice): boolean => p === 'anthropic' || p === 'openai' || p === 'cursor' || p === 'openai-compatible';
+
+// Providers whose setup asks whether Q&A runs in fast mode (Anthropic) or with priority processing
+// (OpenAI, Codex): faster answers at a higher price, so the answer starts at no.
+export const offersFastMode = (p: ProviderChoice): boolean => p === 'anthropic' || p === 'openai' || p === 'codex';
 
 // The answers to start from: the saved settings when the provider is unchanged, then what
 // detection found (a local server's models), then the presets.
@@ -162,6 +167,7 @@ export function modelDefaults(provider: ProviderChoice, previous: AgentRouting |
     strong,
     ...(fastParams ? { fastParams } : {}),
     ...(strongParams ? { strongParams } : {}),
+    qaFastMode: savedStrong?.fastMode === true,
     baseUrl: same?.baseUrl ?? finding?.baseUrl ?? '',
     toolCalling: same?.toolCalling !== false,
     keySource,
@@ -267,7 +273,7 @@ export function previousRouting(current: UserConfig | undefined): AgentRouting |
 }
 
 // Role settings setup writes or carries over; any other set by hand is replaced on save.
-const KEPT_ROLE_KEYS = new Set(['model', 'modelParams', 'maxOutputTokens']);
+const KEPT_ROLE_KEYS = new Set(['model', 'modelParams', 'maxOutputTokens', 'effort', 'fastMode']);
 
 // Whether saving a provider drops per-task overrides set by hand (another provider, endpoint,
 // key, or tool calling for one task).
@@ -293,13 +299,25 @@ export function buildConfig(current: UserConfig | undefined, model: ModelAnswers
     if (takesKey(model.provider) && model.keySource === 'env') connection.apiKeyEnv = model.apiKeyEnv.replace(/^\$/, '');
     if (takesKey(model.provider) && model.keySource === 'store') connection.apiKey = model.apiKey;
     config = presetUserConfig(model.provider, { fast: model.fast.trim(), strong: model.strong.trim(), fastParams: model.fastParams, strongParams: model.strongParams }, connection);
-    // Output caps set by hand stay while the provider does; setup doesn't ask for them.
+    // Output caps, effort, and fast mode set by hand stay while the provider does; setup doesn't
+    // ask for them.
     if (previous?.provider === model.provider) {
       if (previous.maxOutputTokens) config.maxOutputTokens = previous.maxOutputTokens;
+      if (previous.effort) config.effort = previous.effort;
+      if (previous.fastMode !== undefined) config.fastMode = previous.fastMode;
       for (const [role, settings] of Object.entries(config.roles ?? {})) {
-        const cap = previous.roles?.[role as keyof typeof previous.roles]?.maxOutputTokens;
-        if (cap) settings.maxOutputTokens = cap;
+        const kept = previous.roles?.[role as keyof typeof previous.roles];
+        if (kept?.maxOutputTokens) settings.maxOutputTokens = kept.maxOutputTokens;
+        if (kept?.effort) settings.effort = kept.effort;
+        if (kept?.fastMode !== undefined) settings.fastMode = kept.fastMode;
       }
+    }
+    // Setup's own answer for Q&A wins over a carried-over one, including a top-level fastMode.
+    const qa = config.roles?.qa;
+    if (qa && offersFastMode(model.provider)) {
+      if (model.qaFastMode) qa.fastMode = true;
+      else if (config.fastMode) qa.fastMode = false;
+      else delete qa.fastMode;
     }
   }
   config.chapterOrder = current?.chapterOrder ?? DEFAULT_CHAPTER_ORDER;

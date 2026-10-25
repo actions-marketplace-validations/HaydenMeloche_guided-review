@@ -1,11 +1,12 @@
 import React, { useMemo, useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text, useTheme } from './themed.js';
 import { diagramColors, ROLES } from './theme.js';
 import type { Graph } from '../types.js';
 import { renderGraph, type TextDiagram } from '../diagram/text.js';
 import { openGraphInBrowser } from '../diagram/svg.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
+import { Hints } from './KeyBar.js';
 
 interface Span {
   start: number;
@@ -16,12 +17,13 @@ interface Span {
 type DiagramBox = TextDiagram['boxes'][number];
 type Role = 'border' | 'label' | 'line' | 'changedBorder' | 'changedLabel' | 'selected';
 
-// How each kind of character is drawn. A changed box is bold, its frame in the theme's heading
-// color and its text in the title color; unchanged boxes and arrows recede into the comment
-// color. With the terminal's colors a changed box is bold yellow and the rest plain text.
+// How each kind of character is drawn. Every box has rounded corners; a changed box is bold, its
+// frame in the theme's heading color and its text in the title color, and unchanged boxes, their
+// names, arrows and edge labels recede into the comment color. With the terminal's colors a
+// changed box is bold yellow and the rest plain.
 const ROLE_STYLE: Record<Role, { color?: string; bold?: boolean; inverse?: boolean }> = {
   border: { color: ROLES.line },
-  label: {},
+  label: { color: ROLES.line },
   line: { color: ROLES.line },
   changedBorder: { color: ROLES.changedBox, bold: true },
   changedLabel: { color: ROLES.changedText, bold: true },
@@ -132,7 +134,19 @@ export function DiagramView(props: {
         return renderRow(line, row, rendered.boxes, spans, i);
       })}
       {interactive ? (
-        <Text dimColor>{safe(msg) || `tab: next node${selected ? ` (${safe(selected.label)})` : ''} · enter: jump to its code · c: comment on node · b: open SVG in browser · esc: close`}</Text>
+        msg ? (
+          <Text dimColor>{safe(msg)}</Text>
+        ) : (
+          <Hints
+            keys={[
+              ['tab', `next node${selected ? ` (${safe(selected.label)})` : ''}`],
+              ['enter', 'jump to its code'],
+              ['c', 'comment on node'],
+              ['b', 'open SVG in browser'],
+              ['esc', 'close'],
+            ]}
+          />
+        )
       ) : null}
     </Box>
   );

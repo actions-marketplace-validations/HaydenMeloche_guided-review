@@ -8,6 +8,8 @@ import { line, MdLineView, renderMarkdown, type MdLine } from './markdown.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
 import { loadThemeSetting } from '../config.js';
 import { commandLine, fetchReleaseNotes, installCommand, RELEASES_URL, runInstall, type Install, type ReleaseNotes, type UpdateOffer, type UpdateResult } from '../updateCheck.js';
+import { plural } from './plural.js';
+import { SCREEN_RENDER } from './renderOptions.js';
 
 // The update offered before a tour, full screen in the user's theme: what's new since the
 // installed version, then the install with its output as it runs. A failed install can be
@@ -224,7 +226,7 @@ export function UpdateScreen(props: UpdateScreenProps) {
           <Text> </Text>
           <Text wrap="truncate">
             <Text bold> {boxTitle}</Text>
-            <Text dimColor>{phase.kind === 'offer' && below > 0 ? ` · ${below} more line${below === 1 ? '' : 's'}` : ''}</Text>
+            <Text dimColor>{phase.kind === 'offer' && below > 0 ? ` · ${plural(below, 'more line')}` : ''}</Text>
           </Text>
           <Box flexDirection="column" width={width} height={boxHeight} borderStyle="round" borderColor="gray" paddingX={1}>
             {phase.kind === 'offer' && notes === 'loading' ? (
@@ -265,7 +267,7 @@ export async function runUpdateScreen(offer: UpdateOffer): Promise<UpdateResult>
         app.unmount();
       }}
     />,
-    { alternateScreen: true, exitOnCtrlC: false },
+    { ...SCREEN_RENDER, exitOnCtrlC: false },
   );
   await app.waitUntilExit();
   ac.abort();

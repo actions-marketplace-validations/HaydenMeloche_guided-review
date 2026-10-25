@@ -338,13 +338,19 @@ describe('mention completion', () => {
     ui.unmount();
   });
 
-  it('Tab still reaches onTab when no mention matches', async () => {
+  it('Tab inside an @ token that matched nothing does nothing, and reaches onTab once past it', async () => {
     const onTab = vi.fn();
     const ui = render(<TextInput value="hi @zed" onChange={() => {}} width={40} mentions={['alice']} onTab={onTab} />);
     await waitFor(() => true);
     ui.stdin.write('\t');
-    await waitFor(() => expect(onTab).toHaveBeenCalledWith(false));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onTab).not.toHaveBeenCalled();
     ui.unmount();
+    const past = render(<TextInput value="hi @zed " onChange={() => {}} width={40} mentions={['alice']} onTab={onTab} />);
+    await waitFor(() => true);
+    past.stdin.write('\t');
+    await waitFor(() => expect(onTab).toHaveBeenCalledWith(false));
+    past.unmount();
   });
 
   it('@@ never opens the mention list', async () => {
@@ -596,7 +602,7 @@ describe('CommentEditor with a completion list', () => {
     createdAt: '2026-01-01T00:00:00Z',
   };
 
-  it('Esc closes the list first and cancels the draft only on the second press', async () => {
+  it('Esc closes the list first, then asks, and discards the typed draft only on the third press', async () => {
     const onCancel = vi.fn();
     const onSave = vi.fn();
     const ui = render(<CommentEditor draft={draft} target="chapter" width={60} mentions={['alice']} onSave={onSave} onCancel={onCancel} />);
@@ -607,6 +613,9 @@ describe('CommentEditor with a completion list', () => {
     await waitFor(() => expect(ui.lastFrame()).not.toContain('▸ @alice'));
     expect(onCancel).not.toHaveBeenCalled();
     expect(ui.lastFrame()).toContain('ask @al');
+    ui.stdin.write(ESC);
+    await waitFor(() => expect(ui.lastFrame()).toContain('esc again to discard · enter to save'));
+    expect(onCancel).not.toHaveBeenCalled();
     ui.stdin.write(ESC);
     await waitFor(() => expect(onCancel).toHaveBeenCalledOnce());
     ui.unmount();

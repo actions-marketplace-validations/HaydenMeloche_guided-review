@@ -1,0 +1,24 @@
+ ‹dim›local/rich ‹/›‹b›#0 …‹/›‹dim›  chapter 1/3 · hunk 1/3 · ▱▱▱▱▱▱▱▱▱▱▱▱‹/›‹b› 0%‹/›‹dim› · 0/5 hunks · Guided‹/›
+‹cyan,b›1/3 ‹/›‹b›createOrder‹/›‹dim› · hunk 1/3 · next: Dependencies and runtimes (1) · ‹/›‹cyan,b›]‹/›
+‹blue,b›createOrder‹/›‹dim› · hunk 1/3 · ‹/›‹bright-black›· ‹/›src/orders.ts:1‹dim› · entry exported API (createOrder)‹/›
+‹bright-black›▎ ‹/›‹dim›Plain mode: no narration.‹/›
+‹bright-black›▎ ‹/›
+‹bright-black›▎ ‹/›‹red›○ No linked test · 2 possible untested behaviors · U: details‹/›
+
+ ‹dim› ‹/›‹yellow,bg:c235›╭──────────────────────────────────────────────────────────────────────────╮‹/›
+ ‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235› ‹/›‹bg:c235,b›Author preview‹/›‹bg:c235›                                                           ‹/›‹yellow,bg:c235›│‹/›
+ ‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235› This tour is a preview of your branch: there is no PR to post to yet.    ‹/›‹yellow,bg:c235›│‹/›‹c152,bg:c28›tr‹/›
+ ‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235› Flagged gaps and drafts stay local.                                      ‹/›‹yellow,bg:c235›│‹/›
+ ‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235› ‹/›‹bg:c235,dim›any key to go back‹/›‹bg:c235›                                                       ‹/›‹yellow,bg:c235›│‹/›
+ ‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235›                                                                          ‹/›‹yellow,bg:c235›│‹/›‹c222›op‹/›
+ ‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235›                                                                          ‹/›‹yellow,bg:c235›│‹/›
+‹cyan›▶‹/›‹dim› ‹/›‹yellow,bg:c235›│‹/›‹bg:c235›                                                                          ‹/›‹yellow,bg:c235›│‹/›
+  ‹yellow,bg:c235›╰──────────────────────────────────────────────────────────────────────────╯‹/›
+
+
+
+
+
+✎ ‹blue,bg:c235› question ‹/› Before tax?
+ ‹cyan,b›n/p‹/› hunk   ‹dim›+6 more‹/›          ‹yellow›whitespace hidden   ‹/›‹cyan,b›tab‹/› pane   ‹cyan,b›esc‹/› back   ‹cyan,b›?‹/› keys
+

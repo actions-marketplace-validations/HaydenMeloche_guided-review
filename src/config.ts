@@ -3,7 +3,7 @@ import path from 'node:path';
 import { grHome } from './paths.js';
 import { TERMINAL_THEME } from './tui/theme.js';
 import type { ChapterOrder, FileKind, KindRule, RepoConfig } from './types.js';
-import { AGENT_ROLES, PROVIDERS, type AgentConfig, type AgentRouting, type Provider } from './agent/types.js';
+import { AGENT_ROLES, EFFORTS, PROVIDERS, type AgentConfig, type AgentRouting, type Effort, type Provider } from './agent/types.js';
 import { CODING_AGENT_VALUES, CUSTOM_AGENT, customCommandProblem, DEFAULT_CODING_AGENT, isCodingAgent, type CodingAgent, type CodingAgentSetting } from './codingAgent.js';
 
 export const KINDS: FileKind[] = ['logic', 'test', 'config', 'mechanical', 'generated', 'vendored'];
@@ -115,7 +115,12 @@ export type UserConfig = Omit<AgentRouting, 'provider'> & {
   chapterOrder?: ChapterOrderSetting;
   hideWhitespace?: boolean;
   splitDiff?: boolean;
+  sidebar?: boolean;
+  shortExplanation?: boolean;
   theme?: string;
+  glyphs?: GlyphSetting;
+  icons?: IconSetting;
+  tipsSeen?: string[];
   codingAgent?: CodingAgent;
   codingAgentCommand?: string; // with "codingAgent": "custom"
   github?: GitHubConfig;
@@ -149,18 +154,26 @@ export const PRESET_MODELS: Partial<Record<Provider, ModelPair>> = {
   openai: { fast: 'gpt-6-luna', strong: 'gpt-6.1-sol' },
 };
 
+// Providers whose preset runs the briefing and narration at low effort: fewer thinking tokens
+// and tool calls on tasks that summarize. Q&A keeps the model's default.
+const LOW_EFFORT_PRESETS = new Set<Provider>(['anthropic', 'claude-code', 'bedrock', 'vertex', 'openai', 'codex']);
+
 export function presetUserConfig(provider: Provider, models: ModelPair, connection: Omit<AgentConfig, 'provider' | 'model' | 'modelParams'> = {}): UserConfig & AgentRouting {
   // When either task has a variant, both name theirs ({} for the default), so one can't inherit
   // the other's through the top level.
   const variants = !!(models.fastParams || models.strongParams);
-  const fast = { model: models.fast, ...(variants ? { modelParams: models.fastParams ?? {} } : {}) };
+  const fast: AgentConfig = {
+    model: models.fast,
+    ...(variants ? { modelParams: models.fastParams ?? {} } : {}),
+    ...(LOW_EFFORT_PRESETS.has(provider) ? { effort: 'low' as const } : {}),
+  };
   const strong = { model: models.strong, ...(variants ? { modelParams: models.strongParams ?? {} } : {}) };
   return {
     provider,
     ...strong,
     chapterOrder: DEFAULT_CHAPTER_ORDER,
     ...connection,
-    roles: { briefing: fast, narration: fast, qa: strong },
+    roles: { briefing: { ...fast }, narration: { ...fast }, qa: strong },
   };
 }
 
@@ -181,6 +194,14 @@ function parseAgentConfig(raw: Record<string, unknown>, where: string): AgentCon
   if (typeof raw.apiKeyEnv === 'string' && raw.apiKeyEnv) out.apiKeyEnv = raw.apiKeyEnv.replace(/^\$/, '');
   if (typeof raw.toolCalling === 'boolean') out.toolCalling = raw.toolCalling;
   if (Number.isInteger(raw.maxOutputTokens) && (raw.maxOutputTokens as number) > 0) out.maxOutputTokens = raw.maxOutputTokens as number;
+  if (raw.effort !== undefined) {
+    if (!EFFORTS.includes(raw.effort as Effort)) throw new UserConfigError(`${where}: unknown effort ${JSON.stringify(raw.effort)} (expected ${EFFORTS.join(', ')})`);
+    out.effort = raw.effort as Effort;
+  }
+  if (raw.fastMode !== undefined) {
+    if (typeof raw.fastMode !== 'boolean') throw new UserConfigError(`${where}: "fastMode" must be true or false`);
+    out.fastMode = raw.fastMode;
+  }
   if (raw.modelParams !== undefined) {
     const params = raw.modelParams;
     if (!params || typeof params !== 'object' || Array.isArray(params) || Object.values(params).some((v) => typeof v !== 'string')) {
@@ -225,8 +246,11 @@ export function loadChapterOrder(raw = readUserConfigFile()): ChapterOrder {
 }
 
 // Diff view settings a key toggles during a tour and saves for the next one.
-export type ViewSetting = 'hideWhitespace' | 'splitDiff';
-const VIEW_DEFAULTS: Record<ViewSetting, boolean> = { hideWhitespace: true, splitDiff: false };
+// sidebar: the chapter list beside a chapter on a wide terminal. shortExplanation: the explanation
+// above the code cut to its first lines.
+export type ViewSetting = 'hideWhitespace' | 'splitDiff' | 'sidebar' | 'shortExplanation';
+export const VIEW_SETTINGS: ViewSetting[] = ['hideWhitespace', 'splitDiff', 'sidebar', 'shortExplanation'];
+const VIEW_DEFAULTS: Record<ViewSetting, boolean> = { hideWhitespace: true, splitDiff: false, sidebar: true, shortExplanation: false };
 
 function parseViewSetting(raw: Record<string, unknown>, key: ViewSetting, where: string): boolean | undefined {
   if (raw[key] === undefined) return undefined;
@@ -246,6 +270,53 @@ export function saveViewSetting(key: ViewSetting, value: boolean): void {
   const raw = readUserConfigFile();
   if (!raw || raw[key] === value) return;
   fs.writeFileSync(file, JSON.stringify({ ...raw, [key]: value }, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+// A setting that takes one of a few names.
+function parseChoice<T extends string>(raw: Record<string, unknown>, key: string, choices: readonly T[], where: string): T | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !(choices as readonly string[]).includes(value)) throw new UserConfigError(`${where}: unknown ${key} ${JSON.stringify(value)} (expected ${choices.join(' or ')})`);
+  return value as T;
+}
+
+export const ICON_SETTINGS = ['none', 'nerd'] as const;
+export type IconSetting = (typeof ICON_SETTINGS)[number];
+
+// Nerd Font file icons before paths: off unless asked for, since the font can't be detected.
+export function loadIconSetting(raw = readUserConfigFile()): IconSetting {
+  return (raw && parseChoice(raw, 'icons', ICON_SETTINGS, userConfigPath())) ?? 'none';
+}
+
+export const GLYPH_SETTINGS = ['unicode', 'ascii'] as const;
+export type GlyphSetting = (typeof GLYPH_SETTINGS)[number];
+
+// The marks the screens draw, readable without a model provider: unicode when unset, ascii for
+// terminals and fonts without the shapes.
+export function loadGlyphSetting(raw = readUserConfigFile()): GlyphSetting {
+  return (raw && parseChoice(raw, 'glyphs', GLYPH_SETTINGS, userConfigPath())) ?? 'unicode';
+}
+
+function parseTipsSeen(raw: Record<string, unknown>, where: string): string[] | undefined {
+  if (raw.tipsSeen === undefined) return undefined;
+  if (!Array.isArray(raw.tipsSeen) || raw.tipsSeen.some((t) => typeof t !== 'string')) throw new UserConfigError(`${where}: "tipsSeen" must be a list of tip names`);
+  return raw.tipsSeen as string[];
+}
+
+// The first-run tips already shown, readable without a model provider.
+export function loadTipsSeen(raw = readUserConfigFile()): string[] {
+  return (raw && parseTipsSeen(raw, userConfigPath())) ?? [];
+}
+
+// Records a tip as shown, so it shows once; like saveViewSetting, it needs an existing config file.
+export function saveTipSeen(tip: string): void {
+  const file = userConfigPath();
+  const raw = readUserConfigFile();
+  if (!raw) return;
+  const seen = parseTipsSeen(raw, file) ?? [];
+  if (seen.includes(tip)) return;
+  fs.writeFileSync(file, JSON.stringify({ ...raw, tipsSeen: [...seen, tip] }, null, 2) + '\n', { mode: 0o600 });
   fs.chmodSync(file, 0o600);
 }
 
@@ -317,8 +388,8 @@ export function loadGitHubConfig(): GitHubConfig | undefined {
 }
 
 function routingOf(config: UserConfig, provider: Provider | undefined): AgentRouting {
-  const { model, modelParams, baseUrl, apiKey, apiKeyEnv, toolCalling, maxOutputTokens, roles } = config;
-  const routing: AgentRouting = { provider, model, modelParams, baseUrl, apiKey, apiKeyEnv, toolCalling, maxOutputTokens, roles };
+  const { model, modelParams, baseUrl, apiKey, apiKeyEnv, toolCalling, maxOutputTokens, effort, fastMode, roles } = config;
+  const routing: AgentRouting = { provider, model, modelParams, baseUrl, apiKey, apiKeyEnv, toolCalling, maxOutputTokens, effort, fastMode, roles };
   return Object.fromEntries(Object.entries(routing).filter(([, v]) => v !== undefined));
 }
 
@@ -344,12 +415,18 @@ export function loadUserConfig(raw = readUserConfigFile()): UserConfig {
   const out: UserConfig = noModel ? { ...parsed, provider: NO_PROVIDER, ...(parsed.provider ? { lastProvider: parsed.provider } : {}) } : parsed;
   const chapterOrder = parseChapterOrder(raw, file);
   if (chapterOrder) out.chapterOrder = chapterOrder;
-  for (const key of ['hideWhitespace', 'splitDiff'] as const) {
+  for (const key of VIEW_SETTINGS) {
     const value = parseViewSetting(raw, key, file);
     if (value !== undefined) out[key] = value;
   }
   const theme = parseTheme(raw, file);
   if (theme) out.theme = theme;
+  const glyphs = parseChoice(raw, 'glyphs', GLYPH_SETTINGS, file);
+  if (glyphs) out.glyphs = glyphs;
+  const icons = parseChoice(raw, 'icons', ICON_SETTINGS, file);
+  if (icons) out.icons = icons;
+  const tipsSeen = parseTipsSeen(raw, file);
+  if (tipsSeen) out.tipsSeen = tipsSeen;
   const codingAgent = parseCodingAgent(raw, file);
   if (codingAgent) {
     out.codingAgent = codingAgent.agent;

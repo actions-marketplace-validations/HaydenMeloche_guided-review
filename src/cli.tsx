@@ -3,12 +3,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { AppOptions } from './tui/App.js';
 import { currentBranchPR, currentRepo, parsePRArg } from './github/gh.js';
-import { cleanupWorktrees, defaultBaseRef, localRepoRoot, mergeBaseOf, prDiff } from './git/worktree.js';
-import { git } from './git/git.js';
+import { localRepoRoot } from './git/worktree.js';
+import { autoCleanup, cleanup } from './cleanup.js';
+import { localPreview } from './preview.js';
 import {
   agentRouting,
   loadChapterOrder,
   loadCodingAgent,
+  loadGlyphSetting,
+  loadIconSetting,
+  loadTipsSeen,
+  saveTipSeen,
   loadThemeSetting,
   loadUserConfig,
   loadViewSetting,
@@ -17,14 +22,16 @@ import {
   saveViewSetting,
   userConfigPath,
   UserConfigError,
+  type GlyphSetting,
+  type IconSetting,
 } from './config.js';
 import { editRepoConfig, setup } from './setup.js';
 import { installClaudeCommand, installCodexSkill, type SkillInstallResult } from './codexSkill.js';
 import { planOpen, runOpen, targetArg } from './open.js';
-import type { PRInfo } from './types.js';
 import { KEEP_TOURS_PER_PR, TOUR_MAX_AGE_DAYS } from './store/retention.js';
 import { AGENT_ROLES, configForRole, validateRouting } from './agent/types.js';
 import { packageInfo, promptForUpdate, startUpdateCheck } from './updateCheck.js';
+import { SCREEN_RENDER } from './tui/renderOptions.js';
 
 // node:sqlite prints an ExperimentalWarning on load; drop just that one so it
 // does not land on top of the TUI. The store, and the TUI that imports it, are
@@ -58,7 +65,8 @@ const cli = meow(
 ${[
   usage('', 'Pick from PRs awaiting your review'),
   usage('review <number|URL>', 'Start or resume a guided tour of a PR'),
-  usage('preview', 'Author mode: tour your current branch before opening the PR'),
+  usage('feedback [number|URL]', 'Work through the review feedback on your PR (default: this branch)'),
+  usage('preview', 'Tour your current branch before opening the PR'),
   usage('open [number|URL]', 'Open the tour of a PR (default: this branch) in a new terminal window'),
   usage('open --preview', 'Open the preview of your current branch in a new terminal window'),
   usage('build [number|URL]', 'Build a tour without the TUI (for CI); share it with --comment or --out'),
@@ -71,7 +79,7 @@ ${[
 ].join('\n')}
 
   Options
-    --no-agent       Plain mode: kind sorting and test pairing, no model calls
+    --no-agent       Review without a model: static analysis only
     --fresh          Rebuild the tour even if one is cached or shared on the PR for this head
     --preview        With open: open \`${NAME} preview\` instead of a PR's tour
     --force          With install-*: replace an existing file that has different content
@@ -83,7 +91,8 @@ ${[
   Set GR_DEBUG=1 to print stack traces on errors.
   Set GR_NO_UPDATE_CHECK=1 to stop checking npm for a newer version.
 
-  Keys inside a tour: n/p hunk · ]/[ chapter · c comment · ? ask · t tests · d diagram · s submit · h help
+  Keys inside a tour: n/p hunk · ]/[ chapter · c comment · ? ask · t tests · d diagram · s submit · M merge · h help
+  Keys in feedback:   n/p thread · y reply · space triage · Z resolve · o prompt for agent · s send · M merge
 `,
   {
     importMeta: import.meta,
@@ -125,48 +134,6 @@ function reportInstall(result: SkillInstallResult, what: string, installed: stri
   else process.stdout.write(`${result.status === 'replaced' ? 'Replaced' : 'Installed'} ${result.path}. ${installed}\n`);
 }
 
-async function previewInfo(cwd: string): Promise<{ pr: PRInfo; diff: string; worktree: string }> {
-  const root = await localRepoRoot(cwd);
-  if (!root) fail(`${NAME} preview must run inside a git repository.`);
-  const trim = (s: string) => s.trim();
-  // Independent lookups run together; only the merge base waits for the default branch.
-  // Preview works without gh: an unknown repo becomes local/<dir> below.
-  const repoP = currentRepo(root).catch(() => undefined);
-  const headP = git(root, ['rev-parse', 'HEAD']).then(trim);
-  const branchP = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).then(trim);
-  const base = (await defaultBaseRef(root, () => repoP)) ?? fail(`could not find the default branch to compare against (no origin/HEAD, no answer from origin, and no main or master).`);
-  const baseSha = (await mergeBaseOf(root, 'HEAD', base.ref)) ?? fail(`could not find the merge base with ${base.ref.replace(/^refs\/(remotes\/|heads\/)/, '')}.`);
-  // Diffs against the working tree, so it includes uncommitted work: the author is still shaping the branch.
-  const [headSha, branch, log, diff, currentRepoName] = await Promise.all([headP, branchP, git(root, ['log', '--format=%H%x00%B%x1e', `${baseSha}..HEAD`]).then(trim), prDiff(root, baseSha), repoP]);
-  const commits = log
-    .split('\x1e')
-    .map((c) => c.trim())
-    .filter(Boolean)
-    .map((c) => {
-      const [sha, message] = c.split('\0');
-      return { sha, message: message ?? '' };
-    });
-  const repo = currentRepoName ?? `local/${path.basename(root)}`;
-  return {
-    worktree: root,
-    diff,
-    pr: {
-      repo,
-      number: 0,
-      title: `${branch} (preview)`,
-      body: commits.map((c) => c.message).join('\n\n'),
-      url: '',
-      author: 'you',
-      baseRef: base.name,
-      headRef: branch,
-      baseSha,
-      headSha,
-      commits,
-      linkedIssues: [],
-    },
-  };
-}
-
 // The model routing for a tour, or undefined with --no-agent or when the config chooses no model.
 // Exits with a hint when the config is unusable. Reads config.json unless given what it holds.
 function loadAgent(noAgent: boolean, config?: Record<string, unknown> | null): AppOptions['agent'] {
@@ -196,6 +163,20 @@ function agentOptions(config?: Record<string, unknown> | null): { agent: AppOpti
   return { agent, noAgent: !agent };
 }
 
+// How the terminal shows color, read once before any screen: its background (so the default
+// palette's tints suit a light terminal) and its color depth.
+async function readTerminal(noColor: boolean): Promise<void> {
+  const [{ detectBackground }, theme] = await Promise.all([import('./tui/terminalBackground.js'), import('./tui/theme.js')]);
+  theme.setColorDepth(theme.detectColorDepth());
+  theme.setTerminalBackground(await detectBackground(), noColor);
+}
+
+// The marks and file icons the screens draw, from the config.
+async function setMarks(glyphs: GlyphSetting, icons: IconSetting): Promise<void> {
+  (await import('./tui/glyphs.js')).setGlyphs(glyphs);
+  (await import('./tui/icons.js')).setIcons(icons);
+}
+
 async function main() {
   const [cmd, arg] = cli.input;
   const cwd = process.cwd();
@@ -205,26 +186,29 @@ async function main() {
       editRepoConfig((await localRepoRoot(cwd)) ?? fail('not inside a git repository.'));
       return;
     }
+    // The wizard's theme preview draws as the tour will: for this terminal, with the config's marks.
+    // A config that can't be read keeps the default marks; setup says what is wrong with it.
+    if (!cli.flags.edit && process.stdin.isTTY && process.stdout.isTTY) {
+      await readTerminal(!!process.env.NO_COLOR);
+      try {
+        const saved = readUserConfigFile();
+        await setMarks(loadGlyphSetting(saved), loadIconSetting(saved));
+      } catch (error) {
+        if (!(error instanceof UserConfigError)) throw error;
+      }
+    }
     await setup({ edit: cli.flags.edit });
     return;
   }
   if (cmd === 'cleanup') {
     const { days } = cli.flags;
     if (days !== undefined && !(Number.isFinite(days) && days > 0)) fail('--days must be a positive number of days.');
-    const result = await cleanupWorktrees();
-    process.stdout.write(`Removed ${result.removed.length} PR worktree(s).\n`);
-    for (const item of result.skipped) process.stdout.write(`Skipped ${item.path}: ${item.reason}\n`);
-    const { Store } = await import('./store/db.js');
-    const store = new Store();
-    try {
-      const extra = store.pruneTours();
-      const maxAge = days ?? TOUR_MAX_AGE_DAYS;
-      const stale = store.pruneStale(maxAge);
-      process.stdout.write(`Removed ${extra + stale.tours} old tour(s): the newest ${KEEP_TOURS_PER_PR} per PR are kept, minus any not opened in ${maxAge} days.\n`);
-      if (stale.prs) process.stdout.write(`Cleared reading state for ${stale.prs} PR(s) with no tour left; unposted drafts are kept.\n`);
-    } finally {
-      store.close();
-    }
+    const maxAge = days ?? TOUR_MAX_AGE_DAYS;
+    const result = await cleanup(maxAge);
+    process.stdout.write(`Removed ${result.worktrees.removed.length} PR worktree(s).\n`);
+    for (const item of result.worktrees.skipped) process.stdout.write(`Skipped ${item.path}: ${item.reason}\n`);
+    process.stdout.write(`Removed ${result.tours} old tour(s): the newest ${KEEP_TOURS_PER_PR} per PR are kept, minus any not opened in ${maxAge} days.\n`);
+    if (result.prs) process.stdout.write(`Cleared reading state for ${result.prs} PR(s) with no tour left; unposted drafts are kept.\n`);
     return;
   }
   if (cmd === 'install-codex-skill') {
@@ -289,27 +273,41 @@ async function main() {
   }
 
   const prArg = /^(#?\d+|https?:\/\/|[\w.-]+\/[\w.-]+#\d+)/;
-  if (cmd && cmd !== 'review' && cmd !== 'preview' && !prArg.test(cmd)) cli.showHelp(1);
+  if (cmd && cmd !== 'review' && cmd !== 'feedback' && cmd !== 'preview' && !prArg.test(cmd)) cli.showHelp(1);
 
   // Everything below starts the full-screen tour. Check for a terminal before
   // spending any gh or network calls on it.
   if (!process.stdin.isTTY || !process.stdout.isTTY) fail(`${NAME} is an interactive terminal app; run it in a terminal.`);
+  // How the terminal shows color, and NO_COLOR, read once before any screen.
+  const noColor = !!process.env.NO_COLOR;
+  await readTerminal(noColor);
   const offer = updateCheck?.offer();
   if (offer) {
     const code = await promptForUpdate(offer);
     if (code !== undefined) process.exit(code);
   }
-  // First run: introduce gr and set it up, then carry on with the command that was run.
+  // First run: introduce gr and set it up, then carry on with the command that was run. A command
+  // that reads GitHub checks gh first, so a signed-out gh is said before five screens of setup
+  // rather than after them.
   if (cli.flags.agent && !fs.existsSync(userConfigPath())) {
+    if (cmd !== 'preview') {
+      const { detectGitHub } = await import('./detect.js');
+      const gh = await detectGitHub();
+      if (!gh.installed) fail(`the GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run \`gh auth login\`, or run \`${NAME} config\` to use a personal access token.`);
+      if (!gh.login) fail(`gh is not signed in to GitHub (or GitHub could not be reached). Run \`gh auth login\`, or \`${NAME} config\` to use a personal access token, then run this again.`);
+    }
     const result = await setup({ firstRun: true });
     if (result.kind === 'cancelled') fail(`no config saved. Run \`${NAME} config\` when you're ready, or pass --no-agent to review without a model.`);
   }
+  // The weekly cleanup runs while the PR is resolved, and finishes before the tour can open a worktree.
+  const cleanupP = autoCleanup();
   // Load the TUI while the PR is being resolved below.
   const tui = Promise.all([import('ink'), import('./tui/App.js')]);
   tui.catch(() => undefined); // awaited below; a failure surfaces there
   const localRepoP = localRepoRoot(cwd);
-  const needsRepo = cmd === 'review' ? !!arg : !!cmd && cmd !== 'preview';
-  const cwdRepoP = needsRepo && /^#?\d+$/.test((cmd === 'review' ? arg : cmd).trim()) ? currentRepo(cwd) : Promise.resolve(undefined);
+  const takesArg = cmd === 'review' || cmd === 'feedback';
+  const needsRepo = takesArg ? !!arg : !!cmd && cmd !== 'preview';
+  const cwdRepoP = needsRepo && /^#?\d+$/.test((takesArg ? arg : cmd).trim()) ? currentRepo(cwd) : Promise.resolve(undefined);
 
   // config.json, read once for the model and every setting below. A file that can't be read gets
   // the hint the first loader to need it would give.
@@ -324,13 +322,23 @@ async function main() {
   let chapterOrder: AppOptions['chapterOrder'];
   let hideWhitespace: boolean;
   let splitDiff: boolean;
+  let sidebar: boolean;
+  let shortExplanation: boolean;
   let themeName: string | undefined;
+  let glyphs: GlyphSetting;
+  let icons: IconSetting;
+  let tipsSeen: string[];
   let codingAgent: AppOptions['codingAgent'];
   try {
     chapterOrder = loadChapterOrder(config);
     hideWhitespace = loadViewSetting('hideWhitespace', config);
     splitDiff = loadViewSetting('splitDiff', config);
+    sidebar = loadViewSetting('sidebar', config);
+    shortExplanation = loadViewSetting('shortExplanation', config);
     themeName = loadThemeSetting(config);
+    glyphs = loadGlyphSetting(config);
+    icons = loadIconSetting(config);
+    tipsSeen = loadTipsSeen(config);
     codingAgent = loadCodingAgent(config);
   } catch (error) {
     if (!(error instanceof UserConfigError)) throw error;
@@ -338,7 +346,8 @@ async function main() {
   }
   // Loaded while the PR is resolved below. Only a name shiki doesn't have is the config's fault;
   // any other failure is reported as it is.
-  const name = themeName;
+  // NO_COLOR wins over a theme: the screens show no colors at all.
+  const name = noColor ? undefined : themeName;
   const paletteP = name
     ? import('./tui/theme.js').then(async ({ isTheme, loadPalette }) => {
         if (!(await isTheme(name))) fail(`unknown theme ${JSON.stringify(name)} in your config.\n\n  Run \`gr config\` to pick one.`);
@@ -351,6 +360,10 @@ async function main() {
     chapterOrder,
     hideWhitespace,
     splitDiff,
+    sidebar,
+    shortExplanation,
+    tipsSeen,
+    saveTipSeen: config ? saveTipSeen : undefined,
     saveViewSetting,
     saveTheme: config ? saveThemeSetting : undefined,
     codingAgent,
@@ -364,15 +377,22 @@ async function main() {
     const target = arg ? parsePRArg(arg, await cwdRepoP) : await currentBranchPR(cwd);
     if (!target) fail('no PR given and the current branch has no open PR. Usage: gr review <number|URL>');
     opts = { ...base, target };
+  } else if (cmd === 'feedback') {
+    const target = arg ? parsePRArg(arg, await cwdRepoP) : await currentBranchPR(cwd);
+    if (!target) fail(`no PR given and the current branch has no open PR. Usage: ${NAME} feedback <number|URL>`);
+    opts = { ...base, target, mode: 'author' };
   } else if (cmd === 'preview') {
-    opts = { ...base, preview: await previewInfo(cwd) };
+    if (!base.localRepo) fail(`${NAME} preview must run inside a git repository.`);
+    opts = { ...base, preview: await localPreview(cwd).catch((e: Error) => fail(e.message)) };
   } else if (cmd) {
     opts = { ...base, target: parsePRArg(cmd, await cwdRepoP) };
   }
 
   const [{ render }, { App }] = await tui;
+  await cleanupP;
+  await setMarks(glyphs, icons);
   opts = { ...opts, palette: await paletteP };
-  const app = render(<App {...opts} />, { alternateScreen: true, exitOnCtrlC: true });
+  const app = render(<App {...opts} />, { ...SCREEN_RENDER, exitOnCtrlC: true });
   await app.waitUntilExit();
   // Backstop: stray timers, sockets, or child processes must not keep gr alive
   // after the tour has closed.

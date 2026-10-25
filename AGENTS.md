@@ -4,9 +4,10 @@ Guided Review (`gr`) is a terminal app, built with TypeScript, Ink, and pnpm, th
 
 ## Checks
 
-Run these before you call a change done. CI runs them all.
+Run these before you call a change done. CI runs them all. `pnpm check` runs them in order and stops at the first failure.
 
 ```sh
+pnpm check          # all of the below
 pnpm lint
 pnpm format:check   # pnpm format to fix
 pnpm typecheck
@@ -17,6 +18,8 @@ pnpm test:e2e
 The app and tests need Node 22.13 or newer and ripgrep (`rg`) on the PATH.
 
 If a change alters how PRs split into tours, it shows up as a diff of the `.tour.txt` files in `test/fixtures/prs/`. Only accept that diff with `pnpm test -u` when the new shape is intended.
+
+If a change alters how a screen looks, it shows up as a diff of the golden screens in `test/e2e/__screens__/`: each screen at 80×24, 120×36, and 200×50, with its colors and styles marked up. Only accept that diff with `pnpm test:e2e -u` when the new look is intended.
 
 ## Running the app
 

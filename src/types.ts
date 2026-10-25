@@ -66,7 +66,7 @@ export interface Hunk {
   symbols: string[]; // enclosing declarations in the head (or base, for pure deletions)
   narration?: string;
   narrationInferred?: boolean; // true when the narration cites no code
-  narrationShared?: boolean; // a minor hunk: narration is the chapter's shared summary of its minor hunks
+  narrationShared?: boolean; // narration is shared with other hunks: a chapter's summary of its minor hunks, or a lockfile pair's one narration
   risk: Risk;
   riskReasons: string[];
   tests: TestLink[];
@@ -114,6 +114,15 @@ export interface Graph {
   edges: GraphEdge[];
 }
 
+// A changed lockfile read with the changed manifests it locks (see pairLockfiles). Each manifest
+// hunk is a page that lists the lockfile's parsed package changes under its diff; the lockfile's
+// hunks have no page of their own. Every hunk of the pair shares one narration.
+export interface LockPair {
+  lockfile: string; // its path
+  hunkIds: string[]; // the manifests' dependency hunks, in reading order
+  lockHunkIds: string[]; // the lockfile's hunks
+}
+
 export interface Chapter {
   id: string;
   kind: ChapterKind;
@@ -127,6 +136,8 @@ export interface Chapter {
   orphanReasons: Record<string, string>; // supporting chapter: hunkId -> one-line reason
   untestedBranches: string[];
   collapsed: boolean; // low-priority kinds start collapsed to one-line summaries
+  folded?: string[]; // hunks read as one summary on the chapter's opening page (lockfiles with no changed manifest, in the dependencies chapter); the rest follow it
+  lockPairs?: LockPair[]; // dependencies chapter: lockfiles read on the pages of the manifests they lock
   lowConfidence?: boolean; // flow edges from naming/model only
   optional?: boolean; // low-value chapter (import-only changes): not stepped into by n/p, not counted as unread
   checklist?: ChecklistItem[]; // team checklist items whose path pattern matches this chapter
@@ -160,6 +171,7 @@ export interface ThreadComment {
   body: string;
   createdAt: string;
   reactionGroups?: ReactionGroup[];
+  url?: string;
 }
 
 export type ReactionContent = 'THUMBS_UP' | 'THUMBS_DOWN' | 'LAUGH' | 'CONFUSED' | 'HEART' | 'HOORAY' | 'ROCKET' | 'EYES';
@@ -178,6 +190,28 @@ export interface ExistingThread {
   isResolved: boolean;
   isOutdated: boolean;
   comments: ThreadComment[];
+  // Where the thread was written: originalLine (and originalStartLine) are lines of this commit,
+  // not of the base or the head.
+  originalCommit?: string;
+  startLine?: number;
+  originalStartLine?: number;
+  side?: 'LEFT' | 'RIGHT';
+  subjectType?: 'LINE' | 'FILE';
+  diffHunk?: string; // the first comment's diff hunk, ending at the commented line
+  viewerCanResolve?: boolean;
+  viewerCanUnresolve?: boolean;
+  // An outdated thread followed to its line at the head (see placeThread), so it shows where
+  // the code it was about is now. Computed after loading; never from GitHub.
+  placed?: { line: number; side: 'LEFT' | 'RIGHT' };
+}
+
+// A comment on the PR's conversation, not on a line.
+export interface IssueComment {
+  id: number;
+  author: string;
+  body: string;
+  createdAt: string;
+  url: string;
 }
 
 export interface ExistingReview {

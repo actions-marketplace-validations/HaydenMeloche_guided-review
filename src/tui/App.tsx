@@ -1,18 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useApp, useInput, useWindowSize } from 'ink';
+import { useApp, useInput as useInkInput, useWindowSize } from 'ink';
+import { KeysLive, useInput } from './input.js';
 import { Box, PreviewingContext, Text, ThemeContext, useThemePreview } from './themed.js';
 import { terminalPalette, themeList, type Palette, type ThemeInfo } from './theme.js';
 import { ThemePicker } from './ThemePicker.js';
 import { spawnSync } from 'node:child_process';
 import type { Chapter, ChapterOrder, Draft, ExistingThread, Hunk, PRInfo, ReactionContent, ReadState, ThreadComment, Tour } from '../types.js';
 import { Store } from '../store/db.js';
-import { fetchHeadSha, fetchPR, fetchThreads, getMentionUsers, replyToThread, setCommentReaction } from '../github/gh.js';
+import { fetchHeadSha, fetchMergeStatus, fetchPR, fetchThreads, getMentionUsers, replyToThread, setCommentReaction, viewerLogin } from '../github/gh.js';
 import { ensureWorktree } from '../git/worktree.js';
+import { localChanges, localPreview, type LocalPreview } from '../preview.js';
 import { runPipeline } from '../pipeline.js';
 import type { AgentRole, AgentRouting } from '../agent/types.js';
 import type { ViewSetting } from '../config.js';
 import { fileOrderChapters } from '../analysis/flows.js';
-import { applyMoves, ORDER_SEQUENCE, positionAfterOrderChange, sortChapters, stateOf, type States } from './nav.js';
+import { applyMoves, firstHunk, hunkPosition, ORDER_SEQUENCE, pageOf, positionAfterOrderChange, sortChapters, stateOf, type States } from './nav.js';
 import { hunkKeys } from '../review/hunkState.js';
 import { ChapterScreen, type Services } from './ChapterScreen.js';
 import { BriefingScreen } from './BriefingScreen.js';
@@ -28,24 +30,44 @@ import { generateSuggestion } from '../agent/suggest.js';
 import { PickerScreen, keyFor, type DownloadJob, type Target as PickTarget } from './PickerScreen.js';
 import { TourIntro, type IntroLine } from './TourIntro.js';
 import { useTerminalStatus, type TerminalProgress } from './terminalStatus.js';
+import { sanitizeTerminal } from '../util/sanitize.js';
+import { Hints, KeyBar, type Hint } from './KeyBar.js';
+import { plural } from './plural.js';
 import { codingAgentLaunch, type CodingAgentSetting } from '../codingAgent.js';
+import { AuthorMode } from './author/AuthorMode.js';
+import { ChecksPopup, MergePopup, ReviewersPopup } from './prPopups.js';
+import { mergeReadiness, type Readiness } from '../review/merge.js';
+import { placedThreads } from '../review/feedback.js';
+import { loadThreadDiffs } from '../review/threadDiffs.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { ErrorBlock } from './ErrorBlock.js';
 
 export interface Target {
   repo: string;
   number: number;
 }
 
+// review: the reviewer's tour. author: the feedback on your own PR (gr feedback).
+export type Mode = 'review' | 'author';
+
 export interface AppOptions {
   target?: Target; // undefined: pick from PRs awaiting your review
+  mode?: Mode; // what a target opens in; review when unset, which asks first on your own PR
   localRepo?: string;
   agent?: AgentRouting;
   chapterOrder?: ChapterOrder; // the user's default; a PR's saved order wins
   hideWhitespace?: boolean; // the user's saved w setting; on when unset
   splitDiff?: boolean; // the user's saved S setting; off when unset
+  sidebar?: boolean; // the user's saved \ setting; on when unset
+  shortExplanation?: boolean; // the explanation cut to its first lines; off when unset
+  tipsSeen?: string[]; // first-run tips already shown
+  saveTipSeen?: (tip: string) => void; // records one; unset with no config file, where tips can't be remembered and so don't show
   saveViewSetting?: (key: ViewSetting, value: boolean) => void; // records a w or S toggle for next time
   noAgent?: boolean;
   fresh?: boolean;
-  preview?: { pr: PRInfo; diff: string; worktree: string }; // author mode on a local branch
+  preview?: LocalPreview; // gr preview: a tour of a local branch
   palette?: Palette; // the saved theme, loaded before the first frame; the terminal's colors when unset
   saveTheme?: (name: string) => void; // records a theme chosen in the picker; unset when there is no config file
   codingAgent?: CodingAgentSetting; // the agent o opens; Claude Code when unset
@@ -58,7 +80,16 @@ interface ThemeControl {
   popup: (width: number, height: number) => ReactNode;
 }
 
-type Phase = 'pick' | 'load' | 'briefing' | 'chapter' | 'submit' | 'edit' | 'error';
+export type Phase = 'pick' | 'load' | 'own' | 'briefing' | 'chapter' | 'submit' | 'edit' | 'author' | 'error';
+
+// The PR whose unposted drafts and queued replies Q asks about: the one open now. None at the PR
+// list (q there has left the PR, though the last target stays), and none for a local tour, which
+// has nowhere to post them.
+export function quitAsksAbout(phase: Phase, tour: Pick<Tour, 'repo' | 'pr'> | undefined, target: Target | undefined, local: boolean): { repo: string; pr: number } | undefined {
+  if (phase === 'pick' || local) return undefined;
+  if (tour) return { repo: tour.repo, pr: tour.pr };
+  return target ? { repo: target.repo, pr: target.number } : undefined;
+}
 
 interface Step {
   name: string;
@@ -87,6 +118,8 @@ function slots(limit: number) {
 function titleSpot(phase: Phase, hasTour: boolean, ci: number, chapterCount: number): string {
   if (phase === 'pick') return 'reviews';
   if (phase === 'error') return 'error';
+  if (phase === 'own') return 'your PR';
+  if (phase === 'author') return hasTour ? 'feedback' : 'loading';
   if (phase === 'load' || !hasTour) return 'loading';
   if (phase === 'briefing') return 'briefing';
   if (phase === 'submit' || phase === 'edit') return 'submit';
@@ -162,6 +195,13 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const [phase, setPhase] = useState<Phase>(opts.target || opts.preview ? 'load' : 'pick');
   const [submitFrom, setSubmitFrom] = useState<'briefing' | 'chapter'>('chapter');
   const [target, setTarget] = useState<Target | undefined>(opts.target ?? (opts.preview ? { repo: opts.preview.pr.repo, number: opts.preview.pr.number } : undefined));
+  // A tour of a local branch, from gr preview or l on the PR list: the branch as last read, and
+  // where to read it again. Each load reads it again, as the working tree changes under it;
+  // gr preview's first load uses what the CLI read.
+  const [local, setLocal] = useState<LocalPreview | undefined>(opts.preview);
+  const localSource = useRef<{ cwd: string; first?: LocalPreview } | undefined>(opts.preview ? { cwd: opts.preview.worktree, first: opts.preview } : undefined);
+  // What l on the PR list would tour, for the list to offer while there is some.
+  const readLocalChanges = useMemo(() => (opts.localRepo ? () => localChanges(opts.localRepo!) : undefined), [opts.localRepo]);
   const [worktree, setWorktree] = useState<string>('');
   const [tour, setTour] = useState<Tour | undefined>();
   const [steps, setSteps] = useState<Step[]>([]);
@@ -174,11 +214,27 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const [order, setOrder] = useState<ChapterOrder>(opts.chapterOrder ?? 'flow');
   const [hideWhitespace, setHideWhitespace] = useState(opts.hideWhitespace ?? true);
   const [splitDiff, setSplitDiff] = useState(opts.splitDiff ?? false);
+  const [sidebar, setSidebar] = useState(opts.sidebar ?? true);
+  const [shortExplanation, setShortExplanation] = useState(opts.shortExplanation ?? false);
+  // First-run tips: each shows once, then is saved as seen.
+  const tipsSeen = useRef(new Set(opts.tipsSeen ?? []));
+  const takeTip = (tip: string) => {
+    if (!opts.saveTipSeen || tipsSeen.current.has(tip)) return false;
+    tipsSeen.current.add(tip);
+    try {
+      opts.saveTipSeen?.(tip);
+    } catch {
+      // An unwritable config shows the tip again next time; nothing else depends on it.
+    }
+    return true;
+  };
   const [hideTestPane, setHideTestPane] = useState(false);
   const [deltaOnly, setDeltaOnly] = useState(false);
   const [pos, setPosState] = useState({ ci: 0, hi: 0 });
   const [banner, setBanner] = useState<string | undefined>();
   const [pickerNotice, setPickerNotice] = useState<string | undefined>();
+  // The last review posted, shown on that PR's briefing too: the PR list is not the only way back.
+  const [postedNotice, setPostedNotice] = useState<{ key: string; text: string }>();
   const [newHead, setNewHead] = useState<string | undefined>();
   const [editing, setEditing] = useState<Draft | undefined>();
   const [editState, setEditState] = useState<ComposerState>();
@@ -188,6 +244,18 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const repoIndex = useRef<{ key: string; index: RepoIndex } | undefined>(undefined);
   const [confirms, setConfirms] = useState<Record<string, boolean>>({});
   const [prTitle, setPrTitle] = useState<string | undefined>();
+  const [mode, setMode] = useState<Mode>(opts.mode ?? 'review');
+  // PRs whose "this is your PR" question was answered, so it is asked once per PR.
+  const askedOwn = useRef(new Set<string>());
+  // PRs merged from here, kept off the picker: GitHub's search can list them for a while after.
+  const [merged, setMerged] = useState<ReadonlySet<string>>(new Set());
+  const [readiness, setReadiness] = useState<Readiness>();
+  const [merging, setMerging] = useState<Target>();
+  const [checking, setChecking] = useState<Target>(); // the checks popup, over the picker or the briefing
+  const [askingReviewers, setAskingReviewers] = useState<Target>(); // the reviewers popup, over the picker
+  const [pickerReload, setPickerReload] = useState(0);
+  // Diffs from each outdated thread's commit to the head, so the tour shows it on its line now.
+  const threadDiffs = useRef<Awaited<ReturnType<typeof loadThreadDiffs>>>(new Map());
   const loadGen = useRef(0);
   const agentSessions = useRef<Partial<Record<AgentRole, string>>>({});
   // The in-flight tour build: aborted when a new load starts (R rebase, retry, a new pick) and on quit.
@@ -244,8 +312,48 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     [store],
   );
 
+  // The feedback screen's load: it needs the tour's chapters and summary, not narration of the
+  // author's own code. Returns once the tour is in (or the load was superseded).
+  const loadAuthor = useCallback(
+    async (info: PRInfo, wt: string, gen: number, signal: AbortSignal, fresh: boolean | undefined) => {
+      setMoves(store.getMoves(info.repo, info.number));
+      setOrder(store.getPosition(info.repo, info.number)?.order ?? opts.chapterOrder ?? 'flow');
+      setDeltaOnly(false);
+      // The feedback needs the tour's chapters and summary, not narration of the author's own
+      // code. A tour already built for this head (by gr review or CI) is used as it is; else
+      // the static tour opens at once and, with a model, the briefing is written behind it.
+      const saved = fresh ? undefined : store.loadTour(info.repo, info.number, info.headSha);
+      const withModel = !!opts.agent && !opts.noAgent;
+      if (saved && (saved.mode === 'agent' || !withModel)) {
+        setTour(saved);
+        setPhase('author');
+        return;
+      }
+      const final = await runPipeline({
+        pr: info,
+        worktree: wt,
+        store,
+        agent: opts.agent,
+        noAgent: !withModel,
+        briefingOnly: true,
+        fresh,
+        signal,
+        onProgress,
+        onTour: (tr) => {
+          if (gen !== loadGen.current) return;
+          setTour(tr);
+          setPhase('author');
+        },
+      });
+      if (gen !== loadGen.current) return;
+      setTour(final);
+      setPhase('author');
+    },
+    [opts, store, onProgress],
+  );
+
   const load = useCallback(
-    async (t: Target, fresh = opts.fresh) => {
+    async (t: Target, fresh = opts.fresh, as: Mode = opts.mode ?? 'review') => {
       const gen = ++loadGen.current;
       loadAbort.current?.abort();
       const abort = new AbortController();
@@ -261,12 +369,27 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
       setError('');
       setBanner(undefined);
       setNewHead(undefined);
+      setReadiness(undefined);
+      threadDiffs.current = new Map();
       try {
         let info: PRInfo;
         let wt: string;
-        if (opts.preview) {
-          info = opts.preview.pr;
-          wt = opts.preview.worktree;
+        let diff: string | undefined;
+        const src = localSource.current;
+        if (src) {
+          let p = src.first;
+          src.first = undefined;
+          if (!p) {
+            onProgress('Reading your local changes');
+            p = await localPreview(src.cwd);
+            onProgress('Reading your local changes', true);
+          }
+          if (gen !== loadGen.current) return;
+          setLocal(p);
+          setTarget({ repo: p.pr.repo, number: p.pr.number });
+          info = p.pr;
+          wt = p.worktree;
+          diff = p.diff;
         } else {
           onProgress(`Fetching ${t.repo}#${t.number}`);
           info = await fetchPR(t.repo, t.number, signal);
@@ -278,6 +401,18 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         if (gen !== loadGen.current) return;
         setPrTitle(info.title);
         setWorktree(wt);
+        // Your own PR from gr review: ask whether you want its feedback or its tour.
+        if (!src && as === 'review' && !askedOwn.current.has(keyFor(t))) {
+          const viewer = await viewerLogin(signal).catch(() => undefined);
+          if (gen !== loadGen.current) return;
+          if (viewer && viewer === info.author) {
+            askedOwn.current.add(keyFor(t));
+            setPhase('own');
+            return;
+          }
+        }
+        setMode(as);
+        if (as === 'author') return await loadAuthor(info, wt, gen, signal, fresh); // awaited, so a failure reaches the catch below
         setStates(store.getReadStates(info.repo, info.number));
         setDrafts(store.listDrafts(info.repo, info.number));
         setMoves(store.getMoves(info.repo, info.number));
@@ -295,7 +430,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           agent: opts.agent,
           noAgent: opts.noAgent,
           fresh,
-          diffOverride: opts.preview?.diff,
+          diffOverride: diff,
           signal,
           onProgress,
           onTour: (tr) => {
@@ -319,6 +454,16 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         setAnalyzing(undefined);
         setNarration(undefined);
         flagDraftsOnChangedLines(final);
+        if (!src && final.existingThreads.some((th) => th.isOutdated && !th.isResolved)) {
+          loadThreadDiffs(wt, final.headSha, final.existingThreads, { signal }).then(
+            (diffs) => {
+              if (gen !== loadGen.current) return;
+              threadDiffs.current = diffs;
+              setTour((cur) => (cur ? { ...cur, existingThreads: placedThreads(cur, cur.existingThreads, diffs) } : cur));
+            },
+            () => undefined,
+          );
+        }
         if (!shown) {
           setDeltaOnly(!!final.rereview?.newHunkIds.length);
           setPhase('briefing');
@@ -329,7 +474,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         setPhase('error');
       }
     },
-    [opts, store, onProgress, flagDraftsOnChangedLines],
+    [opts, store, onProgress, flagDraftsOnChangedLines, loadAuthor],
   );
 
   // Mount only: later loads come from explicit actions, and `load` changes identity with opts.
@@ -342,7 +487,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const pollRepo = tour?.repo;
   const pollPr = tour?.pr;
   const pollHead = tour?.headSha;
-  const preview = !!opts.preview;
+  const preview = !!local;
   useEffect(() => {
     if (!pollRepo || pollPr === undefined || !pollHead || preview) return;
     const check = async () => {
@@ -350,7 +495,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         const head = await fetchHeadSha(pollRepo, pollPr);
         if (head && head !== pollHead) {
           setNewHead(head);
-          setBanner(`The author pushed ${head.slice(0, 8)}. Press R to rebase the tour onto the new head (drafts are kept).`);
+          setBanner(`▲ The author pushed ${head.slice(0, 8)} · R rebuilds the tour on it (drafts are kept)`);
         }
       } catch {
         /* offline: keep going */
@@ -359,6 +504,19 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     const timer = setInterval(() => void check(), HEAD_POLL_MS);
     return () => clearInterval(timer);
   }, [pollRepo, pollPr, pollHead, preview]);
+
+  // Whether the PR can merge, for the review briefing. Author mode reads its own.
+  useEffect(() => {
+    if (!pollRepo || pollPr === undefined || preview || mode !== 'review') return;
+    let live = true;
+    fetchMergeStatus(pollRepo, pollPr).then(
+      (s) => live && setReadiness(mergeReadiness(s)),
+      () => undefined,
+    );
+    return () => {
+      live = false;
+    };
+  }, [pollRepo, pollPr, pollHead, preview, mode, newHead]);
 
   // ---------- derived ----------
   const chapters: Chapter[] = useMemo(() => {
@@ -372,7 +530,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   }, [tour, order, moves, deltaOnly, chapters]);
 
   // The window title names the PR and where you are in it.
-  const subject = opts.preview ? `preview ${opts.preview.pr.repo}` : target ? `${target.repo}#${target.number}` : undefined;
+  const subject = local ? `preview ${local.pr.repo}` : target ? `${target.repo}#${target.number}` : undefined;
   const title = ['gr', phase === 'pick' ? undefined : subject, titleSpot(phase, !!tour, pos.ci, chapters.length)].filter(Boolean).join(' · ');
   const rewriteTerminalStatus = useTerminalStatus(title, tabProgress(phase, narration));
 
@@ -404,7 +562,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
             store.setChecklistConfirm(tour.repo, tour.pr, id, v);
             setConfirms(store.getChecklistConfirms(tour.repo, tour.pr));
           },
-          loadMentionUsers: opts.preview ? undefined : () => getMentionUsers(tour.repo),
+          loadMentionUsers: local ? undefined : () => getMentionUsers(tour.repo),
         }
       : undefined;
 
@@ -417,14 +575,14 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const resume = (ci?: number) => {
     if (!tour) return;
     if (ci !== undefined) {
-      setPos(ci, chapters[ci]?.collapsed ? -1 : 0);
+      setPos(ci, firstHunk(chapters, ci));
       return setPhase('chapter');
     }
     const saved = store.getPosition(tour.repo, tour.pr);
     const sc = saved ? chapters.findIndex((c) => c.id === saved.chapterId) : -1;
     if (saved && sc >= 0) {
       const hi = saved.hunkId ? chapters[sc].hunkIds.indexOf(saved.hunkId) : -1;
-      setPos(sc, hi >= 0 ? hi : chapters[sc].collapsed ? -1 : 0);
+      setPos(sc, hi >= 0 ? hi : firstHunk(chapters, sc));
     } else {
       // First unread hunk in reading order.
       let found = false;
@@ -432,19 +590,19 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         if (chapters[c].optional) continue;
         const i = chapters[c].hunkIds.findIndex((id) => tour.hunks[id] && !tour.hunks[id].importOnly && stateOf(states, tour.hunks[id]) === 'unread');
         if (i >= 0) {
-          setPos(c, chapters[c].collapsed ? -1 : i);
+          setPos(c, pageOf(chapters[c], i));
           found = true;
         }
       }
-      if (!found) setPos(0, chapters[0]?.collapsed ? -1 : 0);
+      if (!found) setPos(0, firstHunk(chapters, 0));
     }
     setPhase('chapter');
   };
 
-  const setHunkState = (h: Hunk, s: ReadState) => {
-    if (!tour) return;
-    const keys = hunkKeys(h);
-    for (const k of keys) store.setReadState(tour.repo, tour.pr, k, s);
+  const setHunkState = (hs: Hunk[], s: ReadState) => {
+    if (!tour || !hs.length) return;
+    const keys = hs.flatMap(hunkKeys);
+    store.setReadStates(tour.repo, tour.pr, keys, s);
     setStates((prev) => ({ ...prev, ...Object.fromEntries(keys.map((k) => [k, s])) }));
   };
 
@@ -463,8 +621,9 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
       current
         ? {
             ...current,
-            existingThreads:
-              threads ?? current.existingThreads.map((t) => (t.id === thread.id ? { ...t, comments: [...t.comments, { author: 'you', body, createdAt: new Date().toISOString() }] } : t)),
+            existingThreads: threads
+              ? placedThreads(current, threads, threadDiffs.current)
+              : current.existingThreads.map((t) => (t.id === thread.id ? { ...t, comments: [...t.comments, { author: 'you', body, createdAt: new Date().toISOString() }] } : t)),
           }
         : current,
     );
@@ -578,13 +737,34 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     predownloadAbort.current?.abort();
     exit();
   };
+  // Q: quit, once asked again when drafts or replies have not been posted. They are saved, so
+  // the question only makes sure the reviewer knows they are still waiting.
+  const [quitAsk, setQuitAsk] = useState<string | undefined>();
+  const requestQuit = () => {
+    const at = quitAsksAbout(phase, tour, target, !!localSource.current);
+    const drafts = at ? store.listDrafts(at.repo, at.pr).filter((d) => !d.posted).length : 0;
+    const replies = at ? store.listReplies(at.repo, at.pr).length : 0;
+    if (quitAsk || (!drafts && !replies)) return quit();
+    const waiting = [drafts && plural(drafts, 'unposted draft'), replies && plural(replies, 'queued reply', 'queued replies')].filter(Boolean).join(' and ');
+    setQuitAsk(`Quit with ${waiting}? ${drafts + replies === 1 ? 'It stays' : 'They stay'} saved for next time.`);
+  };
+  // Ink's own useInput: the question takes keys while everything under it is quiet.
+  useInkInput(
+    (input, key) => {
+      if (input === 'Q' || input === 'y') return quit();
+      if (key.escape || input === 'n' || input === 'q') setQuitAsk(undefined);
+    },
+    { isActive: !!quitAsk },
+  );
 
-  // q while reviewing: drop the open tour and return to the PR list. A preview has no list,
+  // q while reviewing: drop the open tour and return to the PR list. gr preview has no list,
   // so there q quits.
   const back = opts.preview
     ? undefined
     : () => {
         loadGen.current++;
+        localSource.current = undefined;
+        setLocal(undefined);
         loadAbort.current?.abort();
         setTour(undefined);
         setSteps([]);
@@ -594,272 +774,508 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         setNarration(undefined);
         setPhase('pick');
       };
+  // After a merge the PR is done: back to the list, saying so.
+  const showMerged = (notice: string) => {
+    setPickerNotice(notice);
+    if (back) back();
+    else setBanner(notice);
+  };
 
   // ---------- screens ----------
   const width = columns;
   const height = rows;
-
-  // A screen with the theme picker over it while open. The element tree is the same either way,
-  // so opening the picker never remounts the screen and loses its state.
-  const withThemePicker = (screen: (active: boolean) => ReactNode) => (
-    <ReviewPopup background={screen(!theme.open)} width={width} height={height} maxWidth={100} maxHeight={30}>
-      {theme.open ? theme.popup : undefined}
+  // While the quit question is up, the screen under it takes no keys: KeysLive quiets every
+  // handler under it, popups included.
+  const live = !quitAsk;
+  // Every screen sits in the same popup frame, so asking to quit never remounts it.
+  return (
+    <ReviewPopup background={<KeysLive.Provider value={live}>{screens()}</KeysLive.Provider>} width={width} height={height} maxWidth={Math.min(width - 2, 72)} maxHeight={4} tone="decision">
+      {quitAsk
+        ? (w) => (
+            <Box flexDirection="column" paddingX={1}>
+              <Text color="yellow" wrap="truncate">
+                {quitAsk}
+              </Text>
+              <KeyBar
+                width={w - 2}
+                accent
+                keys={[]}
+                end={[
+                  ['y', 'quit'],
+                  ['esc', 'stay'],
+                ]}
+              />
+            </Box>
+          )
+        : undefined}
     </ReviewPopup>
   );
 
-  if (phase === 'pick') {
-    return withThemePicker((active) => (
-      <PickerScreen
-        store={store}
-        notice={pickerNotice}
+  function screens(): ReactNode {
+    // A screen with the theme picker over it while open. The element tree is the same either way,
+    // so opening the picker never remounts the screen and loses its state.
+    const withThemePicker = (screen: (active: boolean) => ReactNode) => (
+      <ReviewPopup background={screen(!theme.open && live)} width={width} height={height} maxWidth={100} maxHeight={30} tone="input">
+        {theme.open ? theme.popup : undefined}
+      </ReviewPopup>
+    );
+
+    // A merge started from the picker has no checkout: a model drafting its message gets an empty
+    // directory to work in, and the PR's own text in the prompt.
+    const mergeAgent = (cwd?: string) => (opts.agent && !opts.noAgent ? { cwd: cwd ?? emptyDir(), ...opts.agent } : undefined);
+    const mergePopup = (background: ReactNode, t: Target, withTour?: Tour) => (
+      <MergePopup
+        background={background}
+        width={columns}
+        height={rows}
+        repo={t.repo}
+        number={t.number}
+        tour={withTour}
+        agent={mergeAgent(withTour ? worktree || undefined : undefined)}
+        onCancel={() => setMerging(undefined)}
+        onQuit={requestQuit}
+        onDone={(notice) => {
+          setMerging(undefined);
+          setMerged((m) => new Set(m).add(keyFor(t)));
+          showMerged(notice);
+        }}
+      />
+    );
+    const checksPopup = (background: ReactNode, t: Target) => (
+      <ChecksPopup background={background} width={columns} height={rows} repo={t.repo} number={t.number} onClose={() => setChecking(undefined)} onQuit={requestQuit} />
+    );
+    if (phase === 'pick') {
+      const picker = (active: boolean) => (
+        <PickerScreen
+          store={store}
+          notice={pickerNotice}
+          width={width}
+          height={height}
+          active={active}
+          onPick={(t, as) => {
+            setPickerNotice(undefined);
+            setTarget(t);
+            void load(t, opts.fresh, as ?? 'review');
+          }}
+          onLocal={
+            opts.localRepo
+              ? () => {
+                  setPickerNotice(undefined);
+                  localSource.current = { cwd: opts.localRepo! };
+                  const t = { repo: 'local', number: 0 };
+                  setTarget(t);
+                  void load(t, opts.fresh, 'review');
+                }
+              : undefined
+          }
+          readLocalChanges={readLocalChanges}
+          onMerge={setMerging}
+          onChecks={setChecking}
+          onReviewers={setAskingReviewers}
+          reload={pickerReload}
+          merged={merged}
+          downloads={downloads}
+          onDownload={startDownloads}
+          onTheme={theme.show}
+          onQuit={requestQuit}
+        />
+      );
+      if (merging) return mergePopup(picker(false), merging);
+      if (checking) return checksPopup(picker(false), checking);
+      if (askingReviewers)
+        return (
+          <ReviewersPopup
+            background={picker(false)}
+            width={columns}
+            height={rows}
+            repo={askingReviewers.repo}
+            number={askingReviewers.number}
+            onQuit={requestQuit}
+            onClose={(changed) => {
+              setAskingReviewers(undefined);
+              if (changed) setPickerReload((n) => n + 1);
+            }}
+          />
+        );
+      return withThemePicker(picker);
+    }
+    if (phase === 'error') {
+      return <ErrorScreen message={error} width={width} onRetry={() => target && void load(target, true, mode)} onBack={back} onQuit={requestQuit} />;
+    }
+    if (phase === 'own' && target) {
+      return (
+        <OwnPrompt
+          target={target}
+          title={prTitle}
+          onFeedback={() => void load(target, opts.fresh, 'author')}
+          onTour={() => void load(target, opts.fresh, 'review')}
+          onBack={back}
+          onQuit={requestQuit}
+        />
+      );
+    }
+    const introLines = (spinner: string): IntroLine[] => {
+      const shown: IntroLine[] = steps
+        .slice(-INTRO_STEPS)
+        .map((s) => [s.done ? { text: '✓', color: 'green' } : { text: spinner, color: 'cyan' }, { text: ` ${s.name}`, color: s.done ? 'gray' : 'white' }]);
+      return [
+        target ? `${target.repo}#${target.number}` : 'Preparing the tour',
+        tour?.title ?? prTitle ?? ' ',
+        ' ',
+        ...shown,
+        ...Array.from({ length: INTRO_STEPS - shown.length }, () => ' '),
+        ' ',
+        [{ text: `The briefing opens as soon as it is written · ${back ? 'q for the PR list · Q to quit' : 'q to quit'}`, dim: true }],
+      ];
+    };
+    if (phase === 'load' || !tour) {
+      return <TourIntro width={width} height={height} lines={introLines} onBack={back} onQuit={requestQuit} />;
+    }
+    const agent =
+      tour.mode === 'agent' && worktree
+        ? {
+            cwd: worktree,
+            ...opts.agent,
+            sessions: agentSessions.current,
+            // Writes one small row; the tour itself is not rewritten.
+            rememberSession: (role: AgentRole, sessionId: string) => {
+              agentSessions.current[role] = sessionId;
+              store.saveSession(tour.repo, tour.pr, tour.headSha, role, sessionId);
+            },
+          }
+        : undefined;
+    // Why AI features are off, said in their place.
+    const aiOff = agent
+      ? undefined
+      : opts.noAgent
+        ? 'AI is off for this review (no model in gr config, or --no-agent), so questions are off.'
+        : 'The model is unavailable for this tour, so questions are off. The briefing says why.';
+
+    if (phase === 'author') {
+      // Author mode reads its tour statically, so its model use goes by the config, not the tour.
+      const authorAgent =
+        opts.agent && !opts.noAgent && worktree
+          ? {
+              cwd: worktree,
+              ...opts.agent,
+              sessions: agentSessions.current,
+              rememberSession: (role: AgentRole, sessionId: string) => {
+                agentSessions.current[role] = sessionId;
+                store.saveSession(tour.repo, tour.pr, tour.headSha, role, sessionId);
+              },
+            }
+          : undefined;
+      return withThemePicker((active) => (
+        <AuthorMode
+          key={`${tour.repo}#${tour.pr}@${tour.headSha}`}
+          tour={tour}
+          chapters={allChapters}
+          worktree={worktree}
+          store={store}
+          agent={authorAgent}
+          aiOff={authorAgent ? undefined : 'AI is off (no model in gr config, or --no-agent), so questions and drafted replies are off.'}
+          newHead={newHead}
+          writing={steps.some((st) => st.name === 'Writing briefing' && !st.done) ? 'Writing the summary and chapter titles…' : undefined}
+          width={width}
+          height={height}
+          active={active}
+          onReload={() => target && void load(target, false, 'author')}
+          onFullTour={() => {
+            if (!target) return;
+            askedOwn.current.add(keyFor(target));
+            void load(target, opts.fresh, 'review');
+          }}
+          onMerged={showMerged}
+          onTheme={theme.show}
+          onBack={back}
+          onQuit={requestQuit}
+        />
+      ));
+    }
+
+    // One index per checkout and head; its caches never invalidate, so preview mode, where the
+    // working tree changes under it, gets a fresh one for each composer.
+    const indexFor = (): RepoIndex | undefined => {
+      if (!worktree) return undefined;
+      const make = () => new RepoIndex({ root: worktree, headSha: tour.headSha, changedFiles: tour.files.map((f) => f.path) });
+      if (local) return make();
+      const key = `${worktree}\0${tour.headSha}`;
+      if (repoIndex.current?.key !== key) repoIndex.current = { key, index: make() };
+      return repoIndex.current.index;
+    };
+    const references: ReferenceServices = {
+      host: githubWebHost(),
+      repoIndex: indexFor,
+      recent: () => recent.current,
+      noteRecent: (loc) => {
+        recent.current = pushRecent(recent.current, loc);
+      },
+    };
+    const composerEnv: ComposerEnv = {
+      tour,
+      root: worktree || undefined,
+      host: references.host,
+      agent,
+      generate: generateSuggestion,
+      recent: references.recent,
+      noteRecent: references.noteRecent,
+      repoIndex: indexFor,
+    };
+
+    // Where n on the briefing picks up: the saved position, named for the key bar. Read only when
+    // the briefing is drawn, not on every render of every screen.
+    const resumeLabel = () => {
+      const saved = store.getPosition(tour.repo, tour.pr);
+      const ci = saved ? chapters.findIndex((c) => c.id === saved.chapterId) : -1;
+      if (!saved || ci < 0) return undefined;
+      const hi = saved.hunkId ? chapters[ci].hunkIds.indexOf(saved.hunkId) : -1;
+      const at = hunkPosition(chapters[ci], hi);
+      return `resume · chapter ${ci + 1}${hi >= 0 ? `, hunk ${at.n}/${at.total}` : ''}`;
+    };
+    const briefingScreen = (active: boolean) => (
+      <BriefingScreen
+        resume={resumeLabel()}
+        notice={postedNotice?.key === `${tour.repo}#${tour.pr}` ? postedNotice.text : undefined}
+        tour={tour}
+        chapters={chapters}
+        allChapters={allChapters}
+        order={order}
+        cycleOrder={cycleOrder}
+        deltaOnly={deltaOnly}
+        toggleDelta={toggleDelta}
+        states={states}
+        analyzing={narration ? `narrating ${narration.done}/${narration.total}` : analyzing ? 'narrating' : undefined}
+        agent={agent}
+        aiOff={aiOff}
         width={width}
         height={height}
         active={active}
-        onPick={(t) => {
-          setPickerNotice(undefined);
-          setTarget(t);
-          void load(t);
-        }}
-        downloads={downloads}
-        onDownload={startDownloads}
         onTheme={theme.show}
-        onQuit={quit}
+        onStart={resume}
+        onSubmit={() => {
+          setSubmitFrom('briefing');
+          setPhase('submit');
+        }}
+        readiness={readiness}
+        onMerge={!local && readiness && readiness.level !== 'merged' && readiness.level !== 'closed' ? () => target && setMerging(target) : undefined}
+        // Your own PR: t goes back to its feedback, as t on the feedback briefing opens this tour.
+        onChecks={!local && target ? () => setChecking(target) : undefined}
+        onFeedback={!local && target && tour.viewer && tour.viewer === tour.author ? () => void load(target, false, 'author') : undefined}
+        onBack={back}
+        onQuit={requestQuit}
       />
-    ));
-  }
-  if (phase === 'error') {
-    return <ErrorScreen message={error} onRetry={() => target && void load(target, true)} onBack={back} onQuit={quit} />;
-  }
-  const introLines = (spinner: string): IntroLine[] => {
-    const shown: IntroLine[] = steps
-      .slice(-INTRO_STEPS)
-      .map((s) => [s.done ? { text: '✓', color: 'green' } : { text: spinner, color: 'cyan' }, { text: ` ${s.name}`, color: s.done ? 'gray' : 'white' }]);
-    return [
-      target ? `${target.repo}#${target.number}` : 'Preparing the tour',
-      tour?.title ?? prTitle ?? ' ',
-      ' ',
-      ...shown,
-      ...Array.from({ length: INTRO_STEPS - shown.length }, () => ' '),
-      ' ',
-      [{ text: `The briefing opens as soon as it is written · ${back ? 'q for the PR list · Q to quit' : 'q to quit'}`, dim: true }],
-    ];
-  };
-  if (phase === 'load' || !tour) {
-    return <TourIntro width={width} height={height} lines={introLines} onBack={back} onQuit={quit} />;
-  }
-  const agent =
-    tour.mode === 'agent' && worktree
-      ? {
-          cwd: worktree,
-          ...opts.agent,
-          sessions: agentSessions.current,
-          // Writes one small row; the tour itself is not rewritten.
-          rememberSession: (role: AgentRole, sessionId: string) => {
-            agentSessions.current[role] = sessionId;
-            store.saveSession(tour.repo, tour.pr, tour.headSha, role, sessionId);
-          },
-        }
-      : undefined;
-  // Why AI features are off, said in their place.
-  const aiOff = agent
-    ? undefined
-    : opts.noAgent
-      ? 'AI is off for this review (no model in gr config, or --no-agent), so questions are off.'
-      : 'The model is unavailable for this tour, so questions are off. The briefing says why.';
-
-  // One index per checkout and head; its caches never invalidate, so preview mode, where the
-  // working tree changes under it, gets a fresh one for each composer.
-  const indexFor = (): RepoIndex | undefined => {
-    if (!worktree) return undefined;
-    const make = () => new RepoIndex({ root: worktree, headSha: tour.headSha, changedFiles: tour.files.map((f) => f.path) });
-    if (opts.preview) return make();
-    const key = `${worktree}\0${tour.headSha}`;
-    if (repoIndex.current?.key !== key) repoIndex.current = { key, index: make() };
-    return repoIndex.current.index;
-  };
-  const references: ReferenceServices = {
-    host: githubWebHost(),
-    repoIndex: indexFor,
-    recent: () => recent.current,
-    noteRecent: (loc) => {
-      recent.current = pushRecent(recent.current, loc);
-    },
-  };
-  const composerEnv: ComposerEnv = {
-    tour,
-    root: worktree || undefined,
-    host: references.host,
-    agent,
-    generate: generateSuggestion,
-    recent: references.recent,
-    noteRecent: references.noteRecent,
-    repoIndex: indexFor,
-  };
-
-  const briefingScreen = (active: boolean) => (
-    <BriefingScreen
-      tour={tour}
-      chapters={chapters}
-      allChapters={allChapters}
-      order={order}
-      cycleOrder={cycleOrder}
-      deltaOnly={deltaOnly}
-      toggleDelta={toggleDelta}
-      states={states}
-      analyzing={analyzing}
-      agent={agent}
-      aiOff={aiOff}
-      width={width}
-      height={height}
-      active={active}
-      onTheme={theme.show}
-      onStart={resume}
-      onSubmit={() => {
-        setSubmitFrom('briefing');
-        setPhase('submit');
-      }}
-      onBack={back}
-      onQuit={quit}
-    />
-  );
-  const chapterScreen = (active: boolean) => (
-    <ChapterScreen
-      tour={tour}
-      services={services}
-      references={references}
-      chapters={chapters}
-      allChapters={allChapters}
-      states={states}
-      drafts={drafts}
-      ci={Math.min(pos.ci, Math.max(0, chapters.length - 1))}
-      hi={pos.hi}
-      order={order}
-      deltaOnly={deltaOnly}
-      banner={banner ?? (analyzing ? `⟳ ${analyzing}` : undefined)}
-      agent={agent}
-      aiOff={aiOff}
-      width={width}
-      height={height}
-      active={active}
-      setPos={setPos}
-      setState={setHunkState}
-      saveDraft={saveDraft}
-      deleteDraft={(d) => {
-        store.deleteDraft(d.id);
-        setDrafts(store.listDrafts(d.repo, d.pr));
-      }}
-      replyToThread={opts.preview ? undefined : sendThreadReply}
-      reactToComment={opts.preview ? undefined : reactToComment}
-      moveHunk={(h, chapterId) => {
-        for (const k of hunkKeys(h)) store.setMove(tour.repo, tour.pr, k, chapterId);
-        setMoves(store.getMoves(tour.repo, tour.pr));
-      }}
-      toggleOrder={cycleOrder}
-      hideWhitespace={hideWhitespace}
-      toggleWhitespace={() => toggleView('hideWhitespace', hideWhitespace, setHideWhitespace)}
-      splitDiff={splitDiff}
-      toggleSplit={() => toggleView('splitDiff', splitDiff, setSplitDiff)}
-      hideTestPane={hideTestPane}
-      toggleTestPane={() => setHideTestPane((h) => !h)}
-      toggleDelta={toggleDelta}
-      openSubmit={() => {
-        setSubmitFrom('chapter');
-        setPhase('submit');
-      }}
-      openBriefing={() => setPhase('briefing')}
-      openInAgent={(h, c) => void openInAgent(h, c)}
-      rebase={newHead && target ? () => void load(target, false) : undefined}
-      onTheme={theme.show}
-      back={back}
-      quit={quit}
-    />
-  );
-  const submitBackground = () => (submitFrom === 'briefing' ? briefingScreen(false) : chapterScreen(false));
-  if (phase === 'briefing') return withThemePicker(briefingScreen);
-  if (phase === 'edit' && editing && editState) {
-    return (
-      <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={96} maxHeight={editState.ai ? 30 : 16}>
-        {(dialogWidth, dialogHeight) => (
-          <CommentEditor
-            draft={editing}
-            target={editing.anchor.type === 'line' || editing.anchor.type === 'range' ? `${editing.anchor.file}:${editing.anchor.line}` : 'flow'}
-            hunk={editing.anchor.type === 'line' || editing.anchor.type === 'range' ? tour.hunks[editing.anchor.hunkId] : undefined}
-            width={dialogWidth}
-            aiRows={editState.ai ? Math.max(4, dialogHeight - aiChromeRows(editState, dialogWidth)) : undefined}
-            env={composerEnv}
-            state={editState}
-            setState={(f) => setEditState((s) => (s ? f(s) : s))}
-            onCancel={() => setPhase('submit')}
-            onSave={(d) => {
-              saveDraft(d);
-              setPhase('submit');
-            }}
-          />
-        )}
-      </ReviewPopup>
     );
-  }
-  if (phase === 'submit') {
-    if (opts.preview) {
+    const chapterScreen = (active: boolean) => (
+      <ChapterScreen
+        tour={tour}
+        services={services}
+        references={references}
+        chapters={chapters}
+        allChapters={allChapters}
+        states={states}
+        drafts={drafts}
+        ci={Math.min(pos.ci, Math.max(0, chapters.length - 1))}
+        hi={pos.hi}
+        order={order}
+        deltaOnly={deltaOnly}
+        banner={banner}
+        busy={narration ? `narrating ${narration.done}/${narration.total}` : analyzing ? 'narrating' : undefined}
+        agent={agent}
+        aiOff={aiOff}
+        width={width}
+        height={height}
+        active={active}
+        setPos={setPos}
+        setState={setHunkState}
+        saveDraft={saveDraft}
+        deleteDraft={(d) => {
+          store.deleteDraft(d.id);
+          setDrafts(store.listDrafts(d.repo, d.pr));
+        }}
+        replyToThread={local ? undefined : sendThreadReply}
+        reactToComment={local ? undefined : reactToComment}
+        moveHunk={(h, chapterId) => {
+          for (const k of hunkKeys(h)) store.setMove(tour.repo, tour.pr, k, chapterId);
+          setMoves(store.getMoves(tour.repo, tour.pr));
+        }}
+        toggleOrder={cycleOrder}
+        hideWhitespace={hideWhitespace}
+        toggleWhitespace={() => toggleView('hideWhitespace', hideWhitespace, setHideWhitespace)}
+        splitDiff={splitDiff}
+        toggleSplit={() => toggleView('splitDiff', splitDiff, setSplitDiff)}
+        sidebar={sidebar}
+        toggleSidebar={() => toggleView('sidebar', sidebar, setSidebar)}
+        shortExplanation={shortExplanation}
+        toggleExplanation={() => toggleView('shortExplanation', shortExplanation, setShortExplanation)}
+        takeTip={takeTip}
+        hideTestPane={hideTestPane}
+        toggleTestPane={() => setHideTestPane((h) => !h)}
+        toggleDelta={toggleDelta}
+        openSubmit={() => {
+          setSubmitFrom('chapter');
+          setPhase('submit');
+        }}
+        openBriefing={() => setPhase('briefing')}
+        openInAgent={(h, c) => void openInAgent(h, c)}
+        rebase={newHead && target ? () => void load(target, false, 'review') : undefined}
+        onTheme={theme.show}
+        quit={requestQuit}
+      />
+    );
+    const submitBackground = () => (submitFrom === 'briefing' ? briefingScreen(false) : chapterScreen(false));
+    if (phase === 'briefing' && merging) return mergePopup(briefingScreen(false), merging, tour);
+    if (phase === 'briefing' && checking) return checksPopup(briefingScreen(false), checking);
+    if (phase === 'briefing') return withThemePicker(briefingScreen);
+    if (phase === 'edit' && editing && editState) {
       return (
-        <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={76} maxHeight={9}>
-          {() => <PreviewSubmit onBack={() => setPhase(submitFrom)} />}
+        <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={96} maxHeight={editState.ai ? 30 : 16} tone="input">
+          {(dialogWidth, dialogHeight) => (
+            <CommentEditor
+              draft={editing}
+              target={editing.anchor.type === 'line' || editing.anchor.type === 'range' ? `${editing.anchor.file}:${editing.anchor.line}` : 'flow'}
+              hunk={editing.anchor.type === 'line' || editing.anchor.type === 'range' ? tour.hunks[editing.anchor.hunkId] : undefined}
+              width={dialogWidth}
+              aiRows={editState.ai ? Math.max(4, dialogHeight - aiChromeRows(editState, dialogWidth)) : undefined}
+              env={composerEnv}
+              state={editState}
+              setState={(f) => setEditState((s) => (s ? f(s) : s))}
+              onCancel={() => setPhase('submit')}
+              onDelete={() => {
+                store.deleteDraft(editing.id);
+                setDrafts(store.listDrafts(editing.repo, editing.pr));
+                setPhase('submit');
+              }}
+              onSave={(d) => {
+                saveDraft(d);
+                setPhase('submit');
+              }}
+            />
+          )}
         </ReviewPopup>
       );
     }
-    return (
-      <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={104} maxHeight={34}>
-        {(dialogWidth, dialogHeight) => (
-          <SubmitScreen
-            tour={tour}
-            checklist={chapters.flatMap((c) => c.checklist ?? [])}
-            confirms={confirms}
-            chapters={chapters}
-            states={states}
-            drafts={drafts}
-            width={dialogWidth}
-            height={dialogHeight}
-            onEdit={(d) => {
-              setEditing(d);
-              setEditState(initComposer(d, { index: indexFor() }));
-              setPhase('edit');
-            }}
-            onDelete={(d) => {
-              store.deleteDraft(d.id);
-              setDrafts(store.listDrafts(tour.repo, tour.pr));
-            }}
-            onPosted={(ids, review, moved) => {
-              store.markPosted(ids);
-              setDrafts(store.listDrafts(tour.repo, tour.pr));
-              setPickerNotice(`Posted review for ${tour.repo}#${tour.pr}: ${review.url}${moved.length ? ` · ${moved.length} comment(s) re-anchored` : ''}`);
-              setPhase('pick');
-            }}
-            onBack={() => setPhase(submitFrom)}
-          />
-        )}
-      </ReviewPopup>
-    );
+    if (phase === 'submit') {
+      if (local) {
+        return (
+          <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={76} maxHeight={9} tone="decision">
+            {() => <PreviewSubmit onBack={() => setPhase(submitFrom)} />}
+          </ReviewPopup>
+        );
+      }
+      return (
+        <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={104} maxHeight={34} tone="decision">
+          {(dialogWidth, dialogHeight) => (
+            <SubmitScreen
+              tour={tour}
+              checklist={chapters.flatMap((c) => c.checklist ?? [])}
+              confirms={confirms}
+              chapters={chapters}
+              states={states}
+              drafts={drafts}
+              width={dialogWidth}
+              height={dialogHeight}
+              onEdit={(d) => {
+                setEditing(d);
+                setEditState(initComposer(d, { index: indexFor() }));
+                setPhase('edit');
+              }}
+              onDelete={(d) => {
+                store.deleteDraft(d.id);
+                setDrafts(store.listDrafts(tour.repo, tour.pr));
+              }}
+              onPosted={(ids, review, moved) => {
+                store.markPosted(ids);
+                setDrafts(store.listDrafts(tour.repo, tour.pr));
+                const notice = `Posted review for ${tour.repo}#${tour.pr}: ${review.url}${moved.length ? ` · ${plural(moved.length, 'comment')} re-anchored` : ''}`;
+                setPickerNotice(notice);
+                setPostedNotice({ key: `${tour.repo}#${tour.pr}`, text: notice });
+                setPhase('pick');
+              }}
+              onBack={() => setPhase(submitFrom)}
+              onQuit={requestQuit}
+            />
+          )}
+        </ReviewPopup>
+      );
+    }
+    return withThemePicker(chapterScreen);
   }
-  return withThemePicker(chapterScreen);
 }
 
 // ---------- small screens ----------
 
 const INTRO_STEPS = 6;
 
-function ErrorScreen(props: { message: string; onRetry: () => void; onBack?: () => void; onQuit: () => void }) {
-  useInput((input) => {
-    if (input === 'r') props.onRetry();
+let scratch: string | undefined;
+// An empty directory, made once, for a model call that has no checkout to read. It is removed
+// when the process exits, however the app was quit.
+function emptyDir(): string {
+  if (!scratch) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gr-merge-'));
+    scratch = dir;
+    process.once('exit', () => {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    });
+  }
+  return scratch;
+}
+
+function OwnPrompt(props: { target: Target; title?: string; onFeedback: () => void; onTour: () => void; onBack?: () => void; onQuit: () => void }) {
+  useInput((input, key) => {
+    if (key.return || input === 'f') props.onFeedback();
+    if (input === 't') props.onTour();
+    if (key.escape) props.onBack?.();
     if (input === 'q') (props.onBack ?? props.onQuit)();
     if (input === 'Q') props.onQuit();
   });
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Text color="red" bold>
-        Could not open the tour
+      <Text bold>
+        {props.target.repo}#{props.target.number} {props.title ? sanitizeTerminal(props.title) : ''}
       </Text>
-      <Text>{props.message}</Text>
-      <Text dimColor>r: retry · {props.onBack ? 'q: PR list · Q: quit' : 'q: quit'}</Text>
+      <Text>This is your PR. Open the feedback on it (Enter) or the full tour (t)?</Text>
+      <Text dimColor>The feedback lists the review threads to answer, in order; gr feedback opens it directly.</Text>
+      <Hints
+        keys={[
+          ['enter', 'feedback'],
+          ['t', 'full tour'],
+          ...((props.onBack
+            ? [
+                ['q', 'PR list'],
+                ['Q', 'quit'],
+              ]
+            : [['q', 'quit']]) as Hint[]),
+        ]}
+      />
+    </Box>
+  );
+}
+
+function ErrorScreen(props: { message: string; width: number; onRetry: () => void; onBack?: () => void; onQuit: () => void }) {
+  useInput((input, key) => {
+    if (input === 'r') props.onRetry();
+    if (key.escape) props.onBack?.();
+    if (input === 'q') (props.onBack ?? props.onQuit)();
+    if (input === 'Q') props.onQuit();
+  });
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <ErrorBlock message={props.message} failed="Could not open the tour" width={Math.max(20, props.width - 2)} />
+      <Hints
+        keys={[
+          ['r', 'retry'],
+          ...((props.onBack
+            ? [
+                ['q', 'PR list'],
+                ['Q', 'quit'],
+              ]
+            : [['q', 'quit']]) as Hint[]),
+        ]}
+      />
     </Box>
   );
 }

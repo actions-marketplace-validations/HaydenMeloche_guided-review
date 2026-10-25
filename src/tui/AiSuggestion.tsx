@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text } from './themed.js';
 import { SuggestionError } from '../agent/suggest.js';
 import { linesHash, referencedRefs } from '../review/refs.js';
@@ -10,6 +10,7 @@ import { readLines } from './references.js';
 import { TextInput } from './TextInput.js';
 import { truncate, wrap } from './nav.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
+import { G } from './glyphs.js';
 
 // Ctrl+T in the composer: ask the Q&A model for replacement code, on one line under the body
 // so the code it replaces stays in view. The result is a proposal: checked for shape only,
@@ -149,16 +150,16 @@ type Row = { kind: 'input' } | { kind: 'text'; text: string; color?: string; dim
 // inline slot, so this is the one place that decides what is shown.
 export function aiRows(ai: AiState, original: string, applies: Applicability, width: number, budget = Infinity, frame = 0): Row[] {
   if (ai.phase === 'prompt') return Array.from({ length: Math.min(2, wrap(ai.instruction, Math.max(10, width - 2)).length) || 1 }, () => ({ kind: 'input' }));
-  if (ai.phase === 'running') return [{ kind: 'text', text: `✦ ${SPIN[frame % SPIN.length]} generating…${ai.streamed ? ` ${ai.streamed} chars` : ''}`, dim: true }];
+  if (ai.phase === 'running') return [{ kind: 'text', text: `${G.model} ${SPIN[frame % SPIN.length]} generating…${ai.streamed ? ` ${ai.streamed} chars` : ''}`, dim: true }];
   if (ai.phase === 'error')
-    return wrap(`✦ ${ai.error ?? ''}`, Math.max(10, width))
+    return wrap(`${G.model} ${ai.error ?? ''}`, Math.max(10, width))
       .slice(0, 3)
       .map((text) => ({ kind: 'text', text, color: ai.tone === 'warn' ? 'yellow' : 'red' }));
   const r = ai.result!;
   const marker: Row = {
     kind: 'text',
-    text: '✦ proposal',
-    color: 'yellow',
+    text: `${G.model} proposal`,
+    color: 'magenta',
     bold: true,
     tail: ` · not verified · ${applies.ok ? `applies on L${applies.startLine === applies.line ? applies.line : `${applies.startLine}-${applies.line}`}` : `⚠ ${applies.reason}`}`,
     tailColor: applies.ok ? undefined : 'yellow',
@@ -183,11 +184,11 @@ export const aiChromeRows = (st: ComposerState, width: number) => 6 + Math.min(A
 const LIST_MIN_ROWS = 7; // the list's usual rows plus its hint line
 
 // The compact composer's rows other than an open list: border, header, labels, the body's
-// rows, a suggestion if any, and the key and footer lines.
+// rows, a suggestion if any, and the footer line.
 function listChromeRows(st: ComposerState, width: number): number {
   const body = Math.min(8, wrap(st.body + ' ', Math.max(10, width - 4)).length);
-  const suggestion = st.suggestion !== undefined ? 2 + Math.min(8, st.suggestion.split('\n').length) : 0;
-  return 6 + body + suggestion + 2;
+  const suggestion = st.suggestion !== undefined ? 1 + Math.min(8, st.suggestion.split('\n').length) : 0;
+  return 6 + body + suggestion + 1;
 }
 
 // The inline composer's slot under the code: its usual rows, or room for the AI line and its
@@ -217,7 +218,7 @@ export function AiSuggestionView(props: { ai: AiState; tour: Tour; state: Compos
   if (ai.phase === 'prompt')
     return (
       <Box>
-        <Text color="cyan">{'✦ '}</Text>
+        <Text color="magenta">{`${G.model} `}</Text>
         <TextInput value={ai.instruction} onChange={props.onInstruction} onSubmit={props.onSubmit} width={width - 2} maxRows={rows.length} placeholder={truncate(PLACEHOLDER, width - 3)} />
       </Box>
     );

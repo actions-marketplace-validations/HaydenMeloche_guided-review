@@ -1,20 +1,27 @@
 import { useMemo, useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text } from './themed.js';
+import { Confirm } from './Confirm.js';
 import type { Chapter, ChecklistItem, Draft, Tour } from '../types.js';
-import { buildReviewPayload, groupByLabel, LABELS, postingNote, suggestVerdict } from '../review/submit.js';
+import { buildReviewPayload, EVENT_TEXT, groupByLabel, LABELS, postingNote, suggestVerdict } from '../review/submit.js';
 import { postReview, type ReviewPayload } from '../github/gh.js';
 import { githubWebHost } from '../github/auth.js';
 import { progress, truncate, type States } from './nav.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
-import { LABEL_COLOR } from './CommentEditor.js';
+import { LabelChip } from './CommentEditor.js';
 import { TextInput } from './TextInput.js';
 import { KeyBar } from './KeyBar.js';
 import { PostPreview } from './PostPreview.js';
 import { suggestionStillApplies } from './composer.js';
+import { Help } from './Help.js';
+import { helpOf } from './keys.js';
+import { plural } from './plural.js';
+import { SUBMIT_KEYS, submitBar } from './screenKeys.js';
+import { Working } from './Spinner.js';
+import { fileIcon } from './icons.js';
+import { TitleBar } from './TitleBar.js';
 
 type Event = ReviewPayload['event'];
-const EVENT_TEXT: Record<Event, string> = { APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes', COMMENT: 'Comment' };
 
 // Lists drafts by label, unread hunks and a suggested verdict. Nothing posts until the reviewer
 // presses P and confirms. A draft that posting will change (moved, plain-code suggestion, review
@@ -33,6 +40,7 @@ export function SubmitScreen(props: {
   host?: string; // web host for links; githubWebHost() by default
   onPosted: (ids: string[], review: { id: number; url: string }, moved: { draftId: string; note: string }[]) => void;
   onBack: () => void;
+  onQuit?: () => void; // Q
 }) {
   const { tour, states, width } = props;
   const pending = useMemo(() => props.drafts.filter((d) => !d.posted), [props.drafts]);
@@ -44,7 +52,7 @@ export function SubmitScreen(props: {
   const [event, setEvent] = useState<Event>(verdict.event);
   const [sel, setSel] = useState(0);
   const [summary, setSummary] = useState('');
-  const [mode, setMode] = useState<'list' | 'summary' | 'confirm' | 'posting' | 'confirm-delete' | 'preview'>('list');
+  const [mode, setMode] = useState<'list' | 'summary' | 'confirm' | 'posting' | 'confirm-delete' | 'preview' | 'help'>('list');
   const [result, setResult] = useState('');
   const host = useMemo(() => props.host ?? githubWebHost(), [props.host]);
   // Posting, the preview and the hints share these options, so each shows what posts.
@@ -80,10 +88,11 @@ export function SubmitScreen(props: {
         return setMode('list');
       }
       if (mode === 'confirm-delete') {
-        if (input === 'y' && ordered[sel]) props.onDelete(ordered[sel]);
+        if ((input === 'y' || key.return) && ordered[sel]) props.onDelete(ordered[sel]);
         return setMode('list');
       }
       if (key.escape || input === 'q') return props.onBack();
+      if (input === 'Q') return props.onQuit?.();
       if (input === 'j' || key.downArrow) return setSel((s) => Math.min(Math.max(0, ordered.length - 1), s + 1));
       if (input === 'k' || key.upArrow) return setSel((s) => Math.max(0, s - 1));
       if (input === 'e' && ordered[sel]) return props.onEdit(ordered[sel]);
@@ -92,13 +101,14 @@ export function SubmitScreen(props: {
       if (input === 'a') return setEvent('APPROVE');
       if (input === 'r') return setEvent('REQUEST_CHANGES');
       if (input === 'c') return setEvent('COMMENT');
-      if (input === 'b') return setMode('summary');
+      if (input === '?' || input === 'h') return setMode('help');
+      if (input === 'w') return setMode('summary');
       if (input === 'P') {
         if (event === 'REQUEST_CHANGES' && !pending.length && !summary.trim()) return setResult('Requesting changes needs at least one comment or a summary.');
         return setMode('confirm');
       }
     },
-    { isActive: mode !== 'summary' && mode !== 'posting' && mode !== 'preview' },
+    { isActive: mode !== 'summary' && mode !== 'posting' && mode !== 'preview' && mode !== 'help' },
   );
 
   function openPreview(d: Draft) {
@@ -110,6 +120,7 @@ export function SubmitScreen(props: {
 
   const listRoom = Math.max(3, props.height - 14 - unread.length);
 
+  if (mode === 'help') return <Help title="submit" sections={helpOf(SUBMIT_KEYS)} width={width} height={props.height} onClose={() => setMode('list')} />;
   if (mode === 'preview' && previewing) {
     return (
       <Box flexDirection="column" width={width} height={props.height} paddingX={1}>
@@ -122,9 +133,7 @@ export function SubmitScreen(props: {
 
   return (
     <Box flexDirection="column" width={width} height={props.height} paddingX={1}>
-      <Text bold wrap="truncate">
-        Submit review · <Text color="cyan">{safe(tour.repo)}</Text> #{tour.pr} {truncate(tour.title, width - 30)}
-      </Text>
+      <TitleBar repo={tour.repo} title={`#${tour.pr} ${tour.title}`} where="submit review" width={width - 2} />
       <Box marginTop={1} flexDirection="column">
         <Text>
           Suggested: <Text bold>{EVENT_TEXT[verdict.event]}</Text>
@@ -149,7 +158,7 @@ export function SubmitScreen(props: {
         {mode === 'summary' ? (
           <TextInput value={summary} onChange={setSummary} onSubmit={() => setMode('list')} width={width - 4} placeholder="Optional review body" maxRows={4} />
         ) : (
-          <Text dimColor={!summary}>{safe(summary) || '(none — b to write one)'}</Text>
+          <Text dimColor={!summary}>{safe(summary) || '(none — w to write one)'}</Text>
         )}
       </Box>
       <Box marginTop={1} flexDirection="column">
@@ -161,9 +170,9 @@ export function SubmitScreen(props: {
           lastLabel = d.label;
           const where =
             d.anchor.type === 'line'
-              ? `${d.anchor.file}:${d.anchor.line}`
+              ? `${fileIcon(d.anchor.file)}${d.anchor.file}:${d.anchor.line}`
               : d.anchor.type === 'range'
-                ? `${d.anchor.file}:${d.anchor.startLine}-${d.anchor.line}`
+                ? `${fileIcon(d.anchor.file)}${d.anchor.file}:${d.anchor.startLine}-${d.anchor.line}`
                 : d.anchor.type === 'chapter'
                   ? `flow ${props.chapters.find((c) => c.id === (d.anchor as { chapterId: string }).chapterId)?.title ?? ''}`
                   : 'diagram node';
@@ -176,7 +185,8 @@ export function SubmitScreen(props: {
           return (
             <Text key={d.id} wrap="truncate">
               <Text inverse={i === sel}>
-                <Text color={LABEL_COLOR[d.label]}>{header.padEnd(11)}</Text>
+                {header ? <LabelChip label={d.label} /> : null}
+                {' '.repeat(Math.max(1, 13 - (header ? header.length + 2 : 0)))}
                 {text}
               </Text>
               {note ? <Text dimColor>{`  ${note}`}</Text> : null}
@@ -205,24 +215,20 @@ export function SubmitScreen(props: {
       <Box flexGrow={1} />
       {result ? <Text color="red">{safe(result)}</Text> : null}
       {mode === 'confirm' ? (
-        <Text color="yellow" bold>
-          Post a "{EVENT_TEXT[event]}" review with {pending.length} comment(s) to {safe(tour.repo)}#{tour.pr}? Y / n
-        </Text>
+        <Confirm yes="post">
+          Post a "{EVENT_TEXT[event]}" review with {plural(pending.length, 'comment')} to {safe(tour.repo)}#{tour.pr}?
+        </Confirm>
       ) : mode === 'confirm-delete' ? (
-        <Text color="yellow">Delete this draft? y / n</Text>
+        <Confirm yes="delete">Delete this draft?</Confirm>
       ) : mode === 'posting' ? (
-        <Text color="yellow">Posting…</Text>
+        <Working label={`posting the review to ${safe(tour.repo)}#${tour.pr}`} color="yellow" />
       ) : (
         <KeyBar
           width={width}
-          keys={[
-            ['P', 'post'],
+          keys={submitBar()}
+          end={[
             ['esc', 'back'],
-            ['a/r/c', 'verdict'],
-            ['b', 'summary'],
-            ['j/k', 'select'],
-            ['e/x', 'draft'],
-            ['p', 'preview as posted'],
+            ['?', 'keys'],
           ]}
         />
       )}

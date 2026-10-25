@@ -1,12 +1,11 @@
 import { useState } from 'react';
-import { useInput } from 'ink';
+import { useInput } from './input.js';
 import { Box, Text } from './themed.js';
 import type { ChecklistItem } from '../types.js';
-import { MdLineView, renderMarkdown } from './markdown.js';
+import { MdLineView, renderMarkdown, type MdLine } from './markdown.js';
 import { truncate } from './nav.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
-
-const box = (color: string) => ({ flexDirection: 'column' as const, borderStyle: 'round' as const, borderColor: color, paddingX: 1 });
+import { Hints } from './KeyBar.js';
 
 // ---------- Team checklist ----------
 
@@ -22,7 +21,7 @@ export function ChecklistPanel(props: { items: ChecklistItem[]; confirms: Record
     if ((input === ' ' || key.return) && it) props.onToggle(it.id, !props.confirms[it.id]);
   });
   return (
-    <Box {...box('green')} width={props.width}>
+    <Box flexDirection="column" paddingX={1} width={props.width}>
       <Text bold>
         Team checklist <Text dimColor>· agent pre-check, your confirmation</Text>
       </Text>
@@ -43,7 +42,12 @@ export function ChecklistPanel(props: { items: ChecklistItem[]; confirms: Record
           </Box>
         );
       })}
-      <Text dimColor>space: confirm / unconfirm · esc: close</Text>
+      <Hints
+        keys={[
+          ['space', 'confirm / unconfirm'],
+          ['esc', 'close'],
+        ]}
+      />
     </Box>
   );
 }
@@ -51,8 +55,9 @@ export function ChecklistPanel(props: { items: ChecklistItem[]; confirms: Record
 // ---------- Small prompts ----------
 
 // Full-screen scrollable text, e.g. the PR description.
-export function Reader(props: { title: string; markdown: string; width: number; height: number; onClose: () => void }) {
-  const lines = renderMarkdown(props.markdown, Math.min(props.width - 4, 100));
+// `lines`: text already laid out (the explanation), in place of `markdown`.
+export function Reader(props: { title: string; markdown?: string; lines?: MdLine[]; width: number; height: number; onClose: () => void }) {
+  const lines = props.lines ?? renderMarkdown(props.markdown ?? '', props.width - 4);
   const room = Math.max(3, props.height - 4);
   const [top, setTop] = useState(0);
   const maxTop = Math.max(0, lines.length - room);
@@ -71,7 +76,14 @@ export function Reader(props: { title: string; markdown: string; width: number; 
           <MdLineView key={top + i} line={l} />
         ))}
       </Box>
-      <Text dimColor>{`j/k / space: scroll · esc: back${lines.length > room ? ` · ${Math.round(((top + room) / lines.length) * 100)}%` : ''}`}</Text>
+      <Hints
+        keys={[
+          ['j/k', 'scroll'],
+          ['space', 'page'],
+          ['esc', 'back'],
+        ]}
+        note={lines.length > room ? `${Math.round(((top + room) / lines.length) * 100)}%` : undefined}
+      />
     </Box>
   );
 }
