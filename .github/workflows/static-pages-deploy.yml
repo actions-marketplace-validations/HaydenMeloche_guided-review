@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
         with:
           # The released commit, not master's tip; empty on a manual run, which checks out the chosen branch
           ref: ${{ github.event.workflow_run.head_sha }}
