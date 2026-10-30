@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useInput } from './input.js';
 import { Box, Text, useSelected, useTheme } from './themed.js';
 import { ROLES } from './theme.js';
-import type { Chapter, ChapterOrder, Flag, Tour } from '../types.js';
+import type { Chapter, ChapterOrder, ExistingThread, Flag, Tour } from '../types.js';
 import { chapterState, meter, ORDER_LABEL, pad, progress, riskMark, stateMark, type States } from './nav.js';
 import { DiagramView } from './DiagramView.js';
 import { renderGraph } from '../diagram/text.js';
@@ -26,6 +26,7 @@ import { TONE_COLOR, unboundKey, useFlash } from './flash.js';
 import { helpOf, readsKey } from './keys.js';
 import { hasSidePanel } from './breakpoints.js';
 import { TitleBar } from './TitleBar.js';
+import { Confirm } from './Confirm.js';
 
 // Rows each block may take; the chapters get the rest of the screen.
 const BUDGET = { intent: 4, description: 6, flags: 3, reviews: 2, blast: 2 };
@@ -76,6 +77,15 @@ const FLAG_COLOR: Record<string, string> = {
 
 // One screen: the goal, an overview diagram, the chapter list with reading state
 // and size, and anything flagged up front.
+// "3 open review threads and 2 resolved", or just the one kind when the PR has only that.
+function threadCounts(threads: ExistingThread[]): string {
+  const resolved = threads.filter((t) => t.isResolved).length;
+  const open = threads.length - resolved;
+  if (!resolved) return plural(open, 'open review thread');
+  if (!open) return plural(resolved, 'resolved review thread');
+  return `${plural(open, 'open review thread')} and ${resolved} resolved`;
+}
+
 export function BriefingScreen(props: {
   tour: Tour;
   chapters: Chapter[];
@@ -100,6 +110,7 @@ export function BriefingScreen(props: {
   onFeedback?: () => void; // t: the feedback on your own PR (author mode)
   onChecks?: () => void; // c: the PR's checks and their logs
   onTheme?: () => void; // L: the color theme picker
+  onRestart?: () => void; // restart the tour: every hunk unread again, from the start
   onBack?: () => void; // esc, q: back to the PR list; unset (a preview), q quits
   onQuit: () => void;
 }) {
@@ -109,7 +120,7 @@ export function BriefingScreen(props: {
   const { flash, show: showFlash, dismiss: dismissFlash } = useFlash();
   const [noticeSeen, setNoticeSeen] = useState<string>();
   const notice = props.notice && props.notice !== noticeSeen ? props.notice : undefined;
-  const [overlay, setOverlay] = useState<'none' | 'diagram' | 'ask' | 'read' | 'reviews' | 'help' | 'palette'>('none');
+  const [overlay, setOverlay] = useState<'none' | 'diagram' | 'ask' | 'read' | 'reviews' | 'help' | 'palette' | 'restart'>('none');
   useEffect(() => setSel(0), [props.order]);
   // D keeps the selected chapter when it is in both lists.
   const keepSel = useRef<string | undefined>(undefined);
@@ -175,6 +186,20 @@ export function BriefingScreen(props: {
       if (none && !readsKey(REVIEW_BRIEFING_KEYS, input)) showFlash(none, 'quiet');
     },
     { isActive: props.active !== false && overlay === 'none' },
+  );
+  // Restarting asks first, where the key bar was: y or Enter restarts, any other key keeps reading.
+  const reviewed = useMemo(() => {
+    const p = progress(tour, states);
+    return p.read + p.skipped + p.deferred;
+  }, [tour, states]);
+  useInput(
+    (input, key) => {
+      setOverlay('none');
+      if (input !== 'y' && !key.return) return;
+      props.onRestart?.();
+      showFlash(`Tour restarted: ${plural(reviewed, 'hunk')} unread again. n starts from the beginning.`, 'info');
+    },
+    { isActive: props.active !== false && overlay === 'restart' },
   );
 
   if (overlay === 'read') {
@@ -401,7 +426,7 @@ export function BriefingScreen(props: {
           ))}
         </Box>
       ) : null}
-      {tour.existingThreads.length ? <Text dimColor>{plural(tour.existingThreads.length, 'existing review thread')} shown inline.</Text> : null}
+      {tour.existingThreads.length ? <Text dimColor>{threadCounts(tour.existingThreads)} shown inline.</Text> : null}
       {tour.overview && diagramBelowH >= 6 ? (
         <Box marginTop={1} height={diagramBelowH} overflow="hidden" flexShrink={0}>
           <DiagramView graph={tour.overview} width={leftW} height={diagramBelowH} interactive={false} />
@@ -446,26 +471,30 @@ export function BriefingScreen(props: {
       ) : (
         <Text> </Text>
       )}
-      <KeyBar
-        width={width}
-        accent
-        // Keys hinted where they apply on screen (D, f, d beside the overview, r under a cut-off
-        // description) stay off the bar.
-        keys={reviewBriefingBar({
-          start: props.resume ?? 'start',
-          agent: !!props.agent,
-          readDescription: descAll.length <= BUDGET.description,
-          diagram: !(wide && tour.overview),
-          feedback: !!props.onFeedback,
-          checks: !!props.onChecks,
-          theme: !!props.onTheme,
-        })}
-        extraEnd={[PALETTE_HINT]}
-        end={[
-          ['?', 'keys'],
-          ['q', props.onBack ? 'PR list' : 'quit'],
-        ]}
-      />
+      {overlay === 'restart' ? (
+        <Confirm yes="restart">Mark the {plural(reviewed, 'hunk')} you went through unread and start the tour over? Drafts stay.</Confirm>
+      ) : (
+        <KeyBar
+          width={width}
+          accent
+          // Keys hinted where they apply on screen (D, f, d beside the overview, r under a cut-off
+          // description) stay off the bar.
+          keys={reviewBriefingBar({
+            start: props.resume ?? 'start',
+            agent: !!props.agent,
+            readDescription: descAll.length <= BUDGET.description,
+            diagram: !(wide && tour.overview),
+            feedback: !!props.onFeedback,
+            checks: !!props.onChecks,
+            theme: !!props.onTheme,
+          })}
+          extraEnd={[PALETTE_HINT]}
+          end={[
+            ['?', 'keys'],
+            ['q', props.onBack ? 'PR list' : 'quit'],
+          ]}
+        />
+      )}
     </Box>
   );
   // The palette: the briefing's commands, then every chapter to open.
@@ -480,6 +509,7 @@ export function BriefingScreen(props: {
       ...(props.onMerge ? [{ label: 'Merge the PR', key: 'M', run: () => props.onMerge?.() }] : []),
       ...(props.onChecks ? [{ label: 'Checks and their logs', key: 'c', run: () => props.onChecks?.() }] : []),
       ...(props.onTheme ? [{ label: 'Color theme', key: 'L', run: () => props.onTheme?.() }] : []),
+      ...(props.onRestart && reviewed ? [{ label: 'Restart the tour: mark every hunk unread', run: () => setOverlay('restart') }] : []),
       ...chapters.map((c, i) => ({ label: `Go to chapter ${i + 1}: ${c.title}`, detail: plural(c.hunkIds.length, 'hunk'), run: () => props.onStart(i) })),
     ];
     return (

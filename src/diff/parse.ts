@@ -200,5 +200,40 @@ export function parseUnifiedDiff(diff: string): { files: DiffFile[]; hunks: Hunk
       return h.id;
     });
   }
+  numberCopies(hunks);
   return { files, hunks };
 }
+
+// The same change made in several places of one file (a line added to 15 tests) would share a
+// hash, and so a read state: each copy after the first gets its place among them, hash#2, hash#3.
+// Hunks in diff order. A fused hunk's parts are numbered the same way, so a tour saved before
+// copies were numbered can be numbered as it loads; numbering twice changes nothing.
+export function numberCopies(hunks: Hunk[]) {
+  const seen = new Map<string, number>();
+  const number = (k: string) => {
+    const n = (seen.get(k) ?? 0) + 1;
+    seen.set(k, n);
+    return n > 1 ? `${k}#${n}` : k;
+  };
+  for (const h of hunks) {
+    if (h.parts) h.parts = h.parts.map(number);
+    else h.contentHash = number(h.contentHash);
+  }
+}
+
+// What a hunk's copies share: its changed lines, wherever they are and however deep they're
+// indented (a field added to a mock in 20 files). Lines keep their indent relative to each other.
+// A change this short (a `}`, a `return;`) says too little to match it in other files.
+export const SAME_CHANGE_MIN_CHARS = 12;
+const changes = new WeakMap<Hunk, string>();
+export const sameChange = (h: Hunk): string => {
+  let k = changes.get(h);
+  if (k !== undefined) return k;
+  const changed = h.lines.filter((l) => l.kind !== 'ctx').map((l) => ({ sign: l.kind === 'add' ? '+' : '-', text: l.text.trimEnd() }));
+  const indent = Math.min(...changed.filter((l) => l.text).map((l) => l.text.length - l.text.trimStart().length));
+  k = changed.map((l) => l.sign + l.text.slice(indent)).join('\n');
+  if (!changed.length) k = h.contentHash;
+  else if (changed.map((l) => l.text.replace(/\s/g, '')).join('').length < SAME_CHANGE_MIN_CHARS) k = `${h.file}\0${k}`;
+  changes.set(h, k);
+  return k;
+};

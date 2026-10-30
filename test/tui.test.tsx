@@ -14,6 +14,7 @@ import { defaultRepoConfig } from '../src/config.js';
 import { buildReviewPayload } from '../src/review/submit.js';
 import { ChapterScreen } from '../src/tui/ChapterScreen.js';
 import { ThreadView } from '../src/tui/ThreadView.js';
+import { CommentLabels } from '../src/tui/CommentEditor.js';
 import { SubmitScreen } from '../src/tui/SubmitScreen.js';
 import { BriefingScreen, stripFileRefs } from '../src/tui/BriefingScreen.js';
 import { leadThenDim } from '../src/tui/chapter/guide.js';
@@ -320,7 +321,7 @@ describe('ChapterScreen', () => {
         }}
       />,
     );
-    await waitFor(() => expect(ui.lastFrame()).toContain('1 review thread · 2 comments · e to read'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('1 open review thread · 2 comments · e to read'));
     ui.stdin.write('e');
     await waitFor(() => expect(ui.lastFrame()).toContain('@alice'));
     expect(ui.lastFrame()).toContain('Could this fail?');
@@ -351,6 +352,32 @@ describe('ChapterScreen', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('Reply to review thread'));
     expect(ui.lastFrame()).toContain(line.text.trim().slice(0, 20));
     ui.unmount();
+  });
+  it('notes resolved threads apart from open ones, and says so in the thread', async () => {
+    const tour = fixtureTour();
+    const hunk = tour.hunks[tour.chapters[0].hunkIds[0]];
+    const line = hunk.lines.find((l) => l.kind === 'add')!;
+    const thread = (id: string, isResolved: boolean, body: string) => ({
+      id,
+      path: hunk.file,
+      line: line.newLine,
+      originalLine: line.newLine,
+      isResolved,
+      isOutdated: false,
+      comments: [{ id, author: 'alice', body, createdAt: '' }],
+    });
+    tour.existingThreads = [thread('t1', true, 'Settled already.')];
+    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('✓ 1 resolved thread · 1 comment · e to read'));
+    expect(ui.lastFrame()).not.toContain('open review thread');
+    ui.unmount();
+
+    tour.existingThreads = [thread('t1', true, 'Settled already.'), thread('t2', false, 'Still wondering.')];
+    const both = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
+    await waitFor(() => expect(both.lastFrame()).toContain('1 open review thread · 1 comment · e to read'));
+    expect(both.lastFrame()).toContain('✓ 1 resolved thread · 1 comment');
+    expect(both.lastFrame()).not.toContain('resolved thread · 1 comment · e to read');
+    both.unmount();
   });
   it('suggests repository collaborators in a draft mention', async () => {
     const tour = fixtureTour();
@@ -485,6 +512,33 @@ describe('ChapterScreen', () => {
     ui.unmount();
   });
 
+  it('offers no label in the comment box when labels are off', async () => {
+    const tour = fixtureTour();
+    const drafts: Draft[] = [];
+    const ui = render(
+      <CommentLabels value={false}>
+        <Harness tour={tour} onDraft={(d) => drafts.push(d)} onState={() => {}} />
+      </CommentLabels>,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('hunk 1/'));
+    ui.stdin.write('c');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Comment on'));
+    expect(ui.lastFrame()).toContain('posts as written');
+    expect(ui.lastFrame()).not.toMatch(/ blocking | question | suggestion | nit /);
+    expect(ui.lastFrame()).not.toContain('tab label');
+    ui.stdin.write('\t'); // does nothing
+    await tick();
+    ui.stdin.write('naming');
+    await tick();
+    ui.stdin.write('\r');
+    await waitFor(() => expect(drafts).toHaveLength(1));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Draft saved. Nothing posts until you submit.'));
+    // Under the line, the draft shows without a label chip.
+    expect(ui.lastFrame()).toMatch(/✎ naming/);
+    expect(ui.lastFrame()).not.toMatch(/ question +✎/);
+    ui.unmount();
+  });
+
   it('edits and deletes the draft on the selected line', async () => {
     const tour = fixtureTour();
     const drafts: Draft[] = [];
@@ -574,6 +628,112 @@ describe('ChapterScreen', () => {
     ui.stdin.write('x');
     const ids = tour.chapters[collapsedIdx].hunkIds;
     await waitFor(() => expect(Object.values(states).filter((v) => v === 'skipped')).toHaveLength(ids.length));
+    ui.unmount();
+  });
+
+  // Three hunks of one test file making the same change, and one other.
+  const copiesTour = () => {
+    const [a, b, c] = [1, 2, 3].map((n) => ({ ...hunkFromDiff('test/app.test.ts', ` ctx${n}`, '+  anyOrNull(),'), contentHash: n === 1 ? 'chg' : `chg#${n}` }));
+    const d = hunkFromDiff('test/app.test.ts', '-  oldCall(),', '+  newCall(),');
+    return makeTour([a, b, c, d], [{ kind: 'tests', title: 'Test-only changes', hunkIds: [a.id, b.id, c.id, d.id] }], { files: filesFor([a, b, c, d]) });
+  };
+
+  it('asks on n whether to read every copy of the same change, and y reads them all', async () => {
+    let states: States = {};
+    const ui = render(<Harness tour={copiesTour()} onDraft={() => {}} onState={(s) => (states = s)} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('↻ same change in 2 other hunks · 2 unread'));
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).toContain('The same change, 3 times in app.test.ts'));
+    expect(ui.lastFrame()).toContain('+ anyOrNull(),');
+    expect(ui.lastFrame()).toContain('2 other hunks making it are still unread.');
+    expect(ui.lastFrame()).toContain('read all 3');
+    expect(states).toEqual({});
+    ui.stdin.write('y');
+    await waitFor(() => expect(states).toEqual({ chg: 'read', 'chg#2': 'read', 'chg#3': 'read' }));
+    // On past the copies, to the other hunk.
+    await waitFor(() => expect(ui.lastFrame()).toContain('hunk 4/4'));
+    expect(ui.lastFrame()).toContain('the same change read in 3 hunks');
+    ui.unmount();
+  });
+
+  it('names the files when the copies of a change are in more than one', async () => {
+    const [a, b, c] = ['src/funding.mock.ts', 'src/prefund.mock.ts', 'src/product.mock.ts'].map((f, n) => ({
+      ...hunkFromDiff(f, ` ctx${n}`, `+${' '.repeat(2 * n + 2)}qualifyingRate: null,`),
+      contentHash: `chg${n}`,
+    }));
+    const t = makeTour([a, b, c], [{ kind: 'tests', title: 'Mocks', hunkIds: [a.id, b.id, c.id] }], { files: filesFor([a, b, c]) });
+    let states: States = {};
+    const ui = render(<Harness tour={t} onDraft={() => {}} onState={(s) => (states = s)} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('same change in 2 other hunks · 2 unread'));
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).toContain('The same change, 3 times in 3 files'));
+    expect(ui.lastFrame()).toMatch(/funding\.mock\.ts *│?\n.*prefund\.mock\.ts *│?\n.*product\.mock\.ts/);
+    ui.stdin.write('y');
+    await waitFor(() => expect(states).toEqual({ chg0: 'read', chg1: 'read', chg2: 'read' }));
+    ui.unmount();
+  });
+
+  it('reads the copies one at a time after Enter, without asking again, and esc stays', async () => {
+    let states: States = {};
+    const ui = render(<Harness tour={copiesTour()} onDraft={() => {}} onState={(s) => (states = s)} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('hunk 1/4'));
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).toContain('still unread'));
+    ui.stdin.write('\u001b');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('still unread'));
+    expect(ui.lastFrame()).toContain('hunk 1/4');
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).toContain('still unread'));
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('hunk 2/4'));
+    expect(states).toEqual({ chg: 'read' });
+    expect(ui.lastFrame()).toContain('same change in 2 other hunks · 1 unread');
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).toContain('hunk 3/4'));
+    expect(states).toEqual({ chg: 'read', 'chg#2': 'read' });
+    expect(ui.lastFrame()).toContain('all read');
+    ui.unmount();
+  });
+
+  it('n on a collapsed generated chapter marks its hunks read and moves on', async () => {
+    const gen = hunkFromDiff('src/gen/api.ts', '-export const a = 1;', '+export const a = 2;');
+    const gen2 = hunkFromDiff('src/gen/api.ts', '-export const b = 1;', '+export const b = 2;');
+    const t = makeTour([gen, gen2], [{ kind: 'generated', title: 'src/gen/api.ts', hunkIds: [gen.id, gen2.id], collapsed: true }], { files: filesFor([gen, gen2]) });
+    const states: States = {};
+    let writes = 0;
+    const ui = render(
+      <ChapterScreen
+        tour={t}
+        chapters={t.chapters}
+        states={{}}
+        drafts={[]}
+        ci={0}
+        hi={-1}
+        order="flow"
+        deltaOnly={false}
+        width={150}
+        height={40}
+        setPos={() => {}}
+        setState={(hs, st) => {
+          writes++;
+          for (const h of hs) states[h.id] = st;
+        }}
+        saveDraft={() => {}}
+        deleteDraft={() => {}}
+        moveHunk={() => {}}
+        toggleOrder={() => {}}
+        toggleDelta={() => {}}
+        openSubmit={() => {}}
+        openBriefing={() => {}}
+        openInAgent={() => {}}
+        quit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('collapsed'));
+    ui.stdin.write('n');
+    // Both hunks are marked read in one write.
+    await waitFor(() => expect(states).toEqual({ [gen.id]: 'read', [gen2.id]: 'read' }));
+    expect(writes).toBe(1);
     ui.unmount();
   });
 
@@ -817,6 +977,20 @@ describe('ThreadView', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('Final point'));
     ui.unmount();
   });
+  it('marks a resolved thread beside its title', () => {
+    const ui = render(
+      <ThreadView
+        threads={[{ id: 'done', path: 'src/a.ts', line: 1, isResolved: true, isOutdated: true, comments: [{ author: 'alice', body: 'Fixed, thanks.', createdAt: '' }] }]}
+        width={45}
+        height={9}
+        mentions={[]}
+        onClose={() => {}}
+      />,
+    );
+    expect(ui.lastFrame()).toContain('Thread 1  ✓ resolved · outdated');
+    expect(ui.lastFrame()).toContain('Fixed, thanks.');
+    ui.unmount();
+  });
 });
 
 describe('progress', () => {
@@ -878,6 +1052,54 @@ describe('BriefingScreen and SubmitScreen', () => {
     ui.stdin.write('V');
     await waitFor(() => expect(ui.lastFrame()).toContain('reviewer feedback'));
     expect(ui.lastFrame()).toContain('Please cover the error case.');
+    ui.unmount();
+  });
+  it('restarts the tour from the palette, after asking', async () => {
+    const tour = fixtureTour();
+    const read = Object.values(tour.hunks).slice(0, 2);
+    let restarted = 0;
+    const briefing = (states: States) => (
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        order="flow"
+        cycleOrder={() => {}}
+        states={states}
+        width={140}
+        height={45}
+        onStart={() => {}}
+        onSubmit={() => {}}
+        onRestart={() => restarted++}
+        onQuit={() => {}}
+      />
+    );
+    // Nothing read: nothing to restart.
+    const fresh = render(briefing({}));
+    fresh.stdin.write(':');
+    await waitFor(() => expect(fresh.lastFrame()).toContain('Change the chapter order'));
+    expect(fresh.lastFrame()).not.toContain('Restart the tour');
+    fresh.unmount();
+
+    const ui = render(briefing(Object.fromEntries(read.map((h) => [h.contentHash, 'read' as const]))));
+    ui.stdin.write(':');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Change the chapter order'));
+    ui.stdin.write('restart');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Restart the tour: mark every hunk unread'));
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Mark the 2 hunks you went through unread and start the tour over?'));
+    // Any other key keeps reading.
+    ui.stdin.write('x');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('start the tour over?'));
+    expect(restarted).toBe(0);
+    ui.stdin.write(':');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Change the chapter order'));
+    ui.stdin.write('restart');
+    await tick();
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('start the tour over?'));
+    ui.stdin.write('y');
+    await waitFor(() => expect(restarted).toBe(1));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Tour restarted: 2 hunks unread again.'));
     ui.unmount();
   });
   it('on your own PR, offers t to go back to its feedback', async () => {
@@ -1456,7 +1678,7 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     const ui = render(<Harness tour={t} onDraft={() => {}} onState={() => {}} onReply={async () => {}} />);
     await waitFor(() => expect(ui.lastFrame()).toContain('imports: 2 removed, 1 added · I to show'));
     expect(ui.lastFrame()).not.toContain("import { b } from './b'");
-    expect(ui.lastFrame()).toContain('1 review thread');
+    expect(ui.lastFrame()).toContain('1 open review thread');
     // The cursor starts on the code; k, past the blank line, lands on the folded row, which holds
     // the import's thread.
     expect(ui.lastFrame()).not.toContain('e thread');
