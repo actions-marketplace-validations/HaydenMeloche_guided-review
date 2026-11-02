@@ -61,7 +61,11 @@
           <ul>
             <li><code>Esc</code> closes the innermost open thing (a selection, a filter, a popup), or goes up one level. It never quits.</li>
             <li><code>q</code> goes up one level. On the PR list, and on the briefing of <code>gr preview</code>, it quits.</li>
-            <li><code>Q</code> quits from anywhere, asking first if you have unposted drafts or queued replies. They stay saved either way.</li>
+            <li>
+              <code>Q</code> quits from anywhere, asking first if you have unposted drafts or queued replies. They stay saved either way, and a line left in your terminal says where the review stands
+              and how to resume it, such as <code>acme/api#812 · 4/9 hunks read · 2 drafts saved, not posted · resume with gr review acme/api#812</code>.
+            </li>
+            <li><code>Ctrl+Z</code> suspends gr and gives you back your shell, as other terminal programs do; <code>fg</code> brings it back where you were.</li>
           </ul>
           <p>
             <code>?</code> (or <code>h</code>) lists the current screen&#39;s keys; <code>j</code>/<code>k</code> scroll it. On the briefing and in a chapter, <code>Tab</code> turns to a page
@@ -69,10 +73,13 @@
           </p>
           <h2 id="pick-a-pr"><a class="anchor" href="#pick-a-pr" aria-hidden="true">#</a>Pick a PR</h2>
           <p>
-            <code>gr</code> opens the PR list. <strong>Review requests</strong> shows PRs waiting for your review, grouped by repository. <strong>Your PRs</strong> shows your own open PRs that need
-            you: unresolved threads, a new review, changes requested, ready to merge, or no reviewers requested. A line under them counts the rest, which wait on reviewers. Each row shows its state
-            and checks (<code>✓ ready to merge</code>, <code>✗ checks failing</code>). On a wide terminal, a preview shows the description, files, checks, review decision, and whether a tour or drafts
-            already exist. The list refreshes every two minutes.
+            <code>gr</code> opens the PR list. <strong>Review requests</strong> shows PRs waiting for your review, grouped by repository. <strong>Reviewed by you</strong> shows open PRs you already
+            reviewed that have something new: commits since your review (<code>2 new commits</code>), or replies on threads you started (<code>1 reply to you</code>). A line under it counts the PRs
+            you reviewed with nothing new. A PR that asks for your review again moves back under Review requests. <strong>Your PRs</strong> shows your own open PRs that need you: unresolved threads, a
+            new review, changes requested, ready to merge, or no reviewers requested. A line under them counts the rest, which wait on reviewers. Each row shows its state and checks (<code
+              >✓ ready to merge</code
+            >, <code>✗ checks failing</code>). On a wide terminal, a preview shows the description, files, checks, review decision, and whether a tour or drafts already exist. The list refreshes every
+            two minutes.
           </p>
           <div class="table-wrap">
             <table>
@@ -135,6 +142,13 @@
                   <td>Choose a <a href="configuration.html#color-themes">color theme</a>.</td>
                 </tr>
                 <tr>
+                  <td><code>U</code></td>
+                  <td>
+                    <a href="install.html#updating">Update <code>gr</code></a
+                    >, when the status line says a newer version is out.
+                  </td>
+                </tr>
+                <tr>
                   <td><code>?</code> / <code>q</code></td>
                   <td>List the keys, or quit.</td>
                 </tr>
@@ -151,14 +165,16 @@
           </p>
           <h2 id="read-the-tour"><a class="anchor" href="#read-the-tour" aria-hidden="true">#</a>Read the tour</h2>
           <p>
-            The <strong>briefing</strong> opens first. It shows whether the PR can merge, a summary, the author&#39;s description, recent reviewer feedback, the chapters with your progress and a ▲ on
-            risky ones, flagged gaps under <strong>Watch for</strong>, and an overview diagram. Chapter narration may continue in the background (<code>narrating 3/7</code>).
+            The <strong>briefing</strong> opens first. It shows whether the PR can merge, then the chapters with your progress, their size (<code>+55 −5</code> lines), and where the discussion is
+            (<code>2 open</code> review threads in yellow, or how many were resolved, leaving out outdated ones, and <code>✎ 1</code> for your drafts), then the author&#39;s description, recent
+            reviewer feedback, and an overview diagram. <code>i</code>, on the description&#39;s heading, asks the model for an AI description of the PR, written the first time you open it and kept
+            for the run. Chapter narration may continue in the background (<code>narrating 3/7</code>).
           </p>
           <figure class="shot">
             <a href="images/briefing.webp"
               ><img
                 src="images/briefing.webp"
-                alt="The briefing screen: whether the PR can merge, a summary of the PR, chapters in reading order with progress and risk, flagged gaps, the author's description, blast radius, and an overview diagram"
+                alt="The briefing screen: whether the PR can merge, a summary of the PR, chapters in reading order with progress and size, the author's description, and an overview diagram"
                 loading="lazy"
             /></a>
           </figure>
@@ -181,11 +197,15 @@
                 </tr>
                 <tr>
                   <td><code>f</code></td>
-                  <td>Cycle the order: <strong>Guided</strong> (recommended), <strong>Risk first</strong>, <strong>Small first</strong>, and <strong>File</strong>.</td>
+                  <td>
+                    Cycle the order: <strong>Guided</strong> (recommended), <strong>Risk first</strong>, <strong>Small first</strong>, <strong>File</strong>, and <strong>Commit</strong>. Commit order
+                    reads the PR the way it was written: a chapter per commit, oldest first, titled by its subject. A hunk is matched to the commits that added or removed its lines, and read once,
+                    under the first; it shows the code as it ends up, not as that commit left it. In a preview, uncommitted changes come last.
+                  </td>
                 </tr>
                 <tr>
-                  <td><code>r</code> / <code>d</code> / <code>V</code></td>
-                  <td>Read the full description, the overview diagram, or all submitted reviews.</td>
+                  <td><code>r</code> / <code>i</code> / <code>d</code> / <code>V</code></td>
+                  <td>Read the full description, generate an AI description of the PR (written when you first open it, then kept), explore the overview diagram, or read all submitted reviews.</td>
                 </tr>
                 <tr>
                   <td><code>a</code></td>
@@ -208,8 +228,8 @@
                   <td>Open <a href="#draft-and-submit-comments">submit</a>.</td>
                 </tr>
                 <tr>
-                  <td><code>:</code> / <code>L</code> / <code>?</code> / <code>q</code></td>
-                  <td>Command palette, theme, keys, or back to the PR list.</td>
+                  <td><code>:</code> / <code>?</code> / <code>q</code></td>
+                  <td>Command palette, keys, or back to the PR list.</td>
                 </tr>
               </tbody>
             </table>
@@ -220,8 +240,9 @@
           </p>
           <p>
             A <strong>chapter</strong> shows an explanation, the code hunk, risk and test status, review threads, and linked tests. From 110 columns the tests sit beside the code, and from 140 the
-            chapter list sits on the left. Generated, vendored, and mechanical changes start collapsed. Import-only changes form an optional chapter that <code>n</code>/<code>p</code> skip. Outdated
-            review threads are followed to where their lines are now.
+            chapter list sits on the left. The code keeps the width of its longest line and the tests take what is left; when that would leave the tests too narrow, they wait behind a tab that
+            <code>t</code> opens. Generated, vendored, and mechanical changes start collapsed. Import-only changes form an optional chapter that <code>n</code>/<code>p</code> skip. Outdated review
+            threads are followed to where their lines are now.
           </p>
           <figure class="shot">
             <a href="images/ask.webp"><img src="images/ask.webp" alt="A question about a changed line, answered inline below the code with file and line references" loading="lazy" /></a>
@@ -310,7 +331,10 @@
                 </tr>
                 <tr>
                   <td><code>e</code></td>
-                  <td>Open the review threads on the line. <code>Tab</code> selects a comment, <code>+</code> reacts.</td>
+                  <td>
+                    Open the review threads on the line. <code>Tab</code> selects a comment, <code>+</code> reacts, and <code>Z</code> resolves or unresolves the thread on GitHub after asking, such as
+                    your own thread once the author has fixed it.
+                  </td>
                 </tr>
                 <tr>
                   <td><code>y</code></td>
@@ -358,7 +382,10 @@
                 </tr>
                 <tr>
                   <td><code>x</code> / <code>z</code> / <code>u</code></td>
-                  <td>Mark the hunk skipped, deferred, or unread.</td>
+                  <td>
+                    Mark the hunk skipped, deferred, or unread. On a PR, a file whose hunks are all read or skipped is ticked <strong>Viewed</strong> on GitHub&#39;s Files tab, and files you ticked
+                    there open as read (<a href="configuration.html"><code>syncViewed</code></a> turns this off).
+                  </td>
                 </tr>
                 <tr>
                   <td><code>m</code></td>
@@ -369,20 +396,44 @@
                   <td>Change the chapter order.</td>
                 </tr>
                 <tr>
+                  <td><code>H</code></td>
+                  <td>
+                    History of the cursor line or selected range before the PR: the last ten commits that changed those lines, from <code>git log -L</code>, with each one&#39;s age, author, subject,
+                    and PR number. <code>Enter</code> shows a commit&#39;s change to them and <code>o</code> opens its PR. For added lines, it looks up the lines the hunk replaced.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code>B</code></td>
+                  <td>
+                    Blast radius: the places in files the PR leaves alone that use what this hunk changes, found by name, with the source around each. The explanation counts them, in yellow when a
+                    signature, table, or event changed.
+                  </td>
+                </tr>
+                <tr>
                   <td><code>D</code></td>
                   <td>On a re-review, switch between changes only and the full review.</td>
                 </tr>
                 <tr>
                   <td><code>R</code></td>
-                  <td>Rebuild the tour on a newer PR head.</td>
+                  <td>Rebuild the tour on a newer PR head, or, in a preview, on the edits you made with <code>E</code>.</td>
                 </tr>
                 <tr>
                   <td><code>i</code></td>
                   <td>Open the team checklist for this chapter.</td>
                 </tr>
                 <tr>
-                  <td><code>o</code></td>
-                  <td>Open your coding agent in the PR&#39;s checkout with this hunk as its prompt.</td>
+                  <td><code>Y</code> / <code>O</code></td>
+                  <td>
+                    Copy a permalink to the line, or the range you selected with <code>v</code>, pinned to the commit it is in; or open those lines on the PR&#39;s Files tab (with no browser, as over
+                    SSH, the link is copied instead). A preview has no GitHub link.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code>E</code></td>
+                  <td>
+                    Open the file at the cursor line in <code>$VISUAL</code> or <code>$EDITOR</code>. In a preview that is your own checkout, and an edit offers <code>R</code> to rebuild the tour; in
+                    a PR it is gr&#39;s copy of the head.
+                  </td>
                 </tr>
                 <tr>
                   <td><code>b</code> / <code>s</code></td>
@@ -393,12 +444,17 @@
                   <td>Show or hide the chapter list.</td>
                 </tr>
                 <tr>
-                  <td><code>:</code></td>
-                  <td>Command palette: every action, chapter, and file.</td>
+                  <td><code>/</code></td>
+                  <td>
+                    Search this diff, not the whole codebase: the lines of every hunk and their explanations, changed lines first, then context, then explanations. Lowercase matches any case; a
+                    capital letter matches exactly.
+                    <code>Enter</code> puts the cursor on the line without marking anything read, and <code>/</code> reopens the last search, so <code>↓</code> <code>Enter</code> goes to the next
+                    match.
+                  </td>
                 </tr>
                 <tr>
-                  <td><code>L</code></td>
-                  <td>Choose a color theme.</td>
+                  <td><code>:</code></td>
+                  <td>Command palette: every action, chapter, and file.</td>
                 </tr>
                 <tr>
                   <td><code>?</code> / <code>h</code></td>
@@ -418,8 +474,13 @@
             pane. Possible test gaps show as a line in the explanation; <code>U</code> expands them.
           </p>
           <p>
-            Risk scores flag changes to authentication, payments, migrations, public APIs, concurrency, and similar areas. The briefing may also flag likely missing migrations, changesets, docs, or
-            translations. These are prompts to look, not verdicts. The model can raise a hunk&#39;s risk but never lower it, so a PR&#39;s text can&#39;t talk the tour out of a warning.
+            The blast radius is the code a diff can&#39;t show: uses, in files the PR doesn&#39;t touch, of the exported functions, tables, and events it changes. They are found by name, so some may
+            be another symbol of the same name. When a signature, table, or event changed, the hunk&#39;s explanation says so in yellow, and the agent&#39;s narration says which of those uses the
+            change could break. <code>B</code> lists them with their source.
+          </p>
+          <p>
+            Risk scores flag changes to authentication, payments, migrations, public APIs, concurrency, and similar areas. These are prompts to look, not verdicts. The model can raise a hunk&#39;s
+            risk but never lower it, so a PR&#39;s text can&#39;t talk the tour out of a warning.
           </p>
           <p>The agent pre-checks the team&#39;s checklist items; confirm each one with <code>i</code>. Confirmations stay local.</p>
           <h2 id="draft-and-submit-comments"><a class="anchor" href="#draft-and-submit-comments" aria-hidden="true">#</a>Draft and submit comments</h2>
@@ -704,8 +765,8 @@
                   <td>Show or hide resolved threads.</td>
                 </tr>
                 <tr>
-                  <td><code>s</code> / <code>M</code> / <code>Y</code> / <code>L</code></td>
-                  <td>Send, merge, copy the link, or change the theme.</td>
+                  <td><code>s</code> / <code>M</code> / <code>Y</code></td>
+                  <td>Send, merge, or copy the link.</td>
                 </tr>
                 <tr>
                   <td><code>R</code></td>
@@ -794,7 +855,14 @@
                 </tr>
                 <tr>
                   <td><code>P</code></td>
-                  <td>Merge, after you confirm.</td>
+                  <td>
+                    Merge, after you confirm. When only checks, reviews, or branch protection block the PR, this turns on auto-merge instead, and GitHub merges it once they pass. The repository must
+                    allow auto-merge.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code>a</code></td>
+                  <td>Turn auto-merge off.</td>
                 </tr>
                 <tr>
                   <td><code>?</code></td>
@@ -804,25 +872,52 @@
             </table>
           </div>
           <p>The merge names the head commit you saw, so GitHub refuses it if someone pushed in the meantime.</p>
+          <h3 id="bot-prs"><a class="anchor" href="#bot-prs" aria-hidden="true">#</a>Bot PRs</h3>
+          <p>
+            A PR from a bot, such as a Dependabot or Renovate dependency bump, whose tour is only special chapters (dependencies, CI, config, and the like) opens on its chapter rather than the
+            briefing; <code>b</code> still shows the briefing. When you reach the end of a bot&#39;s PR with everything read, no drafts, and an approving verdict, the end card offers
+            <code>Enter</code> to approve and merge. It opens the merge dialog with the approval added: one confirmation approves the PR at the commit you toured, then merges it, or turns on
+            auto-merge, by the same rules as above. If commits arrived after your tour, it offers nothing until you read them; if GitHub still won&#39;t merge after the approval, the dialog says what
+            blocks it.
+          </p>
           <h2 id="preview-your-own-branch"><a class="anchor" href="#preview-your-own-branch" aria-hidden="true">#</a>Preview your own branch</h2>
           <p>
             <code>gr preview</code> (or <code>l</code> on the PR list) tours your branch before you open a PR, uncommitted changes included, against its merge base with the default branch. Commit
             messages stand in for the description. It works without <code>gh</code>.
           </p>
           <p>If the tour includes changes that aren&#39;t yours, your copy of the default branch is out of date: run <code>git fetch</code> and try again.</p>
+          <p>
+            For a stacked branch, <code>gr preview --base &lt;branch&gt;</code> compares with the branch it stacks on instead. To tour any other diff, use <code>gr diff</code>, which reads its
+            argument as <code>git diff</code> does:
+          </p>
+          <ul>
+            <li><code>gr diff</code>: your uncommitted changes.</li>
+            <li><code>gr diff HEAD~3</code>: the working tree against a commit, such as the last three commits a coding agent made.</li>
+            <li>
+              <code>gr diff v0.3.0..v0.4.0</code>: two commits, such as a release. gr reads the second from its own checkout under <code>~/.guided-review/worktrees</code>, so your working tree is left
+              alone; <code>gr cleanup</code> removes it. <code>a...b</code> compares <code>b</code> with its merge base with <code>a</code>.
+            </li>
+          </ul>
+          <p>As with a preview, there is nothing to post to, so drafts stay on your machine.</p>
           <h2 id="commands-and-options"><a class="anchor" href="#commands-and-options" aria-hidden="true">#</a>Commands and options</h2>
           <pre><code class="language-sh">gr                            # choose from PRs awaiting your review
 gr review 1234               # PR number in the current repository
 gr review https://github.com/owner/repo/pull/1234
 gr review owner/repo#1234
-gr review                    # current branch&#39;s open PR
+gr review                    # current branch&#39;s open PR; with none, offers gr preview
 gr feedback                  # work through the review on your own PR
 gr preview                   # tour the current branch before opening a PR
+gr preview --base parent     # against the branch it stacks on
+gr diff HEAD~3               # the working tree against a commit; gr diff a..b for two commits
+gr demo                      # try a tour of a sample change: offline, no PR, gh, or model
 gr open 1234                 # open a tour in a new tmux or Terminal window
 gr open --preview            # open gr preview in a new tmux or Terminal window
 gr build 1234 --comment      # build a tour without the TUI and post it to the PR (for CI)
 gr config                    # set up or change the model, GitHub access, and theme
 gr cleanup                   # remove managed worktrees and prune old tours
+gr doctor                    # check git, gh, ripgrep, your model and the rest, with fixes
+gr completion zsh            # print a shell completion script (zsh, bash, or fish)
+gr update                    # install the newest version of gr
 </code></pre>
           <div class="table-wrap">
             <table>
@@ -835,7 +930,7 @@ gr cleanup                   # remove managed worktrees and prune old tours
               <tbody>
                 <tr>
                   <td><code>--no-agent</code></td>
-                  <td>Build the tour from static analysis only, with no model calls.</td>
+                  <td>Build the tour from static analysis only, with no model calls. With <code>doctor</code>, skip the request to your model.</td>
                 </tr>
                 <tr>
                   <td><code>--fresh</code></td>
@@ -854,6 +949,10 @@ gr cleanup                   # remove managed worktrees and prune old tours
                   <td>With <code>open</code>, open <code>gr preview</code> instead of a PR.</td>
                 </tr>
                 <tr>
+                  <td><code>--base &lt;ref&gt;</code></td>
+                  <td>With <code>preview</code>, compare with this branch or commit instead of the default branch.</td>
+                </tr>
+                <tr>
                   <td><code>--days &lt;n&gt;</code></td>
                   <td>With <code>cleanup</code>, delete tours not opened in this many days (default 90).</td>
                 </tr>
@@ -865,10 +964,27 @@ gr cleanup                   # remove managed worktrees and prune old tours
             </table>
           </div>
           <p>
-            Models and keys live in the config file, not in options; see <a href="configuration.html">Configuration</a>. <code>GR_DEBUG=1</code> prints stack traces, and
-            <code>GR_DEBUG_MODEL</code> logs model calls (see <a href="configuration.html#debugging-model-calls">Debugging model calls</a>). <code>gr</code> checks npm for updates once a day and
-            offers them before a tour; <code>GR_NO_UPDATE_CHECK=1</code> turns that off. For terminal support and tmux settings, see <a href="terminals.html">Terminals</a>.
+            <code>gr doctor</code> checks what gr leans on outside itself: Node, git, <code>gh</code> and its sign-in (or a token set in <code>gr config</code>), ripgrep, the tree-sitter grammars,
+            your terminal&#39;s colors, a clipboard tool, how <code>gr open</code> opens a window, <code>$EDITOR</code>, your config, and the size of <code>~/.guided-review</code>. It sends one short
+            request to each model your config uses, as setup does; <code>--no-agent</code> skips that. Each line ends with what to do about it, and it exits with status 1 when something gr needs is
+            missing, so it is the output to paste into a bug report.
           </p>
+          <p>
+            Models and keys live in the config file, not in options; see <a href="configuration.html">Configuration</a>. <code>GR_DEBUG=1</code> prints stack traces, and
+            <code>GR_DEBUG_MODEL</code> logs model calls (see <a href="configuration.html#debugging-model-calls">Debugging model calls</a>). <code>gr</code> checks npm for updates once a day; see
+            <a href="install.html#updating">Updating</a>. For terminal support and tmux settings, see <a href="terminals.html">Terminals</a>.
+          </p>
+          <h3 id="shell-completion"><a class="anchor" href="#shell-completion" aria-hidden="true">#</a>Shell completion</h3>
+          <p>
+            <code>gr completion</code> prints a script that completes gr&#39;s commands and their options, branches and tags for <code>gr diff</code> (on either side of <code>..</code>) and
+            <code>--base</code>, and the repository&#39;s open PRs, by number and title, for <code>review</code>, <code>feedback</code>, <code>open</code>, and <code>build</code>. It completes
+            <code>guided-review</code> too. Load it from your shell&#39;s startup file:
+          </p>
+          <pre><code class="language-sh">eval "$(gr completion zsh)"     # ~/.zshrc, after compinit
+eval "$(gr completion bash)"    # ~/.bashrc
+gr completion fish | source     # ~/.config/fish/config.fish
+</code></pre>
+          <p>PR numbers come from GitHub as you press Tab, so they take a moment; outside a repository, or offline, there are none.</p>
           <h3 id="use-from-claude-code-or-codex"><a class="anchor" href="#use-from-claude-code-or-codex" aria-hidden="true">#</a>Use from Claude Code or Codex</h3>
           <ul>
             <li>

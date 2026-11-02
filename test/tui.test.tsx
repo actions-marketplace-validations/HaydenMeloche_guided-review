@@ -18,13 +18,25 @@ import { CommentLabels } from '../src/tui/CommentEditor.js';
 import { SubmitScreen } from '../src/tui/SubmitScreen.js';
 import { BriefingScreen, stripFileRefs } from '../src/tui/BriefingScreen.js';
 import { leadThenDim } from '../src/tui/chapter/guide.js';
+import { ChapterTitle } from '../src/tui/chapter/parts.js';
 import { ORDER_SEQUENCE, positionAfterOrderChange, progress, sortChapters, type States } from '../src/tui/nav.js';
 import { waitFor } from './helpers/waitFor.js';
 import { hunkKeys } from '../src/review/hunkState.js';
 import { filesFor, hunkFromDiff, tour as makeTour } from './fixtures/tour.js';
+import { writeClipboard } from '../src/util/clipboard.js';
 
 // Never reach GitHub from a test: confirming the submit screen posts through this.
-vi.mock('../src/agent/agent.js', async (orig) => ({ ...(await orig<typeof import('../src/agent/agent.js')>()), ask: vi.fn(async () => ({ value: 'An answer.' })) }));
+vi.mock('../src/agent/agent.js', async (orig) => ({
+  ...(await orig<typeof import('../src/agent/agent.js')>()),
+  ask: vi.fn(async () => ({ value: 'An answer.' })),
+  summarize: vi.fn(async (o: { onText: (t: string) => void }) => {
+    o.onText('Adds POST /invoices and');
+    return { value: 'Adds POST /invoices and a sales report.' };
+  }),
+}));
+// Never touch the real clipboard or browser: Y copies and O opens through these.
+vi.mock('../src/util/clipboard.js', async (orig) => ({ ...(await orig<typeof import('../src/util/clipboard.js')>()), writeClipboard: vi.fn(async () => 'tool' as const) }));
+vi.mock('../src/util/openExternal.js', () => ({ openExternal: vi.fn(async () => Promise.reject(new Error('no browser'))) }));
 vi.mock('../src/github/gh.js', async (orig) => ({ ...(await orig<typeof import('../src/github/gh.js')>()), postReview: vi.fn(async () => ({ id: 1, url: 'https://example.test/review/1' })) }));
 
 // A short settle for keypresses that change no output but must land before the next key
@@ -47,7 +59,6 @@ function fixtureTour(): Tour {
     headSha: 'b'.repeat(40),
     createdAt: '2026-10-09T00:00:00Z',
     intent: 'Adds POST /invoices.',
-    flags: built.flags,
     notes: built.notes,
     overview: built.overview,
     files,
@@ -64,6 +75,7 @@ function Harness(props: {
   onReply?: (body: string) => Promise<void>;
   onDelete?: (d: Draft) => void;
   onTheme?: () => void;
+  editFile?: (file: string, line: number) => Promise<string | undefined>;
   agent?: { cwd: string };
 }) {
   const { tour } = props;
@@ -105,7 +117,7 @@ function Harness(props: {
       toggleDelta={() => {}}
       openSubmit={() => {}}
       openBriefing={() => props.onBriefing?.()}
-      openInAgent={() => {}}
+      editFile={props.editFile}
       onTheme={props.onTheme}
       quit={() => {}}
     />
@@ -113,12 +125,73 @@ function Harness(props: {
 }
 
 describe('ChapterScreen', () => {
-  it('opens the color theme picker on L', async () => {
+  it('opens the color theme picker from the palette, not a key', async () => {
     const onTheme = vi.fn();
     const ui = render(<Harness tour={fixtureTour()} onDraft={() => {}} onState={() => {}} onTheme={onTheme} />);
     await tick();
     ui.stdin.write('L');
+    await tick();
+    expect(onTheme).not.toHaveBeenCalled();
+    ui.stdin.write(':');
+    await tick();
+    ui.stdin.write('color theme');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Color theme'));
+    ui.stdin.write('\r');
     await waitFor(() => expect(onTheme).toHaveBeenCalledTimes(1));
+    ui.unmount();
+  });
+
+  it('opens the file at the cursor line on E, and shows what the editor reports', async () => {
+    const tour = fixtureTour();
+    const hunk = tour.hunks[tour.chapters[0].hunkIds[0]];
+    const editFile = vi.fn(async () => 'Saved in gr’s copy of the PR head.');
+    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} editFile={editFile} />);
+    await tick();
+    ui.stdin.write('E');
+    await waitFor(() => expect(editFile).toHaveBeenCalledWith(hunk.file, hunk.lines.find((l) => l.newLine !== undefined)!.newLine));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Saved in gr’s copy of the PR head.'));
+    ui.unmount();
+  });
+
+  it('copies a permalink to the line on Y, and copies the Files tab link on O with no browser', async () => {
+    const tour = fixtureTour();
+    const hunk = tour.hunks[tour.chapters[0].hunkIds[0]];
+    const line = hunk.lines[0].newLine ?? hunk.lines[0].oldLine;
+    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
+    await tick();
+    ui.stdin.write('Y');
+    const pinned = `https://github.com/acme/billing/blob/${hunk.lines[0].kind === 'del' ? tour.baseSha : tour.headSha}/${hunk.file}#L${line}`;
+    await waitFor(() => expect(vi.mocked(writeClipboard)).toHaveBeenCalledWith(pinned));
+    ui.stdin.write('O');
+    await waitFor(() => expect(vi.mocked(writeClipboard)).toHaveBeenLastCalledWith(expect.stringMatching(/^https:\/\/github\.com\/acme\/billing\/pull\/7\/files#diff-[0-9a-f]{64}[RL]\d+$/)));
+    await waitFor(() => expect(ui.lastFrame()).toContain('No browser to open here: copied'));
+    ui.unmount();
+  });
+
+  it('searches the tour on /, and enter puts the cursor on the line in its chapter', async () => {
+    const tour = fixtureTour();
+    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
+    await tick();
+    expect(ui.lastFrame()).not.toContain('line 7');
+    ui.stdin.write('/');
+    await waitFor(() => expect(ui.lastFrame()).toContain('text in this diff or its explanations'));
+    ui.stdin.write('negative total');
+    await waitFor(() => expect(ui.lastFrame()).toContain('1 match · 1 chapter'));
+    expect(ui.lastFrame()).toContain('src/services/invoice.ts:7');
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('line 7'));
+    // / opens on the last search.
+    ui.stdin.write('/');
+    await waitFor(() => expect(ui.lastFrame()).toContain('1 match · 1 chapter'));
+    ui.unmount();
+  });
+
+  it('says a preview has no GitHub link', async () => {
+    const tour = { ...fixtureTour(), url: '' };
+    const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
+    await tick();
+    ui.stdin.write('Y');
+    await waitFor(() => expect(ui.lastFrame()).toContain('A preview has no GitHub link'));
     ui.unmount();
   });
 
@@ -169,7 +242,7 @@ describe('ChapterScreen', () => {
     ui.unmount();
   });
 
-  it('keeps both panes visible when the selected test has longer code', async () => {
+  it('keeps the source pane its width when the selected test has longer code', async () => {
     const tour = fixtureTour();
     const hunk = tour.hunks[tour.chapters[0].hunkIds[0]];
     hunk.tests = [
@@ -188,15 +261,13 @@ describe('ChapterScreen', () => {
     ui.stdin.write('t');
     await waitFor(() => expect(ui.lastFrame()).toContain('t/esc'));
     ui.stdin.write('n');
-    await waitFor(() => expect(boundary()).toBeLessThan(shortBoundary));
-    expect(ui.lastFrame()).toContain('long.test.ts');
+    await waitFor(() => expect(ui.lastFrame()).toContain('long.test.ts'));
     expect(ui.lastFrame()).toContain('invoice.total');
-    expect(ui.lastFrame()).toContain('import { Router }');
+    expect(ui.lastFrame()).toContain("import { createInvoice } from '../services/invoice.js';");
+    expect(boundary()).toBe(shortBoundary);
     ui.stdin.write('t');
-    // The layout should not change: wait for the key bar to leave test focus, then check it.
     await waitFor(() => expect(ui.lastFrame()).not.toContain('t/esc'));
-    expect(boundary()).toBeLessThan(shortBoundary);
-    expect(ui.lastFrame()).toContain('import { Router }');
+    expect(boundary()).toBe(shortBoundary);
     ui.unmount();
   });
 
@@ -257,18 +328,19 @@ describe('ChapterScreen', () => {
     ui.stdin.write('t');
     await tick();
     ui.stdin.write('n');
-    await waitFor(() => expect(ui.lastFrame()).toContain(second));
-    expect(ui.lastFrame()).not.toContain(assertion);
+    // The test pane takes what the source leaves, so long test lines wrap: match their start.
+    await waitFor(() => expect(ui.lastFrame()).toContain('it("rejects an invoice",'));
+    expect(ui.lastFrame()).not.toContain('expect(createInvoice())');
     ui.stdin.write('p');
     await waitFor(() => expect(ui.lastFrame()).toContain('expect(createInvoice())'));
-    expect(ui.lastFrame()).not.toContain(second);
+    expect(ui.lastFrame()).not.toContain('it("rejects an invoice",');
     ui.stdin.write('j');
     await waitFor(() => expect(ui.lastFrame()).toMatch(/▶\s*2\s*│\s*\+/));
     ui.stdin.write('c');
-    await waitFor(() => expect(ui.lastFrame()).toContain(`Comment on ${testFile}:2`));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Comment on test/new-invoice'));
     const commentRows = ui.lastFrame()!.split('\n');
     const selectedRow = commentRows.findIndex((row) => row.includes('▶') && row.includes('expect(createInvoice())'));
-    const editorRow = commentRows.findIndex((row) => row.includes(`Comment on ${testFile}:2`));
+    const editorRow = commentRows.findIndex((row) => row.includes('Comment on test/new-invoice'));
     expect(selectedRow).toBeGreaterThan(-1);
     expect(editorRow).toBeGreaterThan(selectedRow);
     expect(editorRow - selectedRow).toBeLessThanOrEqual(2);
@@ -280,9 +352,9 @@ describe('ChapterScreen', () => {
     expect(drafts[0].anchor).toEqual({ type: 'line', hunkId: 'test-hunk', file: testFile, line: 2, side: 'RIGHT' });
     expect(buildReviewPayload(tour, drafts, 'COMMENT', '').payload.comments[0]).toMatchObject({ path: testFile, line: 2, side: 'RIGHT' });
     ui.stdin.write('a');
-    await waitFor(() => expect(ui.lastFrame()).toContain(`Ask about ${testFile}:2`));
+    await waitFor(() => expect(ui.lastFrame()).toContain('Ask about'));
     const askRows = ui.lastFrame()!.split('\n');
-    const askLine = askRows.findIndex((row) => row.includes(`Ask about ${testFile}:2`));
+    const askLine = askRows.findIndex((row) => row.includes('Ask about'));
     expect(askLine).toBeGreaterThan(askRows.findIndex((row) => row.includes('▶') && row.includes('expect(createInvoice())')));
     ui.stdin.write('\u001b');
     await tick();
@@ -420,14 +492,16 @@ describe('ChapterScreen', () => {
 
   it('keeps test gap details collapsed until requested', async () => {
     const tour = fixtureTour();
-    tour.chapters[0].untestedBranches = ['src/routes/invoices.ts:8 — failed invoice creation'];
+    const first = tour.hunks[tour.chapters[0].hunkIds[0]];
+    first.tests = [];
+    first.coverage = 'untested';
     const ui = render(<Harness tour={tour} onDraft={() => {}} onState={() => {}} />);
-    await waitFor(() => expect(ui.lastFrame()).toContain('1 possible untested behavior'));
-    expect(ui.lastFrame()).not.toContain('failed invoice creation');
+    await waitFor(() => expect(ui.lastFrame()).toContain('No linked test · U: details'));
+    expect(ui.lastFrame()).not.toContain('No linked test case found');
     ui.stdin.write('U');
-    await waitFor(() => expect(ui.lastFrame()).toContain('failed invoice creation'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('No linked test case found'));
     ui.stdin.write('U');
-    await waitFor(() => expect(ui.lastFrame()).not.toContain('failed invoice creation'));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('No linked test case found'));
     ui.unmount();
   });
 
@@ -618,7 +692,6 @@ describe('ChapterScreen', () => {
           toggleDelta={() => {}}
           openSubmit={() => {}}
           openBriefing={() => {}}
-          openInAgent={() => {}}
           quit={() => {}}
         />
       );
@@ -645,7 +718,7 @@ describe('ChapterScreen', () => {
     ui.stdin.write('n');
     await waitFor(() => expect(ui.lastFrame()).toContain('The same change, 3 times in app.test.ts'));
     expect(ui.lastFrame()).toContain('+ anyOrNull(),');
-    expect(ui.lastFrame()).toContain('2 other hunks making it are still unread.');
+    expect(ui.lastFrame()).toContain('The other 2 are unread.');
     expect(ui.lastFrame()).toContain('read all 3');
     expect(states).toEqual({});
     ui.stdin.write('y');
@@ -678,12 +751,12 @@ describe('ChapterScreen', () => {
     const ui = render(<Harness tour={copiesTour()} onDraft={() => {}} onState={(s) => (states = s)} />);
     await waitFor(() => expect(ui.lastFrame()).toContain('hunk 1/4'));
     ui.stdin.write('n');
-    await waitFor(() => expect(ui.lastFrame()).toContain('still unread'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('are unread'));
     ui.stdin.write('\u001b');
-    await waitFor(() => expect(ui.lastFrame()).not.toContain('still unread'));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('are unread'));
     expect(ui.lastFrame()).toContain('hunk 1/4');
     ui.stdin.write('n');
-    await waitFor(() => expect(ui.lastFrame()).toContain('still unread'));
+    await waitFor(() => expect(ui.lastFrame()).toContain('are unread'));
     ui.stdin.write('\r');
     await waitFor(() => expect(ui.lastFrame()).toContain('hunk 2/4'));
     expect(states).toEqual({ chg: 'read' });
@@ -725,7 +798,6 @@ describe('ChapterScreen', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
       />,
     );
@@ -771,7 +843,6 @@ describe('ChapterScreen', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
       />,
     );
@@ -810,7 +881,6 @@ describe('ChapterScreen', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
       />,
     );
@@ -870,7 +940,6 @@ describe('ChapterScreen', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
       />
     );
@@ -894,6 +963,51 @@ describe('ChapterScreen', () => {
 });
 
 describe('ThreadView', () => {
+  it('resolves the thread on Z after asking, and refuses when GitHub says you can’t', async () => {
+    const calls: string[] = [];
+    function ResolveHarness(props: { canResolve?: boolean }) {
+      const [threads, setThreads] = useState<ExistingThread[]>([
+        { id: 'T1', path: 'src/a.ts', line: 4, isResolved: false, isOutdated: false, viewerCanResolve: props.canResolve, comments: [{ id: '1', author: 'me', body: 'Rename this?', createdAt: '' }] },
+      ]);
+      return (
+        <ThreadView
+          threads={threads}
+          width={70}
+          height={13}
+          mentions={[]}
+          onClose={() => {}}
+          onResolve={async (thread, resolved) => {
+            calls.push(`${thread.id}:${resolved}`);
+            setThreads((ts) => ts.map((t) => ({ ...t, isResolved: resolved })));
+          }}
+        />
+      );
+    }
+    const ui = render(<ResolveHarness />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('Z: resolve'));
+    await tick();
+    ui.stdin.write('Z');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Resolve the thread on src/a.ts:4?'));
+    // Anything but y or enter cancels.
+    ui.stdin.write('n');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('Resolve the thread'));
+    ui.stdin.write('Z');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Resolve the thread on src/a.ts:4?'));
+    ui.stdin.write('y');
+    await waitFor(() => expect(ui.lastFrame()).toContain('resolved'));
+    expect(calls).toEqual(['T1:true']);
+    expect(ui.lastFrame()).toContain('Z: unresolve');
+    ui.unmount();
+
+    const refused = render(<ResolveHarness canResolve={false} />);
+    await waitFor(() => expect(refused.lastFrame()).toContain('Z: resolve'));
+    await tick();
+    refused.stdin.write('Z');
+    await waitFor(() => expect(refused.lastFrame()).toContain('You can’t change whether this thread is resolved.'));
+    expect(calls).toEqual(['T1:true']);
+    refused.unmount();
+  });
+
   it('reacts to the selected comment and shows updated counts', async () => {
     let reacted = '';
     function ReactionsHarness() {
@@ -1036,6 +1150,50 @@ describe('chapter order', () => {
 });
 
 describe('BriefingScreen and SubmitScreen', () => {
+  it('shows the open threads and your drafts on each chapter row', async () => {
+    const tour = fixtureTour();
+    const first = tour.chapters[0];
+    const h = tour.hunks[first.hunkIds[0]];
+    const line = h.lines.find((l) => l.kind === 'add')!.newLine!;
+    tour.existingThreads = [
+      { id: 'T1', path: h.file, line, isResolved: false, isOutdated: false, comments: [{ author: 'dev', body: 'Why?', createdAt: '' }] },
+      { id: 'T2', path: h.file, line, isResolved: true, isOutdated: false, comments: [{ author: 'dev', body: 'Done', createdAt: '' }] },
+    ];
+    const draft = {
+      id: 'd1',
+      repo: tour.repo,
+      pr: tour.pr,
+      headSha: tour.headSha,
+      anchor: { type: 'chapter' as const, chapterId: first.id },
+      label: 'nit' as const,
+      body: 'x',
+      posted: false,
+      createdAt: '',
+    };
+    const ui = render(
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        drafts={[draft]}
+        order="flow"
+        cycleOrder={() => {}}
+        states={{}}
+        width={140}
+        height={45}
+        onStart={() => {}}
+        onSubmit={() => {}}
+        onQuit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('Chapters'));
+    const row = ui
+      .lastFrame()!
+      .split('\n')
+      .find((l) => /^\s*1 · /.test(l))!;
+    expect(row).toContain('1 open · ✎ 1');
+    ui.unmount();
+  });
+
   it('summarizes other reviewers and opens their full reviews', async () => {
     const tour = fixtureTour();
     tour.viewer = 'me';
@@ -1052,6 +1210,39 @@ describe('BriefingScreen and SubmitScreen', () => {
     ui.stdin.write('V');
     await waitFor(() => expect(ui.lastFrame()).toContain('reviewer feedback'));
     expect(ui.lastFrame()).toContain('Please cover the error case.');
+    ui.unmount();
+  });
+  it('opens on the static tour while the briefing is written, keeping the selection when it reorders', async () => {
+    const plain: Tour = { ...fixtureTour(), mode: 'plain' };
+    expect(plain.chapters.length).toBeGreaterThan(1);
+    const started: (number | undefined)[] = [];
+    const screen = (tour: Tour, writing: boolean) => (
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        order="flow"
+        cycleOrder={() => {}}
+        states={{}}
+        writingBriefing={writing}
+        width={140}
+        height={45}
+        onStart={(ci) => started.push(ci)}
+        onSubmit={() => {}}
+        onQuit={() => {}}
+      />
+    );
+    const ui = render(screen(plain, true));
+    await waitFor(() => expect(ui.lastFrame()).toContain('The model is writing the briefing'));
+    expect(ui.lastFrame()).not.toContain('plain mode');
+    ui.stdin.write('j');
+    await tick();
+    const selected = plain.chapters[1].id;
+    const briefed: Tour = { ...plain, mode: 'agent', chapters: [...plain.chapters].reverse() };
+    ui.rerender(screen(briefed, false));
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('The model is writing the briefing'));
+    ui.stdin.write('\r');
+    await tick();
+    expect(briefed.chapters[started[0]!].id).toBe(selected);
     ui.unmount();
   });
   it('restarts the tour from the palette, after asking', async () => {
@@ -1187,9 +1378,9 @@ describe('BriefingScreen and SubmitScreen', () => {
     expect(frame).toContain(`1 of ${changed.hunkIds.length} changed`);
     expect(frame).toContain(unchanged.title);
     expect(frame).toContain('unchanged');
-    // The re-review note sits just above the chapter list, not under the description.
+    // The re-review note sits just above the chapter list; the summary is behind i.
     expect(frame.indexOf('Changes only:')).toBeLessThan(frame.indexOf('Chapters'));
-    expect(frame.indexOf('Changes only:')).toBeGreaterThan(frame.indexOf('Adds POST /invoices.'));
+    expect(frame).not.toContain('Adds POST /invoices.');
     ui.stdin.write('D');
     await waitFor(() => expect(ui.lastFrame()).toContain('Full review:'));
     expect(toggles).toEqual([false]);
@@ -1226,7 +1417,6 @@ describe('BriefingScreen and SubmitScreen', () => {
         toggleDelta={() => toggled++}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
       />,
     );
@@ -1251,7 +1441,70 @@ describe('BriefingScreen and SubmitScreen', () => {
     ui.unmount();
   });
 
-  it('renders the briefing with chapters and flags', async () => {
+  it('opens the color theme picker from the palette', async () => {
+    const tour = fixtureTour();
+    const onTheme = vi.fn();
+    const ui = render(
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        order="flow"
+        cycleOrder={() => {}}
+        states={{}}
+        width={140}
+        height={45}
+        onStart={() => {}}
+        onSubmit={() => {}}
+        onQuit={() => {}}
+        onTheme={onTheme}
+      />,
+    );
+    await tick();
+    ui.stdin.write(':');
+    await tick();
+    ui.stdin.write('color theme');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Color theme'));
+    ui.stdin.write('\r');
+    await waitFor(() => expect(onTheme).toHaveBeenCalledTimes(1));
+    ui.unmount();
+  });
+
+  it('writes the AI description when i opens it, and keeps it', async () => {
+    const tour = fixtureTour();
+    tour.description = 'Adds invoices.';
+    const { summarize } = await import('../src/agent/agent.js');
+    const calls = vi.mocked(summarize).mock.calls.length;
+    const ui = render(
+      <BriefingScreen
+        tour={tour}
+        chapters={tour.chapters}
+        agent={{ cwd: '/tmp' }}
+        order="flow"
+        cycleOrder={() => {}}
+        states={{}}
+        width={140}
+        height={45}
+        onStart={() => {}}
+        onSubmit={() => {}}
+        onQuit={() => {}}
+      />,
+    );
+    await tick();
+    expect(vi.mocked(summarize).mock.calls.length).toBe(calls); // not until opened
+    expect(ui.lastFrame()).toContain('From the author · i generate AI description');
+    ui.stdin.write('i');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Adds POST /invoices and a sales report.'));
+    expect(ui.lastFrame()).toContain('— AI description');
+    expect(vi.mocked(summarize).mock.calls.length).toBe(calls + 1);
+    ui.stdin.write('\u001b');
+    await waitFor(() => expect(ui.lastFrame()).toContain('i read AI description'));
+    ui.stdin.write('i');
+    await waitFor(() => expect(ui.lastFrame()).toContain('a sales report.'));
+    expect(vi.mocked(summarize).mock.calls.length).toBe(calls + 1); // kept, not written again
+    ui.unmount();
+  });
+
+  it('renders the briefing with its chapters', async () => {
     const tour = fixtureTour();
     let started: number | undefined = -1;
     const ui = render(
@@ -1268,8 +1521,14 @@ describe('BriefingScreen and SubmitScreen', () => {
         onQuit={() => {}}
       />,
     );
+    await waitFor(() => expect(ui.lastFrame()).toContain('Chapters'));
+    // The summary is off the briefing: i reads it (the briefing's intent, with no model).
+    expect(ui.lastFrame()).not.toContain('Adds POST /invoices.');
+    ui.stdin.write('i');
     await waitFor(() => expect(ui.lastFrame()).toContain('Adds POST /invoices.'));
-    expect(ui.lastFrame()).toContain('Chapters');
+    expect(ui.lastFrame()).toContain('— summary');
+    ui.stdin.write('i');
+    await waitFor(() => expect(ui.lastFrame()).not.toContain('— summary'));
     ui.stdin.write('n');
     await waitFor(() => expect(started).toBeUndefined());
     ui.unmount();
@@ -1345,7 +1604,6 @@ describe('optional import chapter', () => {
       hunkIds: [imp.id],
       linkedHunkIds: [],
       orphanReasons: {},
-      untestedBranches: [],
       collapsed: true,
       optional: true,
     });
@@ -1372,7 +1630,6 @@ describe('optional import chapter', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
       />,
     );
@@ -1425,7 +1682,6 @@ describe('team checklist in the chapter screen', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
         services={svc}
       />,
@@ -1471,7 +1727,6 @@ describe('lazy @mention users', () => {
         toggleDelta={() => {}}
         openSubmit={() => {}}
         openBriefing={() => {}}
-        openInAgent={() => {}}
         quit={() => {}}
         services={{
           root: '/tmp/none',
@@ -1577,7 +1832,6 @@ describe('feedback round: guide, tests, inline comments, description', () => {
       toggleDelta={() => {}}
       openSubmit={() => {}}
       openBriefing={() => {}}
-      openInAgent={() => {}}
       quit={() => {}}
     />
   );
@@ -1719,8 +1973,8 @@ describe('feedback round: guide, tests, inline comments, description', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('From the author'));
     expect(ui.lastFrame()).toContain('Adds invoices.');
     expect(ui.lastFrame()).not.toContain('template');
-    // Three lines on the briefing, and r for the rest.
-    expect(ui.lastFrame()).toMatch(/more lines · r read all/);
+    // The note under the cut-off description, and r for the rest.
+    expect(ui.lastFrame()).toMatch(/… \d+ more lines · r read all/);
     ui.stdin.write('r');
     await waitFor(() => expect(ui.lastFrame()).toContain('from the author'));
     expect(ui.lastFrame()).toContain('See the doc (example.com).');
@@ -1750,7 +2004,6 @@ describe('split view, test pane toggle and expanded context', () => {
       toggleDelta={() => {}}
       openSubmit={() => {}}
       openBriefing={() => {}}
-      openInAgent={() => {}}
       quit={() => {}}
       {...extra}
     />
@@ -1903,11 +2156,11 @@ describe('split view, test pane toggle and expanded context', () => {
     const t = fixtureTour();
     const ci = t.chapters.findIndex((c) => c.hunkIds.some((id) => t.hunks[id].tests.some((x) => x.source !== 'naming')));
     const hi = t.chapters[ci].hunkIds.findIndex((id) => t.hunks[id].tests.some((x) => x.source !== 'naming'));
-    const ui = render(screen(t, { ci, hi }));
+    const ui = render(screen(t, { ci, hi, width: 200 }));
     await waitFor(() => expect(ui.lastFrame()).toMatch(/Tests\s/));
     expect(ui.lastFrame()).not.toContain('· t ');
     ui.stdin.write('T');
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/◂ \d+ tests? · t/));
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/t \d+ linked tests?/));
     expect(ui.lastFrame()).not.toMatch(/│ Tests/);
     ui.stdin.write('t');
     await waitFor(() => expect(ui.lastFrame()).toContain('back to code'));
@@ -1948,22 +2201,29 @@ describe('split view, test pane toggle and expanded context', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it('shows a tests tab at the top right when the terminal is too narrow for them beside the code', async () => {
+  it('shows a tests tab right above the code when the terminal is too narrow for them beside it', async () => {
     const t = fixtureTour();
     const ci = t.chapters.findIndex((c) => c.hunkIds.some((id) => t.hunks[id].tests.some((x) => x.source !== 'naming')));
     const hi = t.chapters[ci].hunkIds.findIndex((id) => t.hunks[id].tests.some((x) => x.source !== 'naming'));
     const ui = render(screen(t, { ci, hi, width: 100 }));
-    await waitFor(() => expect(ui.lastFrame()).toMatch(/◂ \d+ tests? · t\s*$/m));
-    // On the title row, right-aligned with the hunk counter.
-    expect(
-      ui
-        .lastFrame()!
-        .split('\n')
-        .find((r) => r.includes('◂')),
-    ).toContain('· hunk');
+    await waitFor(() => expect(ui.lastFrame()).toMatch(/t \d+ linked tests?\s*$/m));
+    // Right-aligned on the blank row under the explanation, so the code's first line follows it.
+    const rows = ui.lastFrame()!.split('\n');
+    const tab = rows.findIndex((r) => /linked tests?/.test(r));
+    expect(rows[tab]).not.toContain('· hunk');
+    expect(rows[tab]).toMatch(/^\s+t \d+ linked/);
+    expect(rows[tab + 1]).toMatch(/▶\s*1\s/);
     ui.stdin.write('t');
     await waitFor(() => expect(ui.lastFrame()).toContain('back to code'));
-    expect(ui.lastFrame()).not.toContain('◂');
+    expect(ui.lastFrame()).not.toMatch(/linked tests?/);
+    ui.unmount();
+  });
+
+  it('keeps the tests tab on the title row when there is no explanation', () => {
+    const h = hunkFromDiff('src/a.ts', '-go();', '+stop();');
+    const t = makeTour([h], [{ hunkIds: [h.id] }], { files: filesFor([h]) });
+    const ui = render(<ChapterTitle chapter={t.chapters[0]} hunk={h} hi={0} isNew={false} width={100} states={{}} drawer="1 linked test" />);
+    expect(ui.lastFrame()).toMatch(/· hunk 1\/1 .*t 1 linked test\s*$/);
     ui.unmount();
   });
 

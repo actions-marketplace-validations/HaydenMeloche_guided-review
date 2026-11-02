@@ -30,7 +30,6 @@ describe('gr preview --no-agent', () => {
     expect(screen).toContain('plain mode');
     expect(screen).toContain('Apply a discount to invoice totals');
     expect(screen).toMatch(/0\/1 hunks done/);
-    expect(screen).toContain('total: 1 unchanged caller — src/invoice.test.ts:2');
     // Preview only asks gh for the repo name; it never touches a PR.
     expect(box.ghCalls()).toEqual(['repo view --json nameWithOwner']);
   });
@@ -50,6 +49,12 @@ describe('gr preview --no-agent', () => {
     expect(chapter).toContain('src/invoice.ts:1');
     expect(chapter).toContain('return sum - sum * discount;');
     expect(chapter).toContain('0/1 hunks');
+    expect(chapter).toContain('Signature changed: 1 use in unchanged files · B: list');
+    gr.press('B');
+    const callers = await gr.waitFor('Uses of total (signature changed)');
+    expect(callers).toMatch(/total\s+src\/invoice\.test\.ts:2/);
+    gr.press(KEY.escape);
+    await gr.waitFor('B: list');
     gr.press('n');
     const end = await gr.waitFor('End of the tour');
     expect(end).toContain('1/1 hunks');
@@ -139,5 +144,45 @@ describe('gr preview with no AI model configured', () => {
     expect(screen).toContain('plain mode');
     expect(screen).not.toContain('ask about the PR');
     expect(screen).not.toContain('Agent disabled');
+  });
+});
+
+describe('quitting', () => {
+  it('leaves a line saying where the review stands', async () => {
+    const gr = preview();
+    await gr.waitFor('Chapters · Guided order');
+    gr.press('Q');
+    expect(await gr.exited).toBe(0);
+    expect(gr.screen()).toContain('feature/discount (preview) · 0/1 hunks read');
+  });
+});
+
+describe('Ctrl+Z', () => {
+  it.each([
+    ['', false],
+    [' as the child of another process, as under pnpm', true],
+  ])('stops gr under a shell%s, and fg brings it back redrawn', async (_, parent) => {
+    const gr = startGr(box, ['preview', '--no-agent'], { cwd: repo, shell: true, parent });
+    sessions.push(gr);
+    await gr.waitFor('Chapters · Guided order');
+    gr.press('\x1a');
+    // The shell has the terminal again, and says the job stopped.
+    await gr.waitFor(/Stopped|Suspended/);
+    expect(gr.screen()).not.toContain('Chapters · Guided order');
+    gr.type('fg\r');
+    await gr.waitFor('Chapters · Guided order');
+    // And it takes keys again.
+    gr.press('n');
+    await gr.waitFor(/hunk 1\/1/);
+  });
+
+  it('comes straight back and says so where nothing can stop it', async () => {
+    // Run with no shell around it, the system ignores the stop.
+    const gr = preview();
+    await gr.waitFor('Chapters · Guided order');
+    gr.press('\x1a');
+    await gr.waitFor('Ctrl+Z suspends gr only under a shell with job control');
+    gr.press('n');
+    await gr.waitFor(/hunk 1\/1/);
   });
 });

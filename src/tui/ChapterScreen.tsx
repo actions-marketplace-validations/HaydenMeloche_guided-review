@@ -24,10 +24,18 @@ import { ChapterList, ChapterStrip, ChapterTitle, CollapsedSummary, EmptyChapter
 import { HelpPopup } from './Help.js';
 import { ReviewPopup } from './ReviewPopup.js';
 import { reviewLegend } from './legend.js';
-import { anchorLines, crossesContext, describeAnchor, lineAnchor, newDraft, selectedCode, selRange, testLineAnchor } from './chapter/selection.js';
+import { anchorLines, crossesContext, describeAnchor, lineAnchor, linkLines, newDraft, selectedCode, selRange, testLineAnchor } from './chapter/selection.js';
+import { filesTabLink, permalink } from '../review/refs.js';
+import { writeClipboard } from '../util/clipboard.js';
+import { openExternal } from '../util/openExternal.js';
 import { CONTEXT_STEP, useFoldedCursor, useFolds, useHunkView } from './chapter/hunkView.js';
 import { barEnd, barKeys, PALETTE_HINT, chapterHelp, keyAction, paletteCommands, type Action, type KeyCtx, type View } from './chapter/keys.js';
 import { CommandPalette, type PaletteItem } from './CommandPalette.js';
+import { SearchPanel, type LastSearch } from './chapter/SearchPanel.js';
+import { HistoryPanel } from './chapter/HistoryPanel.js';
+import { CallersPanel } from './chapter/CallersPanel.js';
+import { baseRange, lineHistory } from '../review/history.js';
+import type { SearchHit } from './chapter/search.js';
 import { explanation } from './chapter/guide.js';
 import { lockListLines, lockPage } from './chapter/lockList.js';
 import { unboundKey, useFlash } from './flash.js';
@@ -83,6 +91,7 @@ export function ChapterScreen(props: {
   deltaOnly: boolean;
   banner?: string; // a notice that needs a decision (the author pushed); esc folds it into the header
   busy?: string; // background work, shown quietly in the header
+  writingBriefing?: boolean; // the model's briefing is still being written; narration follows it
   agent?: AgentCtx;
   aiOff?: string; // why the agent is absent
   width: number;
@@ -94,6 +103,7 @@ export function ChapterScreen(props: {
   saveDraft: (d: Draft) => void;
   deleteDraft: (d: Draft) => void;
   replyToThread?: (thread: ExistingThread, body: string) => Promise<void>;
+  resolveThread?: (thread: ExistingThread, resolved: boolean) => Promise<void>;
   reactToComment?: (comment: ThreadComment, content: ReactionContent, remove: boolean) => Promise<void>;
   moveHunk: (h: Hunk, chapterId: string) => void;
   toggleOrder: () => void;
@@ -110,10 +120,11 @@ export function ChapterScreen(props: {
   toggleTestPane?: () => void;
   toggleDelta: () => void;
   openSubmit: () => void;
+  approveAndMerge?: () => void; // a bot's PR: the end card offers to approve and merge it
   openBriefing: () => void;
-  openInAgent: (h: Hunk | undefined, chapter: Chapter) => void;
+  editFile?: (file: string, line: number) => Promise<string | undefined>;
+  onTheme?: () => void; // the color theme picker, from the palette (L is the PR list's) // E: resolves to a message to show
   rebase?: () => void;
-  onTheme?: () => void; // L: the color theme picker
   services?: Services;
   references?: ReferenceServices; // recent locations, repo index; tests may leave it out
   quit: () => void;
@@ -149,6 +160,7 @@ export function ChapterScreen(props: {
   const setComposerState: SetComposer = (f) => setOverlay((o) => (o.kind === 'comment' ? { ...o, composer: f(o.composer) } : o));
   const mentions = useMentions(tour, overlay.kind === 'comment' || overlay.kind === 'reply' || overlay.kind === 'thread', svc?.loadMentionUsers);
   const linked = useMemo(() => linkedTests(hunk, testIdx), [hunk, testIdx]);
+  const hunkCallers = useMemo(() => (hunk ? tour.blastRadius.filter((b) => b.hunkId === hunk.id) : []), [tour.blastRadius, hunk]);
   const { tests: relevantTests, selected: selectedTest, file: testFile, lines: testCodeLines } = linked;
 
   const hasLinkedTests = linked.any;
@@ -195,12 +207,21 @@ export function ChapterScreen(props: {
     explainScroll,
     listOpen: overlay.kind === 'comment' && !!overlay.composer.listOpen,
     lockRows: lockList ? (w) => lockListLines(lockList, w - 1).length : undefined,
-    explain: (w) => (chapter ? explanation({ tour, chapter, hunk, hi, collapsed: collapsedView, files: filesByPath, confirms: svc?.confirms, linkedTests: hasLinkedTests, showUntested }, w) : []),
+    explain: (w) =>
+      chapter
+        ? explanation(
+            { tour, chapter, hunk, hi, collapsed: collapsedView, writingBriefing: props.writingBriefing, files: filesByPath, confirms: svc?.confirms, linkedTests: hasLinkedTests, showUntested },
+            w,
+          )
+        : [],
   });
   const { wide, listWidth, mainWidth, sideBySide, srcWidth, splitView, bodyHeight, askHeight } = plan;
 
   const { partner, hidden, runs, land } = useFolds(hunk, ignoreWhitespace, splitView, foldImports);
-  const moveCursor = useFoldedCursor(view, hidden, partner, land);
+  // Where a search sends the cursor in the hunk it opens.
+  const landAt = useRef<{ hunkId: string; line: number } | undefined>(undefined);
+  const moveCursor = useFoldedCursor(view, hidden, partner, land, landAt);
+  const [lastSearch, setLastSearch] = useState<LastSearch>({ query: '', sel: 0 });
   const cursorLine = hunk?.lines[cursor];
   const { threads: cursorThreads, draft: cursorDraft } = cursorNotes(hunk, cursor, hidden, partner, tour.existingThreads, props.drafts, runs.get(cursor));
   useEffect(() => {
@@ -318,7 +339,6 @@ export function ChapterScreen(props: {
     rereview: !!tour.rereview,
     deltaOnly: props.deltaOnly,
     rebase: !!props.rebase,
-    theme: !!props.onTheme,
   };
   const lastTestLine = Math.max(0, testCodeLines.length - 1);
   const stepTest = (by: number) => {
@@ -435,6 +455,13 @@ export function ChapterScreen(props: {
     reply: () => (cursorThreads.length ? show('reply') : setFlash('No review thread on this line. Move to a commented line and press y.')),
     thread: () => (cursorThreads.length ? show('thread') : setFlash('No review thread on this line. Move to a commented line and press e.')),
     palette: () => show('palette'),
+    search: () => show('search'),
+    history: () => {
+      if (!svc?.root) return setFlash('History opens once the checkout is ready.');
+      if (!baseRange(hunk!, sel)) return setFlash('These lines are new in the PR: there is no history before it.');
+      show('history');
+    },
+    callers: () => (hunkCallers.length ? show('callers') : setFlash('Nothing outside this PR uses what this hunk changes, as far as a search by name finds.')),
     sidebar: () => (width >= WIDE ? toggleSidebar() : setFlash(`The chapter list needs ${WIDE} columns; this terminal has ${width}.`)),
     explanation: () => toggleExplanation(),
     commentFlow: () => openComposer(draft({ type: 'chapter', chapterId: chapter.id })),
@@ -448,7 +475,27 @@ export function ChapterScreen(props: {
     order: () => props.toggleOrder(),
     delta: () => props.toggleDelta(),
     rebase: () => props.rebase?.(),
-    openInAgent: () => props.openInAgent(hunk, chapter),
+    editor: () => {
+      if (!props.editFile) return setFlash('The editor opens once the checkout is ready.');
+      // A removed line opens at the new line after it, or before it at the end of the hunk.
+      const lines = hunk!.lines;
+      const line = lines.slice(cursor).find((l) => l.newLine !== undefined)?.newLine ?? lines.slice(0, cursor).findLast((l) => l.newLine !== undefined)?.newLine ?? 1;
+      void props.editFile(hunk!.file, line).then((msg) => msg && setFlash(msg));
+    },
+    copyLink: () => {
+      const link = links();
+      if (typeof link === 'string') return setFlash(link);
+      copy(link.permalink);
+    },
+    // With no browser to open (as over SSH), the link is copied instead, as on the PR list.
+    openOnGitHub: () => {
+      const link = links();
+      if (typeof link === 'string') return setFlash(link);
+      openExternal(link.files).then(
+        () => setFlash(`Opened ${link.label} on GitHub.`, 'info'),
+        () => copy(link.files, 'No browser to open here: '),
+      );
+    },
     submit: () => props.openSubmit(),
     help: () => show('help'),
     checklist: () => {
@@ -456,8 +503,30 @@ export function ChapterScreen(props: {
       if (svc) show('checklist');
       else setFlash('The checklist opens once the checkout is ready.');
     },
-    theme: () => props.onTheme?.(),
   };
+  // Y and O: the selected lines as a permalink pinned to the commit they are in (the head for new
+  // lines, the base for removed ones), and on the PR's Files tab. A string says why there is none.
+  const links = (): { permalink: string; files: string; label: string } | string => {
+    if (!tour.url) return 'A preview has no GitHub link: its lines may not be pushed.';
+    const at = hunk && linkLines(hunk, sel);
+    if (!hunk || !at) return 'No line here to link to.';
+    const sha = at.side === 'new' ? tour.headSha : tour.baseSha;
+    return {
+      permalink: permalink(ev?.host ?? 'github.com', tour.repo, sha, hunk.file, at.start, at.end),
+      files: filesTabLink(tour.url, hunk.file, at.side === 'new' ? 'R' : 'L', at.start, at.end),
+      label: `${hunk.file}:${at.start === at.end ? at.start : `${at.start}-${at.end}`}`,
+    };
+  };
+  const copy = (text: string, why = '') =>
+    void writeClipboard(text).then(
+      (how) =>
+        setFlash(
+          `${why}${how === 'tool' ? 'copied' : 'asked your terminal to copy'} ${text}`.replace(/^./, (c) => c.toUpperCase()),
+          'info',
+        ),
+      (e: unknown) => setFlash(`Couldn't copy the link: ${(e as Error).message}`),
+    );
+
   // The panes Tab moves between, in screen order: the chapter list, the explanation, the code, and
   // the tests, each only when it is on screen.
   const panes = [...(wide ? ['list' as const] : []), ...(plan.explainLines.length ? ['explain' as const] : []), 'code' as const, ...(hasLinkedTests && hunk ? ['tests' as const] : [])];
@@ -532,10 +601,16 @@ export function ChapterScreen(props: {
     return <EmptyChapter deltaOnly={props.deltaOnly} width={width} />;
   }
 
-  // Linked tests that are not beside the code (a narrow terminal, T, or a split diff) get a tab
-  // saying they are there and how to open them.
+  // Linked tests that are not beside the code (a narrow terminal, T, long code, or a split diff)
+  // get a tab saying they are there and how to open them. It sits right above the code, on the
+  // blank row under the explanation, or on the title row when there is no explanation.
   const testDrawer =
-    hunk && hasLinkedTests && !sideBySide && !testFocus && !collapsedView ? `◂ ${hunk.covers ? 'code it covers' : `${relevantTests.length} test${relevantTests.length === 1 ? '' : 's'}`}` : undefined;
+    hunk && hasLinkedTests && !sideBySide && !testFocus && !collapsedView
+      ? hunk.covers
+        ? 'code it covers'
+        : `${relevantTests.length} linked test${relevantTests.length === 1 ? '' : 's'}`
+      : undefined;
+  const drawerAboveCode = plan.explainLines.length > 0;
   // The composer sits under the commented line, growing while its AI line is open. Its state is
   // ours, so it survives moving between the inline slot and the popup.
   const slots = overlaySlots(plan, {
@@ -568,7 +643,17 @@ export function ChapterScreen(props: {
       const page = pageOf(c, hi);
       toFile.push({ label: `Go to ${f.path}`, detail: `chapter ${ci + 1} · ${page < 0 ? 'summary' : `hunk ${hunkPosition(c, page).n}`}`, run: () => props.setPos(ci, page) });
     }
-    return [...commands, ...toChapter, ...toFile];
+    const theme: PaletteItem[] = props.onTheme ? [{ label: 'Color theme', run: () => props.onTheme?.() }] : [];
+    return [...commands, ...theme, ...toChapter, ...toFile];
+  };
+
+  // A search hit: its line under the cursor, on its hunk's page. A hunk read as a summary (a
+  // collapsed chapter, a folded lockfile) or on its pair's page opens there.
+  const goToHit = (hit: SearchHit) => {
+    const own = hit.page >= 0 && chapters[hit.ci]?.hunkIds[hit.page] === hit.hunkId && hit.line !== undefined;
+    if (own && hunk?.id === hit.hunkId && diffHunk) view.setCursor(Math.max(0, hunk.lines.indexOf(diffHunk.lines[hit.line!])));
+    else if (own) landAt.current = { hunkId: hit.hunkId, line: hit.line! };
+    props.setPos(hit.ci, hit.page);
   };
 
   // The diagram, the move list, the checklist, and a chapter or node comment float over the
@@ -638,6 +723,8 @@ export function ChapterScreen(props: {
       const verdict = suggestVerdict(tour, props.drafts, states, labels);
       const pending = props.drafts.filter((d) => !d.posted).length;
       const optional = chapters.some((c) => c.optional);
+      // Everything read, nothing to post and nothing against approving: one step from merged.
+      const approveMerge = props.approveAndMerge && !pending && !p.unread && !p.deferred && verdict.event === 'APPROVE' ? props.approveAndMerge : undefined;
       return {
         tone: 'decision' as const,
         width: Math.min(72, width - 4),
@@ -656,6 +743,13 @@ export function ChapterScreen(props: {
               close();
               props.openSubmit();
             }}
+            onApproveMerge={
+              approveMerge &&
+              (() => {
+                close();
+                approveMerge();
+              })
+            }
             onOptional={() => {
               close();
               const oi = chapters.findIndex((c) => c.optional);
@@ -673,6 +767,68 @@ export function ChapterScreen(props: {
         width: Math.min(90, width - 4),
         height: Math.min(height - 4, 22),
         node: (w: number, h: number) => <CommandPalette items={paletteItems()} width={w} height={h} onClose={close} />,
+      };
+    const range = hunk && baseRange(hunk, sel);
+    if (overlay.kind === 'history' && hunk && range && svc?.root) {
+      const root = svc.root;
+      const path = hunk.oldFile ?? hunk.file;
+      const host = ev?.host ?? 'github.com';
+      // A PR the history names, on the same repository; a local tour of an unknown one has none.
+      const openPR = tour.repo.startsWith('local/')
+        ? undefined
+        : (n: number) => {
+            const url = `https://${host}/${tour.repo}/pull/${n}`;
+            openExternal(url).then(
+              () => setFlash(`Opened #${n} in your browser.`, 'info'),
+              () => copy(url, 'No browser to open here: '),
+            );
+          };
+      return {
+        tone: 'reading' as const,
+        width: Math.min(120, width - 4),
+        height: Math.min(height - 4, 26),
+        node: (w: number, h: number) => (
+          <HistoryPanel
+            title={`History of ${path}:${range.start === range.end ? range.start : `${range.start}-${range.end}`} before the PR`}
+            load={() => lineHistory(root, tour.baseSha, path, range.start, range.end)}
+            width={w}
+            height={h}
+            onOpenPR={openPR}
+            onClose={close}
+          />
+        ),
+      };
+    }
+    if (overlay.kind === 'callers' && hunkCallers.length)
+      return {
+        tone: 'reading' as const,
+        width: Math.min(140, width - 4),
+        height: height - 4,
+        node: (w: number, h: number) => <CallersPanel items={hunkCallers} root={svc?.root} width={w} height={h} onClose={close} />,
+      };
+    if (overlay.kind === 'search')
+      return {
+        tone: 'input' as const,
+        width: Math.min(120, width - 4),
+        height: Math.min(height - 4, 22),
+        node: (w: number, h: number) => (
+          <SearchPanel
+            tour={tour}
+            chapters={chapters}
+            last={lastSearch}
+            width={w}
+            height={h}
+            onClose={(last) => {
+              setLastSearch(last);
+              close();
+            }}
+            onGo={(hit, last) => {
+              setLastSearch(last);
+              close();
+              goToHit(hit);
+            }}
+          />
+        ),
       };
     if (overlay.kind === 'move')
       return { tone: 'input' as const, width: Math.min(70, width - 4), height: chapters.length + 5, node: (w: number) => <MoveList chapters={chapters} sel={overlay.sel} width={w} /> };
@@ -759,6 +915,7 @@ export function ChapterScreen(props: {
       startReply={overlay.kind === 'reply'}
       onReply={props.replyToThread}
       onReact={props.reactToComment}
+      onResolve={props.resolveThread}
       onNotice={(text) => setFlash(text, 'info')}
       onClose={() => close()}
     />
@@ -814,8 +971,25 @@ export function ChapterScreen(props: {
         {wide ? <Box width={1} /> : null}
         <Box flexDirection="column" width={mainWidth}>
           <>
-            <ChapterTitle chapter={chapter} hunk={hunk} hi={hi} isNew={!!hunk && delta.has(hunk.id)} unchanged={unchangedHunks} width={mainWidth} states={states} drawer={testDrawer} />
-            <Explanation lines={plan.explainLines} inferred={!!hunk?.narrationInferred} collapsed={collapsedView} updated={updated} focused={focusNow === 'explain'} width={mainWidth} />
+            <ChapterTitle
+              chapter={chapter}
+              hunk={hunk}
+              hi={hi}
+              isNew={!!hunk && delta.has(hunk.id)}
+              unchanged={unchangedHunks}
+              width={mainWidth}
+              states={states}
+              drawer={drawerAboveCode ? undefined : testDrawer}
+            />
+            <Explanation
+              lines={plan.explainLines}
+              inferred={!!hunk?.narrationInferred}
+              collapsed={collapsedView}
+              updated={updated}
+              focused={focusNow === 'explain'}
+              width={mainWidth}
+              drawer={testDrawer}
+            />
             {collapsedView ? (
               <>
                 <CollapsedSummary

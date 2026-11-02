@@ -8,6 +8,7 @@ import { waitFor } from './helpers/waitFor.js';
 vi.mock('../src/github/gh.js', async (orig) => ({
   parsePRArg: (await orig<typeof import('../src/github/gh.js')>()).parsePRArg,
   listReviewRequests: vi.fn(async () => []),
+  listReviewedPRs: vi.fn(async () => ({ prs: [], truncated: false })),
   listAuthoredPRs: vi.fn(async () => ({ prs: [], truncated: false })),
   fetchPRPreview: vi.fn(() => new Promise(() => {})),
   viewerLogin: vi.fn(async () => 'me'),
@@ -25,6 +26,57 @@ describe('the empty PR list', () => {
     expect(ui.lastFrame()).not.toContain('/ filter');
     expect(ui.lastFrame()).toContain('r refresh');
     expect(ui.lastFrame()).toContain('? keys');
+    ui.unmount();
+  });
+});
+
+describe('an update on offer', () => {
+  it('shows the new version at the top, and U installs it', async () => {
+    const onUpdate = vi.fn();
+    const ui = render(
+      <PickerScreen
+        store={store}
+        width={100}
+        height={24}
+        update={{ version: '0.9.0' }}
+        onUpdate={onUpdate}
+        onPick={() => {}}
+        onQuit={() => {}}
+        readClipboard={async () => undefined}
+        downloads={{}}
+        onDownload={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('↑ 0.9.0  A new version of Guided Review is out · press U to update'));
+    ui.stdin.write('U');
+    await waitFor(() => expect(onUpdate).toHaveBeenCalled());
+    ui.unmount();
+  });
+
+  it('turns red with the reason when the installed version is deprecated', async () => {
+    const ui = render(
+      <PickerScreen
+        store={store}
+        width={120}
+        height={24}
+        update={{ version: '0.9.0', deprecated: 'Fixes a token leak' }}
+        onUpdate={() => {}}
+        onPick={() => {}}
+        onQuit={() => {}}
+        readClipboard={async () => undefined}
+        downloads={{}}
+        onDownload={() => {}}
+      />,
+    );
+    await waitFor(() => expect(ui.lastFrame()).toContain('↑ 0.9.0  This version of Guided Review is deprecated: Fixes a token leak · press U to update'));
+    ui.unmount();
+  });
+
+  it('says there is nothing to install when no update is on offer', async () => {
+    const ui = render(<PickerScreen store={store} width={100} height={24} onPick={() => {}} onQuit={() => {}} readClipboard={async () => undefined} downloads={{}} onDownload={() => {}} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('Nothing is waiting'));
+    ui.stdin.write('U');
+    await waitFor(() => expect(ui.lastFrame()).toContain('No newer version of gr to install.'));
     ui.unmount();
   });
 });

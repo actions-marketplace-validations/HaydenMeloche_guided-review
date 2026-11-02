@@ -4,7 +4,7 @@ import { escapeRe } from '../util/regex.js';
 import { SCHEMA_PATH, sqlTableRefs } from './patterns.js';
 import { SPECIAL_CHAPTERS, specialKindOf, type SpecialKind } from './special.js';
 import { testStem } from './testPaths.js';
-import type { Chapter, ChapterKind, DiffFile, FileKind, Flag, Graph, GraphEdge, GraphNode, Hunk, LockPair } from '../types.js';
+import type { Chapter, ChapterKind, DiffFile, FileKind, Graph, GraphEdge, GraphNode, Hunk, LockPair } from '../types.js';
 import { isPackageHunk } from './dependencies.js';
 import { pairLockfiles } from './lockfile.js';
 import type { CallEdge, Decl, SymbolIndex } from './symbols.js';
@@ -36,25 +36,8 @@ function newChapter(id: string, kind: ChapterKind, title: string, hunkIds: strin
     hunkIds,
     linkedHunkIds: [],
     orphanReasons: {},
-    untestedBranches: [],
     collapsed: false,
   };
-}
-
-const BRANCH = /^\s*(?:\}\s*)?(?:if\b|else\b|switch\b|case\b|catch\b|elif\b|except\b|match\b)|\?\s*[^:]+:/;
-
-function untestedBranches(ids: string[], hunks: Record<string, Hunk>): string[] {
-  const out: string[] = [];
-  for (const id of ids) {
-    const h = hunks[id];
-    if (!h || h.coverage === 'tested') continue;
-    for (const l of h.lines) {
-      if (l.kind === 'add' && l.newLine && BRANCH.test(l.text)) {
-        out.push(`${h.file}:${l.newLine} ${l.text.trim().slice(0, 60)}`);
-      }
-    }
-  }
-  return out.slice(0, 20);
 }
 
 function orphanReason(h: Hunk, file: DiffFile | undefined, decls: Decl[]): string {
@@ -297,9 +280,8 @@ function movedFrom(ids: string[], hunks: Record<string, Hunk>): Map<string, stri
   return moves;
 }
 
-export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, index: SymbolIndex): { chapters: Chapter[]; overview: Graph; notes: string[]; flags: Flag[] } {
+export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, index: SymbolIndex): { chapters: Chapter[]; overview: Graph; notes: string[] } {
   const notes: string[] = [];
-  const flags: Flag[] = [];
   const chapters: Chapter[] = [];
   let n = 0;
   const nextId = () => `c${++n}`;
@@ -467,7 +449,6 @@ export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, in
     ch.entryPoint = name ? `${e.reason} (${name})` : e.reason;
     entryHunkOf.set(id, e.hunkId);
     ch.linkedHunkIds = linked;
-    ch.untestedBranches = untestedBranches(ordered, hunks);
     ch.lowConfidence = r.naming || index.lowConfidence || undefined;
     ch.diagram =
       callDiagram(ch.title, [...ordered, ...linked], index, declByQ) ??
@@ -501,9 +482,7 @@ export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, in
 
   if (logicHunks.length && !flows.length) {
     notes.push('No entry point found: chapters use file order by kind.');
-    flags.push({ kind: 'no-entry-point', message: 'No entry point found; logic is shown in file order.' });
     const ch = newChapter(nextId(), 'flow', 'Hand-written logic (file order)', logicHunks, hunks);
-    ch.untestedBranches = untestedBranches(logicHunks, hunks);
     ch.lowConfidence = true;
     ch.diagram = entityDiagram(ch.title, logicFiles, hunks) ?? depsDiagram(ch.title, logicFiles, hunks);
     for (const h of logicHunks) owner.set(h, ch.id);
@@ -519,7 +498,6 @@ export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, in
       const decls = (index.hunkDecls[id] ?? []).map((q) => declByQ.get(q)).filter((d): d is Decl => !!d);
       ch.orphanReasons[id] = orphanReason(hunks[id], fileOf.get(id), decls);
     }
-    ch.untestedBranches = untestedBranches(orphans, hunks);
     ch.diagram = entityDiagram(
       ch.title,
       files.filter((f) => f.hunkIds.some((h) => orphanSet.has(h))),
@@ -533,22 +511,41 @@ export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, in
   // removed cases would otherwise never be seen. Tests of supporting code, and tests whose code did
   // not change, get a chapter of their own.
   const flowById = new Map(flows.map((c) => [c.id, c]));
-  const testOnly: string[] = [];
+  const leftover: { order: number; ids: string[] }[] = [];
   let pairedLeft = false;
-  for (const f of sorted) {
-    if (f.kind !== 'test') continue;
+  const inFlow: { ids: string[]; chapter: Chapter }[] = []; // test files that joined a flow
+  const unpaired: { order: number; f: DiffFile; ids: string[] }[] = []; // test files nothing links to
+  sorted.forEach((f, order) => {
+    if (f.kind !== 'test') return;
     const ids = f.hunkIds.filter((id) => hunks[id] && !special.has(id));
-    if (!ids.length) continue;
+    if (!ids.length) return;
     const { paired, chapterId } = pairedChapter(f, logicFiles, hunks, owner);
     const flow = chapterId ? flowById.get(chapterId) : undefined;
     if (flow) {
       flow.hunkIds.push(...ids);
       flow.risk = maxRisk(flow.hunkIds, hunks);
-    } else {
-      testOnly.push(...ids);
-      if (paired) pairedLeft = true;
+      inFlow.push({ ids, chapter: flow });
+    } else if (paired) {
+      leftover.push({ order, ids });
+      pairedLeft = true;
+    } else unpaired.push({ order, f, ids });
+  });
+  // A test file no code links to, named in the diff of a test that joined a flow, is that test's
+  // fixture or helper: it reads right after the test, not among the leftover tests. One that
+  // several flows' tests name stays a leftover rather than joining one of them.
+  for (const { order, f, ids } of unpaired) {
+    const name = path.posix.basename(f.path).replace(/\.[^.]+$/, '');
+    const re = new RegExp(`(?<![\\w$])${escapeRe(name)}(?![\\w$])`);
+    const named = new Set(inFlow.filter((t) => t.ids.some((id) => hunks[id].lines.some((l) => l.kind !== 'del' && re.test(l.text)))).map((t) => t.chapter));
+    const chapter = named.size === 1 && name.length > 3 ? [...named][0] : undefined;
+    if (!chapter) {
+      leftover.push({ order, ids });
+      continue;
     }
+    chapter.hunkIds.push(...ids);
+    chapter.risk = maxRisk(chapter.hunkIds, hunks);
   }
+  const testOnly = leftover.sort((a, b) => a.order - b.order).flatMap((t) => t.ids);
   if (testOnly.length) {
     const ch = newChapter(nextId(), 'tests', pairedLeft ? 'Test changes' : 'Test-only changes', testOnly, hunks);
     ch.summary = pairedLeft
@@ -592,7 +589,7 @@ export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, in
         .filter((f) => foldedFiles.has(f.path))
         .map((f) => `${f.path}${f.summary ? `: ${f.summary}` : ''}`)
         .join('\n');
-    } else if (sc.collapsed) ch.summary = summaryOf(sc.kind);
+    } else ch.summary = summaryOf(sc.kind); // the briefing titles flows and supporting changes only, so this stays
     chapters.push(ch);
   }
 
@@ -607,7 +604,7 @@ export function buildChapters(files: DiffFile[], hunks: Record<string, Hunk>, in
     chapters.push(ch);
   }
 
-  return { chapters, overview: overviewGraph(flows, files, hunks, index), notes, flags };
+  return { chapters, overview: overviewGraph(flows, files, hunks, index), notes };
 }
 
 // The dependencies chapter's lockfiles paired with the manifests they lock (pairLockfiles), by
@@ -717,8 +714,6 @@ export function splitByDirectory(chapters: Chapter[], hunks: Record<string, Hunk
         risk: maxRisk(ids, hunks),
         orphanReasons: Object.fromEntries(Object.entries(c.orphanReasons).filter(([id]) => own.has(id))),
         linkedHunkIds: c.linkedHunkIds.filter((id) => files.has(hunks[id]?.file ?? '')),
-        // Branches read `file:line text`.
-        untestedBranches: c.untestedBranches.filter((b) => [...files].some((f) => b.startsWith(`${f}:`))),
         // The parent's diagram spans every directory.
         diagram: undefined,
       };

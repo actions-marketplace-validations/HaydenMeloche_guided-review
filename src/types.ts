@@ -5,7 +5,7 @@ export type FileKind = 'logic' | 'test' | 'config' | 'mechanical' | 'generated' 
 
 export type ChapterKind = 'flow' | 'supporting' | 'tests' | 'imports' | 'migrations' | 'api' | 'dependencies' | 'lockfiles' | 'infra' | 'ci' | 'config' | 'mechanical' | 'generated' | 'vendored';
 
-export type ChapterOrder = 'flow' | 'risk' | 'size' | 'file';
+export type ChapterOrder = 'flow' | 'risk' | 'size' | 'file' | 'commit';
 
 export type Risk = 0 | 1 | 2 | 3; // none, low, medium, high
 
@@ -134,7 +134,6 @@ export interface Chapter {
   hunkIds: string[]; // reading order
   linkedHunkIds: string[]; // shared code owned by an earlier chapter, linked from here
   orphanReasons: Record<string, string>; // supporting chapter: hunkId -> one-line reason
-  untestedBranches: string[];
   collapsed: boolean; // low-priority kinds start collapsed to one-line summaries
   folded?: string[]; // hunks read as one summary on the chapter's opening page (lockfiles with no changed manifest, in the dependencies chapter); the rest follow it
   lockPairs?: LockPair[]; // dependencies chapter: lockfiles read on the pages of the manifests they lock
@@ -142,14 +141,6 @@ export interface Chapter {
   optional?: boolean; // low-value chapter (import-only changes): not stepped into by n/p, not counted as unread
   checklist?: ChecklistItem[]; // team checklist items whose path pattern matches this chapter
   narrated?: boolean; // the narration step for this chapter finished; an incomplete tour resumes from the others
-}
-
-export type FlagKind = 'scope-creep' | 'missing-tests' | 'generated-out-of-sync' | 'large-pr' | 'no-entry-point' | 'model-unavailable' | 'missing-change' | 'info';
-
-export interface Flag {
-  kind: FlagKind;
-  message: string;
-  hunkIds?: string[];
 }
 
 export interface CallerRef {
@@ -161,6 +152,8 @@ export interface CallerRef {
 export interface BlastItem {
   symbol: string;
   hunkId: string;
+  // What changed that the callers may not expect; unset for a change inside a body.
+  change?: 'signature' | 'table' | 'event';
   callers: CallerRef[];
 }
 
@@ -297,6 +290,7 @@ export interface PRInfo {
   body: string;
   url: string;
   author: string;
+  authorBot?: boolean; // the author is an app, such as Dependabot or Renovate
   baseRef: string;
   headRef: string;
   baseSha: string;
@@ -312,13 +306,13 @@ export interface Tour {
   title: string;
   url: string;
   author: string;
+  authorBot?: boolean; // the author is an app, such as Dependabot or Renovate
   baseSha: string;
   headSha: string;
   createdAt: string;
   mode: 'agent' | 'plain';
   intent: string; // 2-3 sentence goal
   description?: string; // the PR body as the author wrote it
-  flags: Flag[];
   notes: string[];
   overview?: Graph;
   chapters: Chapter[];

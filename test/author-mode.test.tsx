@@ -11,7 +11,7 @@ import { FeedbackScreen } from '../src/tui/author/FeedbackScreen.js';
 import { SendScreen } from '../src/tui/author/SendScreen.js';
 import { CommentComposer } from '../src/tui/author/CommentComposer.js';
 import { AuthorMode } from '../src/tui/author/AuthorMode.js';
-import { MergeScreen } from '../src/tui/MergeScreen.js';
+import { MergeScreen, SETTLE } from '../src/tui/MergeScreen.js';
 import { mergeReadiness } from '../src/review/merge.js';
 import { Store } from '../src/store/db.js';
 import {
@@ -22,7 +22,10 @@ import {
   fetchThreads,
   markReadyForReview,
   mergePR,
+  postReview,
   updateBranch,
+  enableAutoMerge,
+  disableAutoMerge,
   PartialSendError,
   postIssueComment,
   postThreadReplies,
@@ -50,8 +53,11 @@ vi.mock('../src/github/gh.js', async (orig) => ({
   requestReviewers: vi.fn(async () => undefined),
   fetchPendingReviewers: vi.fn(async () => ({ author: 'dev', users: ['carl'], teams: ['core'] })),
   mergePR: vi.fn(async () => ({ sha: 'merged123456' })),
+  postReview: vi.fn(async () => ({ id: 1, url: 'https://example.test/review/1' })),
   markReadyForReview: vi.fn(async () => undefined),
   updateBranch: vi.fn(async () => undefined),
+  enableAutoMerge: vi.fn(async () => undefined),
+  disableAutoMerge: vi.fn(async () => undefined),
   setCommentReaction: vi.fn(async () => []),
 }));
 
@@ -603,7 +609,9 @@ describe('MergeScreen', () => {
       ['r', 'REBASE', 'Rebased feature onto main'],
     ] as const) {
       vi.mocked(updateBranch).mockClear();
-      vi.mocked(fetchMergeStatus).mockResolvedValueOnce({ ...status, id: 'PR_1', headRef: 'feature', baseRef: 'main', mergeStateStatus: 'BEHIND', viewerCanUpdateBranch: true });
+      vi.mocked(fetchMergeStatus)
+        .mockResolvedValueOnce({ ...status, id: 'PR_1', headRef: 'feature', baseRef: 'main', mergeStateStatus: 'BEHIND', viewerCanUpdateBranch: true })
+        .mockResolvedValueOnce({ ...status, headSha: 'new5678' });
       const ui = render(<MergeScreen repo="acme/pay" number={4} width={110} height={30} onDone={noop} onCancel={noop} />);
       await waitFor(() => expect(ui.lastFrame()).toContain('behind main: update the branch · u updates it'));
       expect(ui.lastFrame()).toContain('u update from main');
@@ -618,6 +626,29 @@ describe('MergeScreen', () => {
       await waitFor(() => expect(ui.lastFrame()).toContain('Ready to merge'));
       ui.unmount();
     }
+  });
+
+  it('reads the PR again after an update until GitHub reports the new head and has worked out its state', async () => {
+    const settle = { ...SETTLE };
+    SETTLE.delayMs = 5;
+    const waiting = { ...status.checks, pending: 1, requiredPending: ['test'] };
+    vi.mocked(fetchMergeStatus)
+      .mockReset()
+      .mockResolvedValueOnce({ ...status, id: 'PR_1', mergeStateStatus: 'BEHIND', viewerCanUpdateBranch: true })
+      .mockResolvedValueOnce({ ...status, id: 'PR_1' }) // the old head, still CLEAN
+      .mockResolvedValueOnce({ ...status, id: 'PR_1', headSha: 'new5678', mergeStateStatus: 'UNKNOWN' })
+      .mockResolvedValue({ ...status, id: 'PR_1', headSha: 'new5678', mergeStateStatus: 'BLOCKED', checks: waiting });
+    const ui = render(<MergeScreen repo="acme/pay" number={4} width={110} height={30} onDone={noop} onCancel={noop} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('u updates it'));
+    ui.stdin.write('u');
+    await waitFor(() => expect(ui.lastFrame()).toContain('from main?'));
+    ui.stdin.write('\r');
+    await waitFor(() => expect(ui.lastFrame()).toContain('waiting on 1 required check'));
+    expect(fetchMergeStatus).toHaveBeenCalledTimes(4);
+    expect(ui.lastFrame()).toContain('head new5678');
+    ui.unmount();
+    Object.assign(SETTLE, settle);
+    vi.mocked(fetchMergeStatus).mockResolvedValue(status);
   });
 
   it('offers no update without permission, and n cancels one', async () => {
@@ -639,6 +670,43 @@ describe('MergeScreen', () => {
     ui.stdin.write('n');
     await waitFor(() => expect(ui.lastFrame()).not.toContain('Update feature from main?'));
     expect(updateBranch).not.toHaveBeenCalled();
+    ui.unmount();
+  });
+
+  it('turns on auto-merge, with the method and message shown, when only checks block the merge', async () => {
+    vi.mocked(mergePR).mockClear();
+    const onDone = vi.fn();
+    const waiting = { ...status.checks, pending: 1, requiredPending: ['build'] };
+    vi.mocked(fetchMergeStatus).mockResolvedValueOnce({ ...status, id: 'PR_1', mergeStateStatus: 'BLOCKED', checks: waiting, viewerCanEnableAutoMerge: true });
+    const ui = render(<MergeScreen repo="acme/pay" number={4} width={110} height={30} onDone={onDone} onCancel={noop} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('P turns on auto-merge'));
+    expect(ui.lastFrame()).toContain('waiting on 1 required check');
+    expect(ui.lastFrame()).not.toContain('Delete retries after merging');
+    expect(ui.lastFrame()).toContain('P auto-merge');
+    ui.stdin.write('P');
+    await waitFor(() => expect(ui.lastFrame()!.replace(/\s+/g, ' ')).toContain('Auto-merge acme/pay#4 into main (squash and merge) once it can? y turn on auto-merge'));
+    ui.stdin.write('y');
+    await waitFor(() => expect(onDone).toHaveBeenCalledWith(expect.stringContaining('Auto-merge on for acme/pay#4')));
+    expect(enableAutoMerge).toHaveBeenCalledWith('PR_1', { method: 'squash', headSha: 'head1234', title: 'Retry payments (#4)', message: '* Retry\n\n* Fix lint' });
+    expect(mergePR).not.toHaveBeenCalled();
+    ui.unmount();
+  });
+
+  it('shows auto-merge that is on, and a turns it off', async () => {
+    vi.mocked(fetchMergeStatus).mockResolvedValueOnce({
+      ...status,
+      id: 'PR_1',
+      mergeStateStatus: 'BLOCKED',
+      autoMerge: 'squash',
+      autoMergeTitle: 'Retry payments (#4)',
+      viewerCanDisableAutoMerge: true,
+    });
+    const ui = render(<MergeScreen repo="acme/pay" number={4} width={110} height={30} onDone={noop} onCancel={noop} />);
+    await waitFor(() => expect(ui.lastFrame()).toContain('Auto-merge is on: GitHub will squash and merge'));
+    expect(ui.lastFrame()).toContain('as “Retry payments (#4)”');
+    ui.stdin.write('a');
+    await waitFor(() => expect(ui.lastFrame()).toContain('Auto-merge is off.'));
+    expect(disableAutoMerge).toHaveBeenCalledWith('PR_1');
     ui.unmount();
   });
 
@@ -690,6 +758,70 @@ describe('MergeScreen', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('needs an approving review'));
     expect(ui.lastFrame()).not.toContain('P merge');
     ui.unmount();
+  });
+
+  describe('approving first', () => {
+    const waiting = { ...status, mergeStateStatus: 'BLOCKED', reviewDecision: 'REVIEW_REQUIRED' };
+    let settle: typeof SETTLE;
+    beforeEach(() => {
+      settle = { ...SETTLE };
+      SETTLE.delayMs = 5;
+      vi.mocked(postReview).mockClear();
+      vi.mocked(mergePR).mockClear();
+      vi.mocked(enableAutoMerge).mockClear();
+    });
+    afterEach(() => Object.assign(SETTLE, settle));
+
+    it('approves at the commit toured with the one confirmation, reads the PR again, then merges', async () => {
+      vi.mocked(fetchMergeStatus).mockReset().mockResolvedValueOnce(waiting).mockResolvedValueOnce(waiting).mockResolvedValue(status);
+      const onDone = vi.fn();
+      const ui = render(<MergeScreen repo="acme/pay" number={4} approve={{ headSha: 'head1234' }} width={110} height={30} onDone={onDone} onCancel={noop} />);
+      // The approval it will give lifts the review it waits on.
+      await waitFor(() => expect(ui.lastFrame()).toContain('Ready to merge'));
+      expect(ui.lastFrame()).toContain('Approve and merge · acme/pay #4');
+      expect(ui.lastFrame()).toContain('P approves it first, at head1234, the commit you toured; then merges.');
+      ui.stdin.write('P');
+      await waitFor(() => expect(ui.lastFrame()!.replace(/\s+/g, ' ')).toContain('Approve acme/pay#4 on GitHub, then squash and merge into main? y approve and merge'));
+      expect(postReview).not.toHaveBeenCalled();
+      ui.stdin.write('y');
+      await waitFor(() => expect(onDone).toHaveBeenCalledWith('Approved and merged acme/pay#4 (squash and merge) as merged12'));
+      expect(postReview).toHaveBeenCalledWith('acme/pay', 4, { commit_id: 'head1234', body: '', event: 'APPROVE', comments: [] });
+      expect(mergePR).toHaveBeenCalledWith('acme/pay', 4, expect.objectContaining({ method: 'squash', headSha: 'head1234' }));
+      ui.unmount();
+    });
+
+    it('says what still blocks it when the approval was not enough, and merges nothing', async () => {
+      vi.mocked(fetchMergeStatus)
+        .mockReset()
+        .mockResolvedValueOnce(waiting)
+        .mockResolvedValue({ ...waiting, reviewDecision: 'REVIEW_REQUIRED' });
+      const onDone = vi.fn();
+      const ui = render(<MergeScreen repo="acme/pay" number={4} approve={{ headSha: 'head1234' }} width={110} height={30} onDone={onDone} onCancel={noop} />);
+      await waitFor(() => expect(ui.lastFrame()).toContain('Ready to merge'));
+      ui.stdin.write('P');
+      await waitFor(() => expect(ui.lastFrame()).toContain('approve and merge'));
+      ui.stdin.write('y');
+      await waitFor(() => expect(ui.lastFrame()).toContain('Approved. It can’t merge yet'));
+      expect(ui.lastFrame()).toContain('needs an approving review');
+      expect(ui.lastFrame()).toContain('Merge · acme/pay #4');
+      expect(postReview).toHaveBeenCalledTimes(1);
+      expect(mergePR).not.toHaveBeenCalled();
+      expect(onDone).not.toHaveBeenCalled();
+      ui.unmount();
+    });
+
+    it('offers nothing when commits came after the tour', async () => {
+      vi.mocked(fetchMergeStatus)
+        .mockReset()
+        .mockResolvedValue({ ...waiting, headSha: 'newer999' });
+      const ui = render(<MergeScreen repo="acme/pay" number={4} approve={{ headSha: 'head1234' }} width={110} height={30} onDone={noop} onCancel={noop} />);
+      await waitFor(() => expect(ui.lastFrame()).toContain('new commits since your tour: read them before approving'));
+      ui.stdin.write('P');
+      await tick();
+      expect(ui.lastFrame()).not.toContain('approve and merge');
+      expect(postReview).not.toHaveBeenCalled();
+      ui.unmount();
+    });
   });
 });
 

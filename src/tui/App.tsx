@@ -4,17 +4,32 @@ import { KeysLive, useInput } from './input.js';
 import { Box, PreviewingContext, Text, ThemeContext, useThemePreview } from './themed.js';
 import { terminalPalette, themeList, type Palette, type ThemeInfo } from './theme.js';
 import { ThemePicker } from './ThemePicker.js';
-import { spawnSync } from 'node:child_process';
 import type { Chapter, ChapterOrder, Draft, ExistingThread, Hunk, PRInfo, ReactionContent, ReadState, ThreadComment, Tour } from '../types.js';
 import { Store } from '../store/db.js';
-import { fetchHeadSha, fetchMergeStatus, fetchPR, fetchThreads, getMentionUsers, replyToThread, setCommentReaction, viewerLogin } from '../github/gh.js';
+import {
+  fetchHeadSha,
+  fetchMergeStatus,
+  fetchPR,
+  fetchThreads,
+  fetchViewedFiles,
+  getMentionUsers,
+  replyToThread,
+  setCommentReaction,
+  setFileViewed,
+  setThreadResolved,
+  viewerLogin,
+  type ViewedState,
+} from '../github/gh.js';
+import { hunksViewedOnGitHub, viewedChanges } from '../review/viewed.js';
+import { isBotAuthor, isShortTour } from '../review/botPR.js';
+import { commitChapters, readCommitHunks } from '../review/commits.js';
 import { ensureWorktree } from '../git/worktree.js';
-import { localChanges, localPreview, type LocalPreview } from '../preview.js';
+import { localChanges, localPreview, type LocalPreview, type LocalTarget } from '../preview.js';
 import { runPipeline } from '../pipeline.js';
 import type { AgentRole, AgentRouting } from '../agent/types.js';
 import type { ViewSetting } from '../config.js';
 import { fileOrderChapters } from '../analysis/flows.js';
-import { applyMoves, firstHunk, hunkPosition, ORDER_SEQUENCE, pageOf, positionAfterOrderChange, sortChapters, stateOf, type States } from './nav.js';
+import { applyMoves, firstHunk, hunkPosition, ORDER_SEQUENCE, pageOf, positionAfterOrderChange, progress, sortChapters, stateOf, type States } from './nav.js';
 import { hunkKeys } from '../review/hunkState.js';
 import { ChapterScreen, type Services } from './ChapterScreen.js';
 import { BriefingScreen } from './BriefingScreen.js';
@@ -27,15 +42,14 @@ import { pushRecent, type RecentLocation } from './references.js';
 import { RepoIndex } from '../analysis/repoIndex.js';
 import { githubWebHost } from '../github/auth.js';
 import { generateSuggestion } from '../agent/suggest.js';
-import { PickerScreen, keyFor, type DownloadJob, type Target as PickTarget } from './PickerScreen.js';
+import { PickerScreen, keyFor, type DownloadJob, type PickerCache, type Target as PickTarget } from './PickerScreen.js';
 import { TourIntro, type IntroLine } from './TourIntro.js';
 import { useTerminalStatus, type TerminalProgress } from './terminalStatus.js';
 import { sanitizeTerminal } from '../util/sanitize.js';
 import { Hints, KeyBar, type Hint } from './KeyBar.js';
 import { plural } from './plural.js';
-import { codingAgentLaunch, type CodingAgentSetting } from '../codingAgent.js';
 import { AuthorMode } from './author/AuthorMode.js';
-import { ChecksPopup, MergePopup, ReviewersPopup } from './prPopups.js';
+import { checksPopup as checksPopupOver, mergePopup as mergePopupOver, reviewersPopup } from './prPopups.js';
 import { mergeReadiness, type Readiness } from '../review/merge.js';
 import { placedThreads } from '../review/feedback.js';
 import { loadThreadDiffs } from '../review/threadDiffs.js';
@@ -43,6 +57,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ErrorBlock } from './ErrorBlock.js';
+import { openInEditor } from '../util/editor.js';
+import { demoNarration } from '../demo.js';
 
 export interface Target {
   repo: string;
@@ -63,6 +79,7 @@ export interface AppOptions {
   sidebar?: boolean; // the user's saved \ setting; on when unset
   shortExplanation?: boolean; // the explanation cut to its first lines; off when unset
   commentLabels?: boolean; // comments carry a label (blocking, question, suggestion, nit); on when unset
+  syncViewed?: boolean; // read state mirrored to GitHub's Viewed checkboxes; on when unset
   tipsSeen?: string[]; // first-run tips already shown
   saveTipSeen?: (tip: string) => void; // records one; unset with no config file, where tips can't be remembered and so don't show
   saveViewSetting?: (key: ViewSetting, value: boolean) => void; // records a w or S toggle for next time
@@ -71,7 +88,12 @@ export interface AppOptions {
   preview?: LocalPreview; // gr preview: a tour of a local branch
   palette?: Palette; // the saved theme, loaded before the first frame; the terminal's colors when unset
   saveTheme?: (name: string) => void; // records a theme chosen in the picker; unset when there is no config file
-  codingAgent?: CodingAgentSetting; // the agent o opens; Claude Code when unset
+  previewTarget?: LocalTarget; // gr preview --base and gr diff: what `preview` compares, to read it again
+  demo?: boolean;
+  onQuit?: (summary: string | undefined) => void; // Q: the line to print once the screen is gone // gr demo: starts over each run, its preview carries written-out narration, and its submit screen posts nothing
+  update?: { version: string; deprecated?: string }; // a newer version gr can install, offered on the PR list
+  onUpdate?: () => void; // U on the PR list: gr closes to install the update
+  notice?: string; // shown on the PR list as it opens, such as the version just updated to
 }
 
 // The theme picker as the screens see it: L opens it over the picker, briefing, or chapter.
@@ -86,6 +108,22 @@ export type Phase = 'pick' | 'load' | 'own' | 'briefing' | 'chapter' | 'submit' 
 // The PR whose unposted drafts and queued replies Q asks about: the one open now. None at the PR
 // list (q there has left the PR, though the last target stays), and none for a local tour, which
 // has nowhere to post them.
+// The line left in the scrollback on Q: where the review stands and how to pick it up again.
+// Undefined when no tour is open (the PR list), and for the demo, which starts over anyway.
+export function quitSummary(o: { tour: Tour; mode: Mode; states: States; drafts: number; replies: number; local?: LocalPreview; demo?: boolean; name?: string }): string | undefined {
+  if (o.demo) return undefined;
+  const gr = o.name ?? 'gr';
+  const where = o.local ? o.tour.title : `${o.tour.repo}#${o.tour.pr}`;
+  const p = progress(o.tour, o.states);
+  const parts = [where];
+  if (o.mode === 'review') parts.push(`${p.read + p.skipped}/${p.total} hunks read`);
+  if (o.drafts) parts.push(`${plural(o.drafts, 'draft')} saved, not posted`);
+  if (o.replies) parts.push(`${plural(o.replies, 'reply', 'replies')} queued, not sent`);
+  // A preview is read again from the working tree, so it has no command to resume by.
+  if (!o.local) parts.push(`resume with ${gr} ${o.mode === 'author' ? 'feedback' : 'review'} ${o.tour.repo}#${o.tour.pr}`);
+  return parts.join(' · ');
+}
+
 export function quitAsksAbout(phase: Phase, tour: Pick<Tour, 'repo' | 'pr'> | undefined, target: Target | undefined, local: boolean): { repo: string; pr: number } | undefined {
   if (phase === 'pick' || local) return undefined;
   if (tour) return { repo: tour.repo, pr: tour.pr };
@@ -135,8 +173,10 @@ function tabProgress(phase: Phase, narration: { done: number; total: number } | 
   return { state: 'none' };
 }
 
-function chaptersForOrder(tour: Tour, order: ChapterOrder, moves: Record<string, string>, deltaOnly: boolean): Chapter[] {
-  const base = order === 'file' ? fileOrderChapters(tour.files, tour.hunks) : tour.chapters;
+// Commit order's chapters come from git, read when the order is first chosen; until they arrive,
+// the guided ones stand in.
+function chaptersForOrder(tour: Tour, order: ChapterOrder, moves: Record<string, string>, deltaOnly: boolean, byCommit?: Chapter[]): Chapter[] {
+  const base = order === 'file' ? fileOrderChapters(tour.files, tour.hunks) : order === 'commit' && byCommit ? byCommit : tour.chapters;
   // Sorted before the delta filter, so a re-review lists chapters in the same order as the whole tour.
   const chapters = sortChapters(applyMoves(base, tour, moves), tour, order);
   if (!deltaOnly || !tour.rereview) return chapters;
@@ -194,7 +234,14 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const { theme } = opts;
   const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useWindowSize();
-  const store = useMemo(() => new Store(), []);
+  const store = useMemo(() => {
+    const s = new Store();
+    // gr demo starts over each run: nothing read, no drafts.
+    if (opts.demo && opts.preview) s.forgetPR(opts.preview.pr.repo, opts.preview.pr.number);
+    return s;
+    // Once, as the app starts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [phase, setPhase] = useState<Phase>(opts.target || opts.preview ? 'load' : 'pick');
   const [submitFrom, setSubmitFrom] = useState<'briefing' | 'chapter'>('chapter');
   const [target, setTarget] = useState<Target | undefined>(opts.target ?? (opts.preview ? { repo: opts.preview.pr.repo, number: opts.preview.pr.number } : undefined));
@@ -202,7 +249,11 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   // where to read it again. Each load reads it again, as the working tree changes under it;
   // gr preview's first load uses what the CLI read.
   const [local, setLocal] = useState<LocalPreview | undefined>(opts.preview);
-  const localSource = useRef<{ cwd: string; first?: LocalPreview } | undefined>(opts.preview ? { cwd: opts.preview.worktree, first: opts.preview } : undefined);
+  // gr preview, gr diff and gr demo keep the repository name and the comparison they started with
+  // when they read it again.
+  const localSource = useRef<{ cwd: string; first?: LocalPreview; repo?: string; target?: LocalTarget } | undefined>(
+    opts.preview ? { cwd: opts.preview.worktree, first: opts.preview, repo: opts.preview.pr.repo, target: opts.previewTarget } : undefined,
+  );
   // What l on the PR list would tour, for the list to offer while there is some.
   const readLocalChanges = useMemo(() => (opts.localRepo ? () => localChanges(opts.localRepo!) : undefined), [opts.localRepo]);
   const [worktree, setWorktree] = useState<string>('');
@@ -233,12 +284,18 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   };
   const [hideTestPane, setHideTestPane] = useState(false);
   const [deltaOnly, setDeltaOnly] = useState(false);
+  // Commit order's chapters for this head, once read (a git log of the tour's commits).
+  const [byCommit, setByCommit] = useState<{ head: string; chapters: Chapter[] }>();
   const [pos, setPosState] = useState({ ci: 0, hi: 0 });
   const [banner, setBanner] = useState<string | undefined>();
-  const [pickerNotice, setPickerNotice] = useState<string | undefined>();
+  const [pickerNotice, setPickerNotice] = useState<string | undefined>(opts.notice);
   // The last review posted, shown on that PR's briefing too: the PR list is not the only way back.
   const [postedNotice, setPostedNotice] = useState<{ key: string; text: string }>();
   const [newHead, setNewHead] = useState<string | undefined>();
+  // The PR's Viewed checkboxes as last read or written, to mirror read state to; unset when not syncing.
+  const viewedSync = useRef<{ prId: string; viewed: Map<string, ViewedState> } | undefined>(undefined);
+  // gr preview: the reader edited the checkout with E, so the tour is behind the working tree.
+  const [localEdited, setLocalEdited] = useState(false);
   const [editing, setEditing] = useState<Draft | undefined>();
   const [editState, setEditState] = useState<ComposerState>();
   // Recent locations for this PR's session feed @ completion and its recent: filter. A ref:
@@ -254,9 +311,13 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const [merged, setMerged] = useState<ReadonlySet<string>>(new Set());
   const [readiness, setReadiness] = useState<Readiness>();
   const [merging, setMerging] = useState<Target>();
+  const [approving, setApproving] = useState(false); // the merge dialog approves first (a bot's PR, from the end card)
+  // A bot's dependency bump opens on its chapter: the briefing has nothing to add to it.
+  const skipBriefing = useRef(false);
   const [checking, setChecking] = useState<Target>(); // the checks popup, over the picker or the briefing
   const [askingReviewers, setAskingReviewers] = useState<Target>(); // the reviewers popup, over the picker
   const [pickerReload, setPickerReload] = useState(0);
+  const pickerCache = useRef<PickerCache>({}); // the list as it was, for coming back from a tour
   // Diffs from each outdated thread's commit to the head, so the tour shows it on its line now.
   const threadDiffs = useRef<Awaited<ReturnType<typeof loadThreadDiffs>>>(new Map());
   const loadGen = useRef(0);
@@ -372,7 +433,9 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
       setError('');
       setBanner(undefined);
       setNewHead(undefined);
+      setLocalEdited(false);
       setReadiness(undefined);
+      viewedSync.current = undefined;
       threadDiffs.current = new Map();
       try {
         let info: PRInfo;
@@ -384,7 +447,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           src.first = undefined;
           if (!p) {
             onProgress('Reading your local changes');
-            p = await localPreview(src.cwd);
+            p = await localPreview(src.cwd, src.repo, src.target);
             onProgress('Reading your local changes', true);
           }
           if (gen !== loadGen.current) return;
@@ -434,6 +497,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           noAgent: opts.noAgent,
           fresh,
           diffOverride: diff,
+          narrate: opts.demo ? demoNarration : undefined,
           signal,
           onProgress,
           onTour: (tr) => {
@@ -441,12 +505,27 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
             // Sessions in the session table win over any a cached tour carried.
             agentSessions.current = { ...tr.agentSessions, ...agentSessions.current };
             setTour({ ...tr, agentSessions: { ...agentSessions.current } });
-            // Show the briefing as soon as it is written; chapters keep narrating behind it.
-            const briefingReady = tr.mode === 'agent' || tr.complete || opts.noAgent;
-            if (!shown && briefingReady) {
+            // Show the briefing on the first tour in, the static one on a fresh build: the model's
+            // briefing fills it in when written, and chapters keep narrating behind it.
+            if (!shown) {
               shown = true;
               setDeltaOnly(!!tr.rereview?.newHunkIds.length);
+              skipBriefing.current = !src && isShortTour(tr);
               setPhase('briefing');
+              // Files viewed on GitHub are read here too; from now on, reading here ticks them there.
+              if (!src && opts.syncViewed !== false)
+                fetchViewedFiles(info.repo, info.number, signal).then(
+                  ({ prId, viewed }) => {
+                    if (gen !== loadGen.current) return;
+                    viewedSync.current = { prId, viewed };
+                    const read = hunksViewedOnGitHub(tr, store.getReadStates(info.repo, info.number), viewed);
+                    if (!read.length) return;
+                    const keys = read.flatMap(hunkKeys);
+                    store.setReadStates(info.repo, info.number, keys, 'read');
+                    setStates((prev) => ({ ...prev, ...Object.fromEntries(keys.map((k) => [k, 'read' as const])) }));
+                  },
+                  () => undefined, // offline, or an old GitHub Enterprise: reading works the same without it
+                );
             }
           },
         });
@@ -469,6 +548,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         }
         if (!shown) {
           setDeltaOnly(!!final.rereview?.newHunkIds.length);
+          skipBriefing.current = !src && isShortTour(final);
           setPhase('briefing');
         }
       } catch (e) {
@@ -522,15 +602,28 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   }, [pollRepo, pollPr, pollHead, preview, mode, newHead]);
 
   // ---------- derived ----------
+  const tourKey = tour ? `${tour.repo}#${tour.pr}@${tour.headSha}` : '';
+  const commitOrder = byCommit?.head === tourKey ? byCommit.chapters : undefined;
   const chapters: Chapter[] = useMemo(() => {
     if (!tour) return [];
-    return chaptersForOrder(tour, order, moves, deltaOnly);
-  }, [tour, order, moves, deltaOnly]);
+    return chaptersForOrder(tour, order, moves, deltaOnly, commitOrder);
+  }, [tour, order, moves, deltaOnly, commitOrder]);
+  // The briefing reorders flow chapters under a reader who opened the static tour; the position
+  // follows its chapter and hunk. Adjusted during render, so the stale index never draws.
+  const [plainChapters, setPlainChapters] = useState<{ head: string; chapters: Chapter[] }>();
+  const tourHead = tour ? `${tour.repo}#${tour.pr}@${tour.headSha}` : '';
+  if (tour?.mode === 'plain' && plainChapters?.chapters !== chapters) setPlainChapters({ head: tourHead, chapters });
+  if (tour?.mode === 'agent' && plainChapters) {
+    setPlainChapters(undefined);
+    if (plainChapters.head === tourHead) setPosState((p) => positionAfterOrderChange(plainChapters.chapters, p, chapters));
+  }
+  const writingBriefing = steps.some((s) => s.name === 'Writing briefing' && !s.done);
+  const busy = writingBriefing ? 'writing briefing' : narration ? `narrating ${narration.done}/${narration.total}` : analyzing ? 'narrating' : undefined;
   // The whole tour, so a re-review can show the chapters it leaves out, greyed.
   const allChapters: Chapter[] = useMemo(() => {
     if (!tour) return [];
-    return deltaOnly ? chaptersForOrder(tour, order, moves, false) : chapters;
-  }, [tour, order, moves, deltaOnly, chapters]);
+    return deltaOnly ? chaptersForOrder(tour, order, moves, false, commitOrder) : chapters;
+  }, [tour, order, moves, deltaOnly, commitOrder, chapters]);
 
   // The window title names the PR and where you are in it.
   const subject = local ? `preview ${local.pr.repo}` : target ? `${target.repo}#${target.number}` : undefined;
@@ -540,15 +633,47 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   // Switch between the new or changed hunks and the whole tour, keeping the current hunk when it is in both.
   const toggleDelta = () => {
     if (!tour?.rereview) return;
-    const nextChapters = chaptersForOrder(tour, order, moves, !deltaOnly);
+    const nextChapters = chaptersForOrder(tour, order, moves, !deltaOnly, commitOrder);
     setDeltaOnly(!deltaOnly);
     setPosState(positionAfterOrderChange(chapters, pos, nextChapters));
   };
 
-  const cycleOrder = () => {
+  // Commit order's chapters, read from git once per head. Undefined when they can't be read (no
+  // checkout yet, or git failed), and commit order is then passed over.
+  const readCommitOrder = async (): Promise<Chapter[] | undefined> => {
+    if (!tour || !worktree) return undefined;
+    if (commitOrder) return commitOrder;
+    try {
+      const list = await readCommitHunks(worktree, tour, !!local && !local.copy);
+      const read = commitChapters(tour, list);
+      setByCommit({ head: tourKey, chapters: read });
+      return read.length ? read : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // A tour reopened in commit order shows the guided chapters until the commits are read, then
+  // moves to them, keeping the reader on the same hunk.
+  useEffect(() => {
+    if (order !== 'commit' || !tour || commitOrder || !worktree) return;
+    let live = true;
+    const shown = chaptersForOrder(tour, 'commit', moves, deltaOnly);
+    void readCommitOrder().then((read) => {
+      if (live && read) setPosState((p) => positionAfterOrderChange(shown, p, chaptersForOrder(tour, 'commit', moves, deltaOnly, read)));
+    });
+    return () => {
+      live = false;
+    };
+    // Once per head and order; the rest is read when the commits arrive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [order, tourKey, worktree, commitOrder]);
+
+  const cycleOrder = async () => {
     if (!tour) return;
-    const next = ORDER_SEQUENCE[(ORDER_SEQUENCE.indexOf(order) + 1) % ORDER_SEQUENCE.length];
-    const nextChapters = chaptersForOrder(tour, next, moves, deltaOnly);
+    let next = ORDER_SEQUENCE[(ORDER_SEQUENCE.indexOf(order) + 1) % ORDER_SEQUENCE.length];
+    const nextCommits = next === 'commit' ? await readCommitOrder() : commitOrder;
+    if (next === 'commit' && !nextCommits) next = ORDER_SEQUENCE[(ORDER_SEQUENCE.indexOf(next) + 1) % ORDER_SEQUENCE.length];
+    const nextChapters = chaptersForOrder(tour, next, moves, deltaOnly, nextCommits);
     const { ci, hi } = positionAfterOrderChange(chapters, pos, nextChapters);
     const chapter = nextChapters[ci];
     setOrder(next);
@@ -574,6 +699,14 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     const c = chapters[ci];
     if (tour && c) store.setPosition(tour.repo, tour.pr, { chapterId: c.id, hunkId: hi >= 0 ? c.hunkIds[hi] : undefined, order });
   };
+
+  // The short tour's first frame: on to the chapter, where it would have resumed.
+  useEffect(() => {
+    if (phase !== 'briefing' || !skipBriefing.current || !chapters.length) return;
+    skipBriefing.current = false;
+    resume();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, chapters]);
 
   const resume = (ci?: number) => {
     if (!tour) return;
@@ -607,6 +740,15 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     const keys = hs.flatMap(hunkKeys);
     store.setReadStates(tour.repo, tour.pr, keys, s);
     setStates((prev) => ({ ...prev, ...Object.fromEntries(keys.map((k) => [k, s])) }));
+    // A file now read through, or no longer, ticks or clears its Viewed checkbox. A failed write
+    // leaves GitHub as it was, so it is tried again on the next change to that file.
+    const sync = viewedSync.current;
+    if (!sync) return;
+    for (const c of viewedChanges(tour, store.getReadStates(tour.repo, tour.pr), sync.viewed, hs)) {
+      const before = sync.viewed.get(c.path);
+      sync.viewed.set(c.path, c.viewed ? 'VIEWED' : 'UNVIEWED');
+      setFileViewed(sync.prId, c.path, c.viewed).catch(() => (before ? sync.viewed.set(c.path, before) : sync.viewed.delete(c.path)));
+    }
   };
 
   const saveDraft = (d: Draft) => {
@@ -632,6 +774,12 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     );
   };
 
+  // Z in a review thread: resolve or unresolve it on GitHub, then show it as GitHub says it is now.
+  const resolveThread = async (thread: ExistingThread, resolved: boolean) => {
+    const isResolved = await setThreadResolved(thread.id, resolved);
+    setTour((current) => (current ? { ...current, existingThreads: current.existingThreads.map((t) => (t.id === thread.id ? { ...t, isResolved } : t)) } : current));
+  };
+
   const reactToComment = async (comment: ThreadComment, content: ReactionContent, remove: boolean) => {
     if (!tour || !comment.nodeId) throw new Error('This comment cannot receive reactions.');
     const reactionGroups = await setCommentReaction(comment.nodeId, content, remove);
@@ -648,33 +796,30 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     );
   };
 
-  const openInAgent = async (h: Hunk | undefined, c: Chapter) => {
-    if (!tour) return;
-    const related = drafts.filter((d) => !d.posted && (d.anchor.type === 'line' || d.anchor.type === 'range') && h && d.anchor.file === h.file);
-    const threads = tour.existingThreads.filter((t) => h && t.path === h.file);
-    const hunkText = h ? `${h.file} ${h.header}\n${h.lines.map((l) => (l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ') + l.text).join('\n')}` : '';
-    const prompt = [
-      `I'm reviewing ${tour.repo}#${tour.pr} (${tour.url}) at ${tour.headSha.slice(0, 8)}, chapter "${c.title}".`,
-      h ? `Here is the hunk:\n\`\`\`diff\n${hunkText}\n\`\`\`` : '',
-      related.length ? `My draft comments:\n${related.map((d) => `- ${opts.commentLabels === false ? '' : `[${d.label}] `}line ${(d.anchor as { line: number }).line}: ${d.body}`).join('\n')}` : '',
-      threads.length ? `Existing review threads:\n${threads.map((t) => `- line ${t.line ?? t.originalLine}: ${t.comments.map((x) => `@${x.author}: ${x.body}`).join(' / ')}`).join('\n')}` : '',
-      'Help me dig into this.',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
-    // A NUL byte from the PR would make spawnSync throw rather than start the agent.
-    const agent = codingAgentLaunch(opts.codingAgent, prompt.replaceAll('\0', ''));
+  // E: the file at a line in $EDITOR, in the checkout the tour reads. In a preview that is the
+  // reader's own, so an edit offers to rebuild the tour; in a PR, or two commits of gr diff, it is
+  // gr's detached copy.
+  const editFile = async (file: string, line: number): Promise<string | undefined> => {
+    const full = path.resolve(worktree, file);
+    if (path.relative(worktree, full).startsWith('..')) return `${file} is outside the checkout.`;
+    if (!fs.existsSync(full)) return local ? `${file} is not in your working tree.` : `${file} is not in the PR head: the PR deletes it.`;
+    const before = fs.readFileSync(full, 'utf8');
+    let failed: string | undefined;
     await suspendTerminal(() => {
-      // spawnSync throws on arguments it can't pass at all; report those like a failed start.
       try {
-        const r = spawnSync(agent.command, agent.args, { stdio: 'inherit', cwd: worktree || process.cwd() });
-        if (r.error) process.stderr.write(`Could not start ${agent.command}: ${r.error.message}\n`);
+        openInEditor(full, line);
       } catch (e) {
-        process.stderr.write(`Could not start ${agent.command}: ${(e as Error).message}\n`);
+        failed = (e as Error).message;
       }
     });
-    // The agent sets its own title; put gr's back.
     rewriteTerminalStatus();
+    if (failed) return `Could not open the editor: ${failed}`;
+    if (fs.existsSync(full) && fs.readFileSync(full, 'utf8') === before) return undefined;
+    if (!local) return `Saved in gr's copy of the PR head (${worktree}), not in a branch of yours.`;
+    if (local.copy) return `Saved in gr's copy of ${local.pr.headRef} (${worktree}), not in your working tree.`;
+    setLocalEdited(true);
+    setBanner(`▲ You edited ${file} · R rebuilds the tour on your working tree (drafts are kept)`);
+    return undefined;
   };
 
   const toggleView = (key: ViewSetting, value: boolean, set: (v: boolean) => void) => {
@@ -735,9 +880,70 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     }
   };
 
+  // Ctrl+Z: give the terminal back to the shell and stop, as a terminal program does; fg resumes
+  // with the screen redrawn. Raw mode turns Ctrl+Z into a key, so gr stops itself. Without job
+  // control (no shell to take the terminal), the system ignores the stop: gr then comes straight
+  // back and says so. Windows has none, so there it does nothing.
+  const suspendToShell = async () => {
+    let stopped = true;
+    await suspendTerminal(
+      () =>
+        new Promise<void>((resolve) => {
+          // The loop stays alive meanwhile: a stop that never comes must not let gr exit.
+          const keepAlive = setInterval(() => undefined, 1000);
+          const done = () => {
+            clearInterval(keepAlive);
+            clearTimeout(ignored);
+            process.removeListener('SIGCONT', done);
+            resolve();
+          };
+          // A stopped process runs no timers: this firing on time means the stop was ignored, and
+          // firing late, that gr was stopped and is resuming (before SIGCONT is handled).
+          const start = Date.now();
+          const ignored = setTimeout(() => {
+            stopped = Date.now() - start > 600;
+            done();
+          }, 300);
+          process.once('SIGCONT', done);
+          // The whole process group, as the terminal's own Ctrl+Z would: under a parent that
+          // waits for gr (pnpm, npx, tsx), the shell's job is the parent, which must stop too.
+          process.kill(0, 'SIGTSTP');
+        }),
+    );
+    // The window may have been resized while stopped.
+    process.stdout.emit('resize');
+    rewriteTerminalStatus();
+    if (stopped) return;
+    // Said wherever the reader is: the chapter's header, the briefing, or the PR list.
+    const note = 'Ctrl+Z suspends gr only under a shell with job control; this terminal has none.';
+    setBanner(note);
+    if (tour) setPostedNotice({ key: `${tour.repo}#${tour.pr}`, text: note });
+    setPickerNotice(note);
+  };
+  useInkInput(
+    (input, key) => {
+      if (key.ctrl && input === 'z') void suspendToShell();
+    },
+    // From the first screen on, as the screens' own handlers start: one taking the terminal's
+    // input during the load (straight after gr review's question) leaves Ink without it.
+    { isActive: process.platform !== 'win32' && phase !== 'load' },
+  );
+
   const quit = () => {
     loadAbort.current?.abort();
     predownloadAbort.current?.abort();
+    if (tour && phase !== 'pick' && phase !== 'load')
+      opts.onQuit?.(
+        quitSummary({
+          tour,
+          mode,
+          states,
+          drafts: store.listDrafts(tour.repo, tour.pr).filter((d) => !d.posted).length,
+          replies: store.listReplies(tour.repo, tour.pr).length,
+          local,
+          demo: opts.demo,
+        }),
+      );
     exit();
   };
   // Q: quit, once asked again when drafts or replies have not been posted. They are saved, so
@@ -773,6 +979,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         setSteps([]);
         setBanner(undefined);
         setNewHead(undefined);
+        setLocalEdited(false);
         setAnalyzing(undefined);
         setNarration(undefined);
         setPhase('pick');
@@ -826,27 +1033,30 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     // A merge started from the picker has no checkout: a model drafting its message gets an empty
     // directory to work in, and the PR's own text in the prompt.
     const mergeAgent = (cwd?: string) => (opts.agent && !opts.noAgent ? { cwd: cwd ?? emptyDir(), ...opts.agent } : undefined);
-    const mergePopup = (background: ReactNode, t: Target, withTour?: Tour) => (
-      <MergePopup
-        background={background}
-        width={columns}
-        height={rows}
-        repo={t.repo}
-        number={t.number}
-        tour={withTour}
-        agent={mergeAgent(withTour ? worktree || undefined : undefined)}
-        onCancel={() => setMerging(undefined)}
-        onQuit={requestQuit}
-        onDone={(notice) => {
+    const mergePopup = (background: ReactNode, t: Target, withTour?: Tour) =>
+      mergePopupOver({
+        background,
+        width: columns,
+        height: rows,
+        repo: t.repo,
+        number: t.number,
+        tour: withTour,
+        agent: mergeAgent(withTour ? worktree || undefined : undefined),
+        approve: approving && withTour ? { headSha: withTour.headSha } : undefined,
+        onCancel: () => {
           setMerging(undefined);
+          setApproving(false);
+        },
+        onQuit: requestQuit,
+        onDone: (notice) => {
+          setMerging(undefined);
+          setApproving(false);
           setMerged((m) => new Set(m).add(keyFor(t)));
           showMerged(notice);
-        }}
-      />
-    );
-    const checksPopup = (background: ReactNode, t: Target) => (
-      <ChecksPopup background={background} width={columns} height={rows} repo={t.repo} number={t.number} onClose={() => setChecking(undefined)} onQuit={requestQuit} />
-    );
+        },
+      });
+    const checksPopup = (background: ReactNode, t: Target) =>
+      checksPopupOver({ background, width: columns, height: rows, repo: t.repo, number: t.number, onClose: () => setChecking(undefined), onQuit: requestQuit });
     if (phase === 'pick') {
       const picker = (active: boolean) => (
         <PickerScreen
@@ -876,30 +1086,38 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           onChecks={setChecking}
           onReviewers={setAskingReviewers}
           reload={pickerReload}
+          cache={pickerCache.current}
           merged={merged}
           downloads={downloads}
           onDownload={startDownloads}
           onTheme={theme.show}
+          update={opts.update}
+          onUpdate={
+            opts.onUpdate
+              ? () => {
+                  opts.onUpdate!();
+                  quit();
+                }
+              : undefined
+          }
           onQuit={requestQuit}
         />
       );
       if (merging) return mergePopup(picker(false), merging);
       if (checking) return checksPopup(picker(false), checking);
       if (askingReviewers)
-        return (
-          <ReviewersPopup
-            background={picker(false)}
-            width={columns}
-            height={rows}
-            repo={askingReviewers.repo}
-            number={askingReviewers.number}
-            onQuit={requestQuit}
-            onClose={(changed) => {
-              setAskingReviewers(undefined);
-              if (changed) setPickerReload((n) => n + 1);
-            }}
-          />
-        );
+        return reviewersPopup({
+          background: picker(false),
+          width: columns,
+          height: rows,
+          repo: askingReviewers.repo,
+          number: askingReviewers.number,
+          onQuit: requestQuit,
+          onClose: (changed) => {
+            setAskingReviewers(undefined);
+            if (changed) setPickerReload((n) => n + 1);
+          },
+        });
       return withThemePicker(picker);
     }
     if (phase === 'error') {
@@ -928,14 +1146,16 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         ...shown,
         ...Array.from({ length: INTRO_STEPS - shown.length }, () => ' '),
         ' ',
-        [{ text: `The briefing opens as soon as it is written · ${back ? 'q for the PR list · Q to quit' : 'q to quit'}`, dim: true }],
+        [{ text: `The briefing opens once the diff is mapped · ${back ? 'q for the PR list · Q to quit' : 'q to quit'}`, dim: true }],
       ];
     };
     if (phase === 'load' || !tour) {
       return <TourIntro width={width} height={height} lines={introLines} onBack={back} onQuit={requestQuit} />;
     }
+    // A narrated tour opened with the model off (--no-agent on a saved tour, or the demo's written
+    // narration) still has no model to ask.
     const agent =
-      tour.mode === 'agent' && worktree
+      (tour.mode === 'agent' || writingBriefing) && worktree && !opts.noAgent
         ? {
             cwd: worktree,
             ...opts.agent,
@@ -950,9 +1170,11 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     // Why AI features are off, said in their place.
     const aiOff = agent
       ? undefined
-      : opts.noAgent
-        ? 'AI is off for this review (no model in gr config, or --no-agent), so questions are off.'
-        : 'The model is unavailable for this tour, so questions are off. The briefing says why.';
+      : opts.demo
+        ? 'The demo runs without a model, so questions are off. Run gr config to choose one for your own reviews.'
+        : opts.noAgent
+          ? 'AI is off for this review (no model in gr config, or --no-agent), so questions are off.'
+          : 'The model is unavailable for this tour, so questions are off. The briefing says why.';
 
     if (phase === 'author') {
       // Author mode reads its tour statically, so its model use goes by the config, not the tour.
@@ -989,7 +1211,6 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
             void load(target, opts.fresh, 'review');
           }}
           onMerged={showMerged}
-          onTheme={theme.show}
           onBack={back}
           onQuit={requestQuit}
         />
@@ -1042,12 +1263,14 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         tour={tour}
         chapters={chapters}
         allChapters={allChapters}
+        drafts={drafts}
         order={order}
-        cycleOrder={cycleOrder}
+        cycleOrder={() => void cycleOrder()}
         deltaOnly={deltaOnly}
         toggleDelta={toggleDelta}
         states={states}
-        analyzing={narration ? `narrating ${narration.done}/${narration.total}` : analyzing ? 'narrating' : undefined}
+        analyzing={busy}
+        writingBriefing={writingBriefing}
         agent={agent}
         aiOff={aiOff}
         width={width}
@@ -1087,7 +1310,8 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         order={order}
         deltaOnly={deltaOnly}
         banner={banner}
-        busy={narration ? `narrating ${narration.done}/${narration.total}` : analyzing ? 'narrating' : undefined}
+        busy={busy}
+        writingBriefing={writingBriefing}
         agent={agent}
         aiOff={aiOff}
         width={width}
@@ -1101,12 +1325,13 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           setDrafts(store.listDrafts(d.repo, d.pr));
         }}
         replyToThread={local ? undefined : sendThreadReply}
+        resolveThread={local ? undefined : resolveThread}
         reactToComment={local ? undefined : reactToComment}
         moveHunk={(h, chapterId) => {
           for (const k of hunkKeys(h)) store.setMove(tour.repo, tour.pr, k, chapterId);
           setMoves(store.getMoves(tour.repo, tour.pr));
         }}
-        toggleOrder={cycleOrder}
+        toggleOrder={() => void cycleOrder()}
         hideWhitespace={hideWhitespace}
         toggleWhitespace={() => toggleView('hideWhitespace', hideWhitespace, setHideWhitespace)}
         splitDiff={splitDiff}
@@ -1124,8 +1349,16 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           setPhase('submit');
         }}
         openBriefing={() => setPhase('briefing')}
-        openInAgent={(h, c) => void openInAgent(h, c)}
-        rebase={newHead && target ? () => void load(target, false, 'review') : undefined}
+        approveAndMerge={
+          !local && target && isBotAuthor(tour) && !merged.has(keyFor(target))
+            ? () => {
+                setApproving(true);
+                setMerging(target);
+              }
+            : undefined
+        }
+        rebase={target && (newHead || localEdited) ? () => void load(target, localEdited, 'review') : undefined}
+        editFile={worktree ? editFile : undefined}
         onTheme={theme.show}
         quit={requestQuit}
       />
@@ -1163,7 +1396,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
       );
     }
     if (phase === 'submit') {
-      if (local) {
+      if (local && !opts.demo) {
         return (
           <ReviewPopup background={submitBackground()} width={width} height={height} maxWidth={76} maxHeight={9} tone="decision">
             {() => <PreviewSubmit onBack={() => setPhase(submitFrom)} />}
@@ -1202,11 +1435,13 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
               onBack={() => setPhase(submitFrom)}
               onQuit={requestQuit}
               loadMentionUsers={local ? undefined : () => getMentionUsers(tour.repo)}
+              noPost={opts.demo ? 'This is the demo: nothing is posted. p shows what a draft would post as.' : undefined}
             />
           )}
         </ReviewPopup>
       );
     }
+    if (merging) return mergePopup(chapterScreen(false), merging, tour);
     return withThemePicker(chapterScreen);
   }
 }
@@ -1293,8 +1528,8 @@ function PreviewSubmit(props: { onBack: () => void }) {
   useInput(() => props.onBack());
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Text bold>Author preview</Text>
-      <Text>This tour is a preview of your branch: there is no PR to post to yet. Flagged gaps and drafts stay local.</Text>
+      <Text bold>Local changes</Text>
+      <Text>This tour is of local changes, so there is no PR to post a review to. Flagged gaps and drafts stay on your machine.</Text>
       <Text dimColor>any key to go back</Text>
     </Box>
   );

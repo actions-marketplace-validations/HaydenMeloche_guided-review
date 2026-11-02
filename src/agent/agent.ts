@@ -1,7 +1,7 @@
 import { setMaxListeners } from 'node:events';
 import { readOnlyGuard, readOnlyHook } from './guard.js';
 import type { Chapter, DiffLine, Graph, Hunk, PRInfo, Tour } from '../types.js';
-import { briefingPrompt, chapterPrompt, SYSTEM_PROMPT } from './prompts.js';
+import { briefingPrompt, chapterPrompt, summaryPrompt, SYSTEM_PROMPT } from './prompts.js';
 import { runCompatible } from './openaiCompatible.js';
 import { runOpenAI } from './openaiResponses.js';
 import { runCodex } from './codex.js';
@@ -253,23 +253,6 @@ const briefingSchema = {
   type: 'object',
   properties: {
     intent: { type: 'string', description: '2-3 sentences: what the PR does and why' },
-    missingChanges: {
-      type: 'array',
-      description: 'things the PR probably should have changed but did not (docs, CHANGELOG, migration, feature flag, translations, config)',
-      items: {
-        type: 'object',
-        properties: { message: { type: 'string' }, hunkIds: { type: 'array', items: { type: 'string' } } },
-        required: ['message'],
-      },
-    },
-    scopeCreep: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { message: { type: 'string' }, hunkIds: { type: 'array', items: { type: 'string' } } },
-        required: ['message'],
-      },
-    },
     chapters: {
       type: 'array',
       description: 'one entry per flow/supporting chapter id given, in the recommended reading order',
@@ -307,7 +290,6 @@ const chapterSchema = {
         required: ['id', 'narration', 'citesCode'],
       },
     },
-    untestedBranches: { type: 'array', items: { type: 'string' } },
     checklist: {
       type: 'array',
       description: 'pre-check of each team checklist item given, by id',
@@ -324,8 +306,6 @@ const chapterSchema = {
 
 export interface BriefingResult {
   intent: string;
-  scopeCreep?: { message: string; hunkIds?: string[] }[];
-  missingChanges?: { message: string; hunkIds?: string[] }[];
   chapters: { id: string; title: string; summary: string }[];
   overview?: Graph;
 }
@@ -333,7 +313,6 @@ export interface BriefingResult {
 export interface ChapterResult {
   hunkOrder?: string[];
   hunks: { id: string; narration: string; citesCode: boolean; risk?: number; riskReason?: string; orphanReason?: string }[];
-  untestedBranches?: string[];
   diagram?: Graph;
   checklist?: { id: string; status: 'pass' | 'fail' | 'unknown'; reason?: string }[];
 }
@@ -361,6 +340,11 @@ export function selectionContext(hunk: Hunk, lineIdx?: number, endIdx?: number, 
 
 // API providers can run without tool calling; the model then sees only what the prompt gives it.
 export const withoutTools = (config: AgentConfig) => (config.provider === 'openai-compatible' || config.provider === 'openai' || config.provider === 'anthropic') && config.toolCalling === false;
+
+// The briefing's on-demand summary (i). A one-off call on the Q&A routing, outside its session.
+export async function summarize(opts: AgentContext & { tour: Tour; onText: (text: string) => void; signal?: AbortSignal }): Promise<RunResult<string>> {
+  return runRole<string>('qa', summaryPrompt(opts.tour), opts, { onText: opts.onText, signal: opts.signal, maxTurns: 8, session: false });
+}
 
 export interface AskTurn {
   question: string;

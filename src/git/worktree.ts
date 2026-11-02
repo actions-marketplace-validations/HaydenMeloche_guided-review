@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { PRInfo } from '../types.js';
 import { grHome, repoSlug } from '../paths.js';
 import { gh } from '../github/gh.js';
-import { gitAuthEnv, githubAuth } from '../github/auth.js';
+import { githubAuth } from '../github/auth.js';
 import { restJson, webHost } from '../github/api.js';
 import { git, repoFromRemote } from './git.js';
 
@@ -58,7 +58,7 @@ async function repoCache(repo: string, localRepo?: string): Promise<string> {
   const dir = path.join(grHome(), 'repos', `${repoSlug(repo)}.git`);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(path.dirname(dir), { recursive: true });
-    await git(path.dirname(dir), ['clone', '--bare', '--filter=blob:none', await cloneUrl(repo), dir], { maxBuffer: 256 * 1024 * 1024, env: gitAuthEnv() });
+    await git(path.dirname(dir), ['clone', '--bare', '--filter=blob:none', await cloneUrl(repo), dir], { maxBuffer: 256 * 1024 * 1024 });
   }
   return dir;
 }
@@ -75,7 +75,7 @@ export async function hasCommit(root: string, sha: string, signal?: AbortSignal)
 
 // Fetches one commit by id from origin, e.g. a PR's earlier head for a re-review diff.
 export async function fetchCommit(root: string, sha: string, signal?: AbortSignal): Promise<void> {
-  await git(root, ['fetch', '--quiet', 'origin', sha], { signal, env: gitAuthEnv() });
+  await git(root, ['fetch', '--quiet', 'origin', sha], { signal });
 }
 
 export async function ensureWorktree(pr: PRInfo, opts: { localRepo?: string } = {}): Promise<string> {
@@ -85,7 +85,7 @@ export async function ensureWorktree(pr: PRInfo, opts: { localRepo?: string } = 
 
   if (!(await hasCommit(repoDir, pr.headSha)) || !(await hasCommit(repoDir, pr.baseSha))) {
     // Refs live under refs/gr/ so the user's branches are never touched.
-    await git(repoDir, ['fetch', 'origin', pr.baseSha, `+refs/pull/${pr.number}/head:refs/gr/pr-${pr.number}`], { maxBuffer: 256 * 1024 * 1024, env: gitAuthEnv() });
+    await git(repoDir, ['fetch', 'origin', pr.baseSha, `+refs/pull/${pr.number}/head:refs/gr/pr-${pr.number}`], { maxBuffer: 256 * 1024 * 1024 });
   }
 
   if (fs.existsSync(path.join(target, '.git'))) return target;
@@ -100,6 +100,19 @@ export async function ensureWorktree(pr: PRInfo, opts: { localRepo?: string } = 
   }
   await git(repoDir, ['worktree', 'prune']).catch(() => undefined);
   await git(repoDir, ['worktree', 'add', '--detach', target, pr.headSha], { maxBuffer: 256 * 1024 * 1024 });
+  return target;
+}
+
+// A detached checkout of one commit of the repository at `root`, for touring a range of commits
+// without touching the user's working tree. Named as a PR worktree numbered 0, so gr cleanup
+// removes it like the others.
+export async function commitWorktree(root: string, repo: string, sha: string): Promise<string> {
+  const dir = path.join(grHome(), 'worktrees', repoSlug(repo));
+  const target = path.join(dir, `pr-0-${sha.slice(0, 8)}`);
+  if (fs.existsSync(path.join(target, '.git'))) return target;
+  fs.mkdirSync(dir, { recursive: true });
+  await git(root, ['worktree', 'prune']).catch(() => undefined);
+  await git(root, ['worktree', 'add', '--detach', target, sha], { maxBuffer: 256 * 1024 * 1024 });
   return target;
 }
 
@@ -221,10 +234,7 @@ async function githubDefaultBranch(repo: string): Promise<string> {
 // (git init + remote add, or a host other than GitHub). Never prompts: a remote that needs a
 // password or a passphrase fails fast instead of hanging the preview.
 async function originDefaultBranch(root: string): Promise<string> {
-  const out = await git(root, ['ls-remote', '--symref', 'origin', 'HEAD'], {
-    timeout: 5000,
-    env: { ...gitAuthEnv(), GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes' },
-  });
+  const out = await git(root, ['ls-remote', '--symref', 'origin', 'HEAD'], { timeout: 5000 });
   return out.match(/^ref: refs\/heads\/(\S+)\tHEAD$/m)?.[1] ?? '';
 }
 

@@ -272,7 +272,7 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       title body url
-      author { login }
+      author { login __typename }
       baseRefName headRefName baseRefOid headRefOid
       commits(first: 100) { nodes { commit { oid message } } }
       closingIssuesReferences(first: 10) { nodes { title body url number } }
@@ -286,7 +286,7 @@ interface PRQueryResult {
       title: string;
       body: string;
       url: string;
-      author: { login: string } | null;
+      author: { login: string; __typename?: string } | null;
       baseRefName: string;
       headRefName: string;
       baseRefOid: string;
@@ -378,6 +378,7 @@ export async function fetchPR(repo: string, number: number, signal?: AbortSignal
     body: pr.body ?? '',
     url: pr.url,
     author: pr.author?.login ?? 'ghost',
+    ...(pr.author?.__typename === 'Bot' ? { authorBot: true } : {}),
     baseRef: pr.baseRefName,
     headRef: pr.headRefName,
     baseSha: pr.baseRefOid,
@@ -740,6 +741,28 @@ export async function currentBranchPR(cwd: string): Promise<{ repo: string; numb
   }
 }
 
+// A repo's open PRs, most recently updated first, for shell completion of PR numbers.
+export async function listOpenPRs(repo: string, signal?: AbortSignal): Promise<{ number: number; title: string }[]> {
+  const [owner, name] = repo.split('/');
+  const data = await graphql<{ repository: { pullRequests: { nodes: { number: number; title: string }[] } } | null }>(
+    `
+      query ($owner: String!, $name: String!) {
+        repository(owner: $owner, name: $name) {
+          pullRequests(states: OPEN, first: 50, orderBy: { field: UPDATED_AT, direction: DESC }) {
+            nodes {
+              number
+              title
+            }
+          }
+        }
+      }
+    `,
+    { owner, name },
+    signal,
+  );
+  return data.repository?.pullRequests.nodes ?? [];
+}
+
 export async function postReview(repo: string, number: number, payload: ReviewPayload): Promise<{ id: number; url: string }> {
   const path = `repos/${repo}/pulls/${number}/reviews`;
   const auth = githubAuth();
@@ -1001,6 +1024,10 @@ export interface MergeStatus {
   methods: MergeMethod[]; // what the repository allows, in GitHub's order
   viewerCanMerge: boolean; // write access or more
   deleteBranchOnMerge: boolean;
+  autoMerge?: MergeMethod; // auto-merge is on, with this method: GitHub merges once the requirements are met
+  autoMergeTitle?: string; // the commit title auto-merge will use, when it was given one
+  viewerCanEnableAutoMerge?: boolean; // the repository allows auto-merge and the viewer may turn it on
+  viewerCanDisableAutoMerge?: boolean;
   checks: CheckSummary;
   unresolvedThreads: number;
   unresolvedThreadsAtLeast?: boolean; // the PR has more than the 100 threads read: the count is a lower bound
@@ -1014,6 +1041,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     viewerPermission mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed deleteBranchOnMerge
     pullRequest(number: $number) {
       id title state isDraft viewerCanUpdate viewerCanUpdateBranch mergeable mergeStateStatus reviewDecision headRefOid headRefName baseRefName
+      viewerCanEnableAutoMerge viewerCanDisableAutoMerge autoMergeRequest { mergeMethod commitHeadline }
       headRepository { nameWithOwner }
       commits { totalCount }
       reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } }
@@ -1135,6 +1163,9 @@ export async function fetchMergeStatus(repo: string, number: number, signal?: Ab
         isDraft: boolean;
         viewerCanUpdate: boolean;
         viewerCanUpdateBranch: boolean;
+        viewerCanEnableAutoMerge?: boolean;
+        viewerCanDisableAutoMerge?: boolean;
+        autoMergeRequest?: { mergeMethod: string; commitHeadline?: string | null } | null;
         mergeable: string;
         mergeStateStatus: string;
         reviewDecision: string | null;
@@ -1173,6 +1204,10 @@ export async function fetchMergeStatus(repo: string, number: number, signal?: Ab
     methods,
     viewerCanMerge: ['ADMIN', 'MAINTAIN', 'WRITE'].includes(r.viewerPermission ?? ''),
     deleteBranchOnMerge: r.deleteBranchOnMerge,
+    ...(pr.autoMergeRequest ? { autoMerge: pr.autoMergeRequest.mergeMethod.toLowerCase() as MergeMethod } : {}),
+    ...(pr.autoMergeRequest?.commitHeadline ? { autoMergeTitle: pr.autoMergeRequest.commitHeadline } : {}),
+    viewerCanEnableAutoMerge: !!pr.viewerCanEnableAutoMerge,
+    viewerCanDisableAutoMerge: !!pr.viewerCanDisableAutoMerge,
     checks: summarizeChecks(pr.last.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? []),
     unresolvedThreads: pr.reviewThreads.nodes.filter((t) => !t.isResolved).length,
     ...(pr.reviewThreads.pageInfo.hasNextPage ? { unresolvedThreadsAtLeast: true } : {}),
@@ -1253,6 +1288,44 @@ export async function mergePR(repo: string, number: number, req: MergeRequest): 
     ? await restJson<{ sha: string }>(auth, path, { method: 'PUT', body })
     : (JSON.parse(await gh(['api', '-X', 'PUT', path, '--input', '-'], { input: JSON.stringify(body) })) as { sha: string });
   return { sha: res.sha };
+}
+
+// Turns on auto-merge: GitHub merges the PR with this method once its requirements are met.
+// GitHub refuses it for a PR that can merge now (merge it instead), and, as with mergePR, when
+// the head moved since the viewer saw it.
+export async function enableAutoMerge(prId: string, req: MergeRequest): Promise<void> {
+  const vars: Record<string, string> = { id: prId, method: req.method.toUpperCase(), head: req.headSha };
+  if (req.method !== 'rebase') {
+    if (req.title !== undefined) vars.title = req.title;
+    if (req.message !== undefined) vars.message = req.message;
+  }
+  await graphql(
+    `
+      mutation ($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!, $title: String, $message: String) {
+        enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $head, commitHeadline: $title, commitBody: $message }) {
+          pullRequest {
+            id
+          }
+        }
+      }
+    `,
+    vars,
+  );
+}
+
+export async function disableAutoMerge(prId: string): Promise<void> {
+  await graphql(
+    `
+      mutation ($id: ID!) {
+        disablePullRequestAutoMerge(input: { pullRequestId: $id }) {
+          pullRequest {
+            id
+          }
+        }
+      }
+    `,
+    { id: prId },
+  );
 }
 
 export async function deleteBranch(repo: string, branch: string): Promise<void> {
@@ -1357,4 +1430,135 @@ export async function listAuthoredPRs(signal?: AbortSignal): Promise<{ prs: Auth
     };
   });
   return { prs, truncated: more };
+}
+
+// ---------- PRs you reviewed ----------
+
+// An open PR you reviewed, not yours, that no longer asks for your review: what happened since.
+export interface ReviewedPR extends ReviewRequest {
+  reviewedAt: string; // your latest review
+  newCommits: number; // commits made after it
+  newCommitsAtLeast?: boolean; // more commits than were read: the count is a lower bound
+  replies: number; // unresolved threads you started where someone else spoke last
+}
+
+const REVIEWED_QUERY = `
+query($q: String!, $after: String) {
+  viewer { login }
+  search(query: $q, type: ISSUE, first: 50, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number title url updatedAt isDraft
+        author { login }
+        repository { nameWithOwner }
+        labels(first: 10) { nodes { name } }
+        latestReviews(first: 50) { nodes { author { login } submittedAt } }
+        commits(last: 100) { totalCount nodes { commit { committedDate } } }
+        reviewThreads(first: 100) { nodes { isResolved first: comments(first: 1) { nodes { author { login } } } last: comments(last: 1) { nodes { author { login } } } } }
+      }
+    }
+  }
+}`;
+
+export const REVIEWED_LIMIT = 100;
+
+// Open PRs you reviewed that aren't yours and no longer request your review (a re-request puts
+// them back under review requests), a page at a time up to REVIEWED_LIMIT. `truncated` says
+// there were more.
+export async function listReviewedPRs(signal?: AbortSignal): Promise<{ prs: ReviewedPR[]; truncated: boolean }> {
+  type Login = { author: { login: string } | null };
+  type Node = {
+    number: number;
+    title: string;
+    url: string;
+    updatedAt: string;
+    isDraft: boolean;
+    author: { login: string } | null;
+    repository: { nameWithOwner: string };
+    labels: { nodes: { name: string }[] };
+    latestReviews: { nodes: (Login & { submittedAt: string | null })[] };
+    commits: { totalCount: number; nodes: { commit: { committedDate: string } }[] };
+    reviewThreads: { nodes: { isResolved: boolean; first: { nodes: Login[] }; last: { nodes: Login[] } }[] };
+  };
+  type Page = { viewer: { login: string }; search: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: (Node | Record<string, never>)[] } };
+  const nodes: Node[] = [];
+  let me = '';
+  let after = '';
+  let more = false;
+  for (let page = 0; page < REVIEWED_LIMIT / 50; page++) {
+    const data = await graphql<Page>(REVIEWED_QUERY, { q: 'is:pr is:open reviewed-by:@me -author:@me -review-requested:@me archived:false sort:updated-desc', ...(after ? { after } : {}) }, signal);
+    me = data.viewer.login;
+    nodes.push(...data.search.nodes.filter((n): n is Node => 'number' in n));
+    more = data.search.pageInfo.hasNextPage && !!data.search.pageInfo.endCursor;
+    if (!more) break;
+    after = data.search.pageInfo.endCursor!;
+  }
+  const by = (n: { nodes: Login[] }) => n.nodes[0]?.author?.login;
+  const prs = nodes.flatMap((n): ReviewedPR[] => {
+    const reviewedAt = n.latestReviews.nodes.find((r) => r.author?.login === me)?.submittedAt;
+    // The search can match a review GitHub's latestReviews doesn't list (a dismissed one): nothing to measure from.
+    if (!reviewedAt) return [];
+    const newCommits = n.commits.nodes.filter((c) => c.commit.committedDate > reviewedAt).length;
+    return [
+      {
+        repo: n.repository.nameWithOwner,
+        number: n.number,
+        title: n.title,
+        author: n.author?.login ?? 'ghost',
+        url: n.url,
+        updatedAt: n.updatedAt,
+        isDraft: n.isDraft,
+        labels: n.labels.nodes.map((l) => l.name),
+        reviewedAt,
+        newCommits,
+        // Every commit read is newer, and there are more than were read.
+        ...(newCommits === n.commits.nodes.length && n.commits.totalCount > n.commits.nodes.length ? { newCommitsAtLeast: true } : {}),
+        replies: n.reviewThreads.nodes.filter((t) => !t.isResolved && by(t.first) === me && by(t.last) !== me).length,
+      },
+    ];
+  });
+  return { prs, truncated: more };
+}
+
+// ---------- the Viewed checkboxes on the Files tab ----------
+
+// VIEWED, UNVIEWED, or DISMISSED: viewed, then changed by a later push.
+export type ViewedState = 'VIEWED' | 'UNVIEWED' | 'DISMISSED';
+
+const VIEWED_QUERY = `
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+      files(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { path viewerViewedState } }
+    }
+  }
+}`;
+
+// GitHub lists at most 3,000 files of a PR.
+const VIEWED_PAGES = 30;
+
+// The viewer's Viewed state of each file of a PR, and the PR's node id to change them with.
+export async function fetchViewedFiles(repo: string, number: number, signal?: AbortSignal): Promise<{ prId: string; viewed: Map<string, ViewedState> }> {
+  const { owner, name } = splitRepo(repo);
+  type Page = { repository: { pullRequest: { id: string; files: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: { path: string; viewerViewedState: ViewedState }[] } } } };
+  const viewed = new Map<string, ViewedState>();
+  let prId = '';
+  let after = '';
+  for (let page = 0; page < VIEWED_PAGES; page++) {
+    const data = await graphql<Page>(VIEWED_QUERY, { owner, name, number, ...(after ? { after } : {}) }, signal);
+    const pr = data.repository.pullRequest;
+    prId = pr.id;
+    for (const f of pr.files.nodes) viewed.set(f.path, f.viewerViewedState);
+    if (!pr.files.pageInfo.hasNextPage || !pr.files.pageInfo.endCursor) break;
+    after = pr.files.pageInfo.endCursor;
+  }
+  return { prId, viewed };
+}
+
+// Ticks or clears a file's Viewed checkbox for the viewer. Only the viewer sees it.
+export async function setFileViewed(prId: string, path: string, viewed: boolean): Promise<void> {
+  const action = viewed ? 'markFileAsViewed' : 'unmarkFileAsViewed';
+  await graphql(`mutation($id: ID!, $path: String!) { ${action}(input: { pullRequestId: $id, path: $path }) { clientMutationId } }`, { id: prId, path });
 }

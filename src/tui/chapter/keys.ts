@@ -25,7 +25,6 @@ export interface KeyCtx {
   rereview: boolean;
   deltaOnly: boolean; // a re-review shows only new and changed hunks
   rebase: boolean;
-  theme: boolean;
 }
 
 export type Action =
@@ -72,16 +71,20 @@ export type Action =
   | 'order'
   | 'delta'
   | 'rebase'
-  | 'openInAgent'
+  | 'editor'
+  | 'copyLink'
+  | 'openOnGitHub'
   | 'checklist'
   | 'submit'
   | 'help'
-  | 'theme'
   | 'summaryDown'
   | 'summaryUp'
   | 'expand'
   | 'skipChapter'
   | 'palette'
+  | 'search'
+  | 'history'
+  | 'callers'
   | 'sidebar'
   | 'explanation';
 
@@ -260,7 +263,19 @@ export const KEYS: KeyRow[] = [
     ],
     bar: [{ mode: 'code', key: 'x', label: 'skip' }],
   },
-  { keys: 'f', group: 'Read', help: 'Cycle Guided, Risk first, Small first, and File order', bind: [{ mode: 'code', on: ['f'], do: 'order', palette: 'Change the chapter order' }] },
+  { keys: 'f', group: 'Read', help: 'Cycle Guided, Risk first, Small first, File, and Commit order', bind: [{ mode: 'code', on: ['f'], do: 'order', palette: 'Change the chapter order' }] },
+  {
+    keys: 'H',
+    group: 'Read',
+    help: 'History of the selected lines before the PR (git log -L)',
+    bind: [{ mode: 'code', on: ['H'], do: 'history', when: hunk, palette: 'History of these lines' }],
+  },
+  {
+    keys: 'B',
+    group: 'Read',
+    help: 'Blast radius: uses of what this hunk changes in files the PR leaves alone',
+    bind: [{ mode: 'code', on: ['B'], do: 'callers', when: hunk, palette: 'Callers outside the PR (blast radius)' }],
+  },
   {
     keys: 'D',
     group: 'Read',
@@ -270,8 +285,8 @@ export const KEYS: KeyRow[] = [
   {
     keys: 'S',
     group: 'Settings',
-    help: 'Split view (old beside new) or inline',
-    bind: [{ mode: 'code', on: ['S'], do: 'split', palette: 'Split view: old beside new, or inline' }],
+    help: 'Toggle between split (old beside new) and inline view',
+    bind: [{ mode: 'code', on: ['S'], do: 'split', palette: 'Toggle between split and inline view' }],
   },
   { keys: 'w', group: 'Settings', help: 'Hide or show whitespace-only changes', bind: [{ mode: 'code', on: ['w'], do: 'whitespace', palette: 'Hide or show whitespace-only changes' }] },
   {
@@ -292,16 +307,10 @@ export const KEYS: KeyRow[] = [
     bind: [{ mode: 'code', on: ['R'], do: 'rebase', when: (c) => c.rebase, palette: 'Rebuild on the new head' }],
   },
   {
-    keys: 'o',
+    keys: 'E',
     group: 'Settings',
-    help: 'Open the hunk in your coding agent (set in gr config)',
-    bind: [{ mode: 'code', on: ['o'], do: 'openInAgent', palette: 'Open the hunk in your coding agent' }],
-  },
-  {
-    keys: 'L',
-    group: 'Settings',
-    help: 'Color theme (previews as you move through the list)',
-    bind: [{ mode: 'code', on: ['L'], do: 'theme', when: (c) => c.theme, palette: 'Color theme' }],
+    help: 'Open the file at the cursor line in $EDITOR',
+    bind: [{ mode: 'code', on: ['E'], do: 'editor', when: hunk, palette: 'Open the file at this line in your editor' }],
   },
   {
     keys: '\\',
@@ -309,8 +318,23 @@ export const KEYS: KeyRow[] = [
     help: 'Show or hide the chapter list beside the chapter (wide terminals)',
     bind: [{ mode: 'any', on: ['\\'], do: 'sidebar', palette: 'Show or hide the chapter list' }],
   },
+  {
+    keys: 'Y / O',
+    group: 'Go',
+    help: 'Copy a permalink to the line or range / open it on GitHub',
+    bind: [
+      { mode: 'code', on: ['Y'], do: 'copyLink', when: hunk, palette: 'Copy a permalink to the line or range' },
+      { mode: 'code', on: ['O'], do: 'openOnGitHub', when: hunk, palette: 'Open the line or range on GitHub' },
+    ],
+  },
   // Palette only: no key of its own.
   { keys: '', bind: [{ mode: 'code', on: [], do: 'explanation', palette: 'Short or whole explanation' }] },
+  {
+    keys: '/',
+    group: 'Go',
+    help: 'Search the diff and its explanations (not the whole codebase)',
+    bind: [{ mode: 'code', on: ['/'], do: 'search', palette: 'Search the diff' }],
+  },
   {
     keys: ':',
     group: 'Go',

@@ -8,7 +8,7 @@ import type { Chapter, DiffFile, DiffLine, Hunk } from '../src/types.js';
 describe('buildChapters', () => {
   const { files, hunks } = buildFixture();
   const index = buildSymbolIndex(files, hunks, ctx);
-  const { chapters, overview, notes, flags } = buildChapters(files, hunks, index);
+  const { chapters, overview, notes } = buildChapters(files, hunks, index);
   const h = (f: string) => hunkOf(hunks, f);
 
   it('orders the main flow by call order with types before first use', () => {
@@ -18,11 +18,9 @@ describe('buildChapters', () => {
     // The paired test's diff follows the code it tests.
     expect(flow.hunkIds).toEqual([h('src/routes/invoices.ts'), h('src/types.ts'), h('src/services/invoice.ts'), h('src/db/invoiceRepo.ts'), h('test/invoice.test.ts')]);
     expect(flow.risk).toBe(2);
-    expect(flow.untestedBranches.some((b) => b.includes('if (total < 0)'))).toBe(true);
     expect(flow.diagram?.kind).toBe('call');
     expect(flow.diagram?.nodes.length).toBeGreaterThanOrEqual(4);
     expect(notes).toEqual([]);
-    expect(flags).toEqual([]);
   });
 
   it('puts orphans in supporting changes with a reason', () => {
@@ -42,6 +40,25 @@ describe('buildChapters', () => {
     const tests = out.chapters.find((c) => c.kind === 'tests')!;
     expect(tests.title).toBe('Test changes');
     expect(tests.hunkIds).toEqual([id]);
+  });
+
+  it('keeps a fixture nothing links to beside the test that names it', () => {
+    const extra = buildFixture();
+    const testId = hunkOf(extra.hunks, 'test/invoice.test.ts');
+    // A new fixture module the test imports; no code symbol links to it.
+    const fixture = 'h_fixture';
+    extra.hunks[fixture] = { ...extra.hunks[testId], id: fixture, file: 'test/fixtures/invoiceFixture.ts', tests: [] };
+    extra.files.push({ path: 'test/fixtures/invoiceFixture.ts', status: 'added', binary: false, kind: 'test', kindReason: 'test file', additions: 1, deletions: 0, hunkIds: [fixture] });
+    const place = (importLine: string) => {
+      const hunks = { ...extra.hunks, [testId]: { ...extra.hunks[testId], lines: [{ kind: 'add' as const, text: importLine, newLine: 1 }, ...extra.hunks[testId].lines] } };
+      return buildChapters(extra.files, hunks, buildSymbolIndex(extra.files, hunks, ctx)).chapters;
+    };
+    const named = place("import { sample } from './fixtures/invoiceFixture.js';");
+    expect(named[0].hunkIds.slice(-2)).toEqual([testId, fixture]);
+    expect(named.some((c) => c.kind === 'tests')).toBe(false);
+    // Not named by any test in a flow: it is a test-only change.
+    const unnamed = place("import { other } from './fixtures/other.js';");
+    expect(unnamed.find((c) => c.kind === 'tests')?.hunkIds).toEqual([fixture]);
   });
 
   it('pairs tests and sinks low-priority kinds in order', () => {
@@ -88,7 +105,6 @@ describe('buildChapters', () => {
     const idx = buildSymbolIndex(f3, h3, ctx);
     idx.entries = [];
     const res = buildChapters(f3, h3, idx);
-    expect(res.flags[0].kind).toBe('no-entry-point');
     expect(res.notes[0]).toMatch(/No entry point/);
     expect(res.chapters[0].title).toMatch(/file order/);
   });
@@ -189,7 +205,6 @@ describe('splitByDirectory', () => {
       hunkIds: ['a', 'b', 'c'],
       linkedHunkIds: ['c'],
       orphanReasons: { a: 'constant change', b: 'dead code removal' },
-      untestedBranches: ['packages/foo/a.ts:3 if (x)', 'packages/bar/b.ts:9 else'],
       diagram: { kind: 'call', title: 'T', nodes: [], edges: [] },
       collapsed: false,
     };
@@ -201,9 +216,8 @@ describe('splitByDirectory', () => {
       risk: 1,
       orphanReasons: { a: 'constant change' },
       linkedHunkIds: ['c'],
-      untestedBranches: ['packages/foo/a.ts:3 if (x)'],
     });
-    expect(bar).toMatchObject({ id: 'c2-2', hunkIds: ['b'], risk: 3, linkedHunkIds: [], untestedBranches: ['packages/bar/b.ts:9 else'] });
+    expect(bar).toMatchObject({ id: 'c2-2', hunkIds: ['b'], risk: 3, linkedHunkIds: [] });
     expect(foo.diagram).toBeUndefined();
   });
 });

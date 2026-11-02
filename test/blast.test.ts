@@ -35,6 +35,8 @@ describe('findBlastRadius', () => {
     expect(create.callers.map((c) => c.file)).toEqual(['src/admin/rebill.ts']);
     expect(items.find((i) => i.symbol === 'table invoices')?.callers[0].file).toBe('src/reports/sales.sql');
     expect(items.find((i) => i.symbol === 'event invoice.created')?.callers[0].file).toBe('src/notify.ts');
+    expect(items.find((i) => i.symbol === 'table invoices')?.change).toBe('table');
+    expect(items.find((i) => i.symbol === 'event invoice.created')?.change).toBe('event');
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

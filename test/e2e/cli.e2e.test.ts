@@ -68,6 +68,17 @@ describe('gr commands that print and exit', () => {
     expect(debug.stderr).toContain('    at ');
   });
 
+  it('checks the machine with doctor, without a terminal or setup, and fails on a signed-out gh', async () => {
+    const result = await runGr(box, ['doctor', '--no-agent']);
+    // The sandbox's gh fails every call, so gh is a problem to fix; nothing asks to set up first.
+    expect(result.code).toBe(1);
+    expect(result.stdout).toMatch(/✓ node\s+\d+\.\d+/);
+    expect(result.stdout).toMatch(/✗ gh\s+.*not signed in.*gh auth login/);
+    expect(result.stdout).toContain('model        not set up yet');
+    expect(result.stdout).toMatch(/problems? to fix/);
+    expect(fs.existsSync(path.join(box.env.GR_HOME!, 'config.json'))).toBe(false);
+  });
+
   it('cleans up with no worktrees present', async () => {
     const result = await runGr(box, ['cleanup']);
     expect(result.code).toBe(0);
@@ -137,8 +148,6 @@ describe('gr with a terminal', () => {
       await session.waitFor(about);
     }
     session.press(KEY.enter);
-    await session.waitFor('Coding agent');
-    session.press(KEY.enter);
     await session.waitFor('Plain comments');
     session.press(KEY.enter);
     // The fake gh runs but isn't signed in, so GitHub access is asked for, starting on gh.
@@ -185,10 +194,20 @@ describe('gr with a terminal', () => {
     session.press('q');
   });
 
-  it('explains a missing PR when the branch has none', async () => {
+  it('offers the preview when the branch has no PR, and n leaves', async () => {
     const session = startGr(box, ['review', '--no-agent'], { cwd: fixtureRepo(box) });
-    await session.waitFor('no PR given');
-    expect(await session.exited).toBe(1);
+    await session.waitFor('No open PR for feature/discount. Tour the branch against');
+    session.press('n', KEY.enter);
+    expect(await session.exited).toBe(0);
+  });
+
+  it('opens the preview of a branch with no PR on enter, and the tour takes keys', async () => {
+    const session = startGr(box, ['review', '--no-agent'], { cwd: fixtureRepo(box) });
+    await session.waitFor('[Y/n]');
+    session.press(KEY.enter);
+    await session.waitFor('feature/discount (preview)');
+    session.press('n');
+    await session.waitFor(/hunk 1\/1/);
   });
 
   it('explains a missing PR for feedback when the branch has none', async () => {

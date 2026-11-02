@@ -84,18 +84,37 @@ pnpm build
 pnpm add -g .
 </code></pre>
           <p>If pnpm&#39;s global binary directory is not on your <code>PATH</code>, run <code>pnpm setup</code> once and restart your shell.</p>
+          <h2 id="updating"><a class="anchor" href="#updating" aria-hidden="true">#</a>Updating</h2>
+          <p>
+            <code>gr</code> checks npm for a newer version once a day, without slowing anything down. The first time <code>gr</code> starts after a release, it offers the update with the release notes
+            since your version: install it, put it off, or skip that version. Put off, it waits on the PR list, where <code>U</code> installs it, and <code>gr</code> mentions it once a day as it
+            exits. Run <code>gr update</code> to update at any time. Either way, <code>gr</code> runs the package manager that installed it (npm, pnpm, Yarn, Bun, or Volta), checks that the
+            <code>gr</code> on your <code>PATH</code> is the new version, and restarts it. If another copy of <code>gr</code> comes first on your <code>PATH</code>, such as one from another Node
+            version, it says where that copy is.
+          </p>
+          <p>
+            A version with a serious problem, such as a security fix or a GitHub change that breaks it, is marked deprecated on npm. If yours is, <code>gr</code> says why and offers the update each
+            time it starts, and the version can&#39;t be skipped.
+          </p>
+          <p>After an update, <code>gr</code> also updates the <code>/guided-review</code> command and the Codex skill if you installed them and have not edited them.</p>
           <h2 id="configure-a-model"><a class="anchor" href="#configure-a-model" aria-hidden="true">#</a>Configure a model</h2>
           <p>
-            The first run walks you through setup: a color theme, a model provider, the coding agent <code>o</code> opens, and GitHub access. It finds what your machine already has, such as a Codex
-            login or an <code>ANTHROPIC_API_KEY</code>, and tests each model before saving. Run <code>gr config</code> to go through it again. An Anthropic, OpenAI, or Cursor API key is the fastest
-            choice; Codex works from your Codex CLI login with no key. With Claude, OpenAI, and Codex models, setup runs summaries and narration at low effort to keep tours quick; Q&amp;A uses the
-            model&#39;s default. To review without AI, choose <strong>No AI model</strong> in setup, or pass <code>--no-agent</code> for one review. See
-            <a href="configuration.html">Configuration</a> for every provider, compatible endpoints, Bedrock, Vertex, and GitHub tokens.
+            The first run walks you through setup: a color theme, a model provider, comment labels, and GitHub access. It finds what your machine already has, such as a Codex login or an
+            <code>ANTHROPIC_API_KEY</code>, and tests each model before saving. Run <code>gr config</code> to go through it again. An Anthropic, OpenAI, or Cursor API key is the fastest choice; Codex
+            works from your Codex CLI login with no key. With Claude, OpenAI, and Codex models, setup runs summaries and narration at low effort to keep tours quick; Q&amp;A uses the model&#39;s
+            default. To review without AI, choose <strong>No AI model</strong> in setup, or pass <code>--no-agent</code> for one review. See <a href="configuration.html">Configuration</a> for every
+            provider, compatible endpoints, Bedrock, Vertex, and GitHub tokens.
           </p>
           <p>
             The tour is built from static analysis of the diff and the checkout. A model adds the briefing&#39;s summary, each chapter&#39;s explanation, and answers to your questions. Without one,
             everything else still works, and nothing leaves your machine.
           </p>
+          <p>
+            To try it before setting anything up, run <code>gr demo</code>. It tours a small made-up change (discount codes in a shop, with a moved function, a generated file, and an import-only
+            change) from a repository it writes to <code>~/.guided-review/demo</code>, with no PR, no <code>gh</code>, and no model: its briefing and explanations were written ahead of time. Read,
+            comment, and open the submit screen as in any review; nothing can be posted. Each run starts over, with nothing read and no drafts.
+          </p>
+          <p>If something doesn&#39;t work, run <code>gr doctor</code>: it checks everything gr needs and says what to install or change.</p>
           <h2 id="use-from-claude-code-or-codex"><a class="anchor" href="#use-from-claude-code-or-codex" aria-hidden="true">#</a>Use from Claude Code or Codex</h2>
           <p>
             <code>gr install-claude-command</code> adds a <code>/guided-review</code> command to Claude Code, and <code>gr install-codex-skill</code> adds a skill to Codex. Both preview your local

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { Chapter, DiffLine, ExistingThread, Hunk } from '../src/types.js';
-import { cursorNotes } from '../src/tui/chapter/lineNotes.js';
+import type { Chapter, DiffLine, Draft, ExistingThread, Hunk } from '../src/types.js';
+import { chapterNotes, chapterSize, cursorNotes } from '../src/tui/chapter/lineNotes.js';
 import { linkedTests } from '../src/tui/chapter/linkedTests.js';
-import { anchorLines, crossesContext, describeAnchor, lineAnchor, newDraft, selectedCode, selRange, testLineAnchor } from '../src/tui/chapter/selection.js';
+import { anchorLines, crossesContext, describeAnchor, lineAnchor, linkLines, newDraft, selectedCode, selRange, testLineAnchor } from '../src/tui/chapter/selection.js';
 import { diffLines, hunk } from './fixtures/tour.js';
 
 // Two diff lines, three lines of expanded context, then two more diff lines.
@@ -162,5 +162,44 @@ describe('linkedTests', () => {
   it('has none without a hunk or links', () => {
     expect(linkedTests(undefined, 0)).toMatchObject({ tests: [], lines: [], any: false });
     expect(linkedTests(hunk('h6', 'src/e.ts', diffLines(['+x'])), 0).any).toBe(false);
+  });
+});
+
+describe('linkLines', () => {
+  it('links the new lines of a selection, or its removed lines when it has none', () => {
+    const h = hunk('h9', 'src/c.ts', diffLines([' a', '-b', '-c', '+d', ' e'], 10));
+    expect(linkLines(h, [0, 0])).toEqual({ side: 'new', start: 10, end: 10 });
+    expect(linkLines(h, [1, 2])).toEqual({ side: 'old', start: 11, end: 12 });
+    // Removed lines inside a range with new ones are left out of it.
+    expect(linkLines(h, [1, 4])).toEqual({ side: 'new', start: 11, end: 12 });
+  });
+});
+
+describe('chapterNotes', () => {
+  it('counts the current threads on a chapter’s lines, resolved apart, and your unposted drafts', () => {
+    const h = hunk('h1', 'src/a.ts', diffLines([' a', '-b', '+c'], 10));
+    const t = (id: string, extra: Partial<ExistingThread>): ExistingThread => ({ id, path: 'src/a.ts', isResolved: false, isOutdated: false, comments: [], ...extra });
+    const chapter = { id: 'c1', hunkIds: ['h1'] } as Chapter;
+    const tour = {
+      hunks: { h1: h },
+      existingThreads: [
+        t('open', { line: 11 }),
+        t('resolved', { line: 10, isResolved: true }),
+        // Outdated, though placed on a line of the hunk: about code since changed.
+        t('outdated', { originalLine: 11, isOutdated: true, placed: { line: 11, side: 'RIGHT' } }),
+        t('elsewhere', { line: 99 }),
+      ],
+    };
+    const draft = (anchor: Draft['anchor'], posted = false) => ({ id: Math.random().toString(), anchor, posted }) as Draft;
+    const drafts = [draft({ type: 'line', hunkId: 'h1', file: 'src/a.ts', line: 11, side: 'RIGHT' }), draft({ type: 'chapter', chapterId: 'c2' }), draft({ type: 'chapter', chapterId: 'c1' }, true)];
+    expect(chapterNotes(tour, chapter, drafts)).toEqual({ open: 1, resolved: 1, drafts: 1 });
+  });
+});
+
+describe('chapterSize', () => {
+  it('counts the lines a chapter’s hunks add and remove, not the context around them', () => {
+    const chapter = { id: 'c1', hunkIds: ['h1', 'h2', 'gone'] } as Chapter;
+    const tour = { hunks: { h1: fused, h2: hunk('h2', 'src/b.ts', diffLines(['+x', '+y', '-z'], 1)) } };
+    expect(chapterSize(tour, chapter)).toEqual({ added: 4, removed: 2 });
   });
 });

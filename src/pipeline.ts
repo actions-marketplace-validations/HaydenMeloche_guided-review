@@ -1,10 +1,9 @@
-import type { Chapter, ChecklistStatus, DiffFile, Flag, Graph, Hunk, PRInfo, ProgressFn, RepoConfig, Risk, Tour } from './types.js';
+import type { Chapter, ChecklistStatus, DiffFile, Graph, Hunk, PRInfo, ProgressFn, RepoConfig, Risk, Tour } from './types.js';
 import { changedCount, maxRisk } from './diff/lines.js';
 import { HUNK_ID_RE } from './diff/parse.js';
 import { parseTourDiff } from './diff/fuse.js';
 import { markMovedLines, unmovedFiles } from './diff/moves.js';
 import { classifyFiles } from './analysis/kinds.js';
-import { checkGeneratedSync } from './analysis/generatedSync.js';
 import { SPECIAL_CHAPTERS } from './analysis/special.js';
 import { buildSymbolIndex } from './analysis/symbols.js';
 import { attachChangedTestDiffs, COVERAGE_FILES, pairTests } from './analysis/tests.js';
@@ -15,13 +14,12 @@ import { findBlastRadius } from './analysis/blast.js';
 import { defaultRepoConfig, parseRepoConfig } from './config.js';
 import { clearImportNoise, markImportOnly, separateImportChapter } from './analysis/imports.js';
 import { initTreeSitter } from './analysis/treesitter.js';
-import { findMissingChanges } from './analysis/missing.js';
 import { applicableChecklists } from './analysis/checklists.js';
 import { listFiles, diffBetween, fetchCommit, hasCommit, mergeBaseOf, prDiff } from './git/worktree.js';
 import { primeBaseCache, readBlobs } from './git/blobs.js';
 import { fetchDiff, fetchReviews, fetchThreads, getMentionUsers, viewerLogin } from './github/gh.js';
 import { fetchSharedTour, restoreSharedTour } from './github/sharedTour.js';
-import { analyzeBriefing, analyzeChapter, AgentUnavailableError, type ChapterResult } from './agent/agent.js';
+import { analyzeBriefing, analyzeChapter, AgentUnavailableError, type BriefingResult, type ChapterResult } from './agent/agent.js';
 import { routingIdentity, type AgentRole, type AgentRouting } from './agent/types.js';
 import { chapterBatches, isTruncated, lockPairOf, MINOR_SUMMARY_ID, minorHunkIds } from './agent/prompts.js';
 import { computeReReview } from './review/rereview.js';
@@ -47,6 +45,14 @@ export interface PipelineOptions {
   // emission is a new top-level object, and unchanged chapters and hunks keep their identity.
   onTour: (tour: Tour) => void;
   signal?: AbortSignal;
+  // Written-out model results for the static tour, applied as a model's would be: gr demo's
+  // briefing and narration, without a model.
+  narrate?: (tour: Tour) => CannedNarration;
+}
+
+export interface CannedNarration {
+  briefing: BriefingResult;
+  chapters: { id: string; result: ChapterResult }[];
 }
 
 // Files that steer the review itself. They are read from the merge base, never from the PR head,
@@ -82,29 +88,13 @@ export async function buildStaticTour(pr: PRInfo, diff: string, worktree: string
   const [configText, gitattributes] = REVIEW_CONFIG_FILES.map((p) => blobs.get(p));
   signal?.throwIfAborted();
 
-  const flags: Flag[] = [];
   const touched = changedPaths(files);
-  const touchedConfig = REVIEW_CONFIG_FILES.filter((p) => touched.has(p));
-  if (touchedConfig.length) {
-    flags.push({
-      kind: 'info',
-      message: `This PR changes ${touchedConfig.join(' and ')}, which steer this tour (file kinds, test patterns, checklists). The tour uses the base branch's version; review the change itself carefully.`,
-      hunkIds: files.filter((f) => touchedConfig.includes(f.path) || touchedConfig.includes(f.oldPath ?? '')).flatMap((f) => f.hunkIds),
-    });
-  }
   const untrustedCoverage = COVERAGE_FILES.filter((p) => touched.has(p));
-  if (untrustedCoverage.length) {
-    flags.push({
-      kind: 'info',
-      message: `This PR changes committed coverage data (${untrustedCoverage.join(', ')}): it was ignored, so coverage-based test links are not shown for it.`,
-    });
-  }
 
   onProgress('Classifying files by kind');
   const config = repoConfigFromText(configText);
   classifyFiles(files, hunks, { gitattributes: gitattributes ?? '', readHead, config });
   markMovedLines(hunkList, readHead, unmovedFiles(files));
-  flags.push(...checkGeneratedSync(files, hunks));
   markImportOnly(files, hunks);
   onProgress('Classifying files by kind', true);
 
@@ -127,11 +117,9 @@ export async function buildStaticTour(pr: PRInfo, diff: string, worktree: string
 
   const built = buildChapters(files, hunks, index);
   built.chapters = separateImportChapter(built.chapters, hunks);
-  flags.push(...built.flags);
   const notes = [...built.notes];
   if (index.lowConfidence) notes.push('Some files have no static analyzer: their flow edges come from naming and are low confidence.');
 
-  flags.push(...findMissingChanges(files, hunks, { listFiles: () => allFiles, readHead }));
   for (const [chapterId, items] of applicableChecklists(built.chapters, hunks, config.checklists)) {
     const ch = built.chapters.find((c) => c.id === chapterId);
     if (ch) ch.checklist = items;
@@ -139,17 +127,9 @@ export async function buildStaticTour(pr: PRInfo, diff: string, worktree: string
 
   const kindOf = new Map(files.map((f) => [f.path, f.kind]));
   const logicHunks = Object.values(hunks).filter((h) => !h.importOnly && kindOf.get(h.file) === 'logic');
-  const untestedRisky = logicHunks.filter((h) => h.coverage === 'untested' && h.risk >= 2);
-  if (untestedRisky.length) {
-    flags.push({ kind: 'missing-tests', message: `${untestedRisky.length} risky hunk(s) have no linked test`, hunkIds: untestedRisky.map((h) => h.id) });
-  }
   const changed = logicHunks.reduce((n, h) => n + changedCount(h), 0);
   if (changed > LARGE_PR_LINES) {
     built.chapters = splitByDirectory(built.chapters, hunks);
-    flags.push({
-      kind: 'large-pr',
-      message: `${changed} changed lines of hand-written code: supporting changes are split by directory and analyzed in batches; very large hunks get a lighter analysis.`,
-    });
   }
 
   signal?.throwIfAborted();
@@ -171,13 +151,13 @@ export async function buildStaticTour(pr: PRInfo, diff: string, worktree: string
     title: pr.title,
     url: pr.url,
     author: pr.author,
+    ...(pr.authorBot ? { authorBot: true } : {}),
     baseSha: mergeBase,
     headSha: pr.headSha,
     createdAt: new Date().toISOString(),
     mode: 'plain',
     intent: fallbackIntent(pr),
     description: pr.body,
-    flags,
     notes,
     overview: built.overview,
     chapters: built.chapters,
@@ -251,7 +231,7 @@ const CHECKLIST_STATUSES: ChecklistStatus[] = ['pass', 'fail', 'unknown'];
 // the hunks the result narrated are new objects; everything else keeps its identity.
 // `minorIds` share the result's summary entry; `sharedRiskIds` also take its risk (a lockfile
 // pair's manifest hunks, whose one narration is that entry).
-export function applyChapterResult(tour: Tour, chapterId: string, r: ChapterResult, opts: { minorIds?: string[]; sharedRiskIds?: string[]; untestedBranches?: string[] } = {}): Tour {
+export function applyChapterResult(tour: Tour, chapterId: string, r: ChapterResult, opts: { minorIds?: string[]; sharedRiskIds?: string[] } = {}): Tour {
   const idx = tour.chapters.findIndex((c) => c.id === chapterId);
   if (idx < 0) return tour;
   const old = tour.chapters[idx];
@@ -290,8 +270,6 @@ export function applyChapterResult(tour: Tour, chapterId: string, r: ChapterResu
     }
   }
   if (orphanReasons) chapter.orphanReasons = orphanReasons;
-  if (opts.untestedBranches) chapter.untestedBranches = opts.untestedBranches.map(fix);
-  else if (r.untestedBranches?.length) chapter.untestedBranches = r.untestedBranches.map(fix);
   if (r.checklist?.length && old.checklist) {
     const results = new Map(r.checklist.map((c) => [c.id, c]));
     // Checklist status is the model's pre-check only (see ChecklistItem.status); the reviewer's
@@ -326,17 +304,10 @@ export function sanitizeGraph(g: Graph, tour: Tour): Graph | undefined {
   };
 }
 
-// The briefing's result as a new tour: intent, flags, chapter titles and order, overview.
+// The briefing's result as a new tour: intent, chapter titles and order, overview.
 function applyBriefing(tour: Tour, brief: Awaited<ReturnType<typeof analyzeBriefing>>): Tour {
   const fix = (s: string) => humanizeHunkIds(s, tour);
   const fixOpt = (s?: string) => (s === undefined ? s : fix(s));
-  let flags = tour.flags;
-  flags = [...(brief.value.scopeCreep ?? []).map((s): Flag => ({ kind: 'scope-creep', message: s.message, hunkIds: s.hunkIds?.filter((id) => tour.hunks[id]) })), ...flags];
-  for (const m of brief.value.missingChanges ?? []) {
-    if (!flags.some((f) => f.kind === 'missing-change' && f.message === m.message)) {
-      flags = [...flags, { kind: 'missing-change', message: m.message, hunkIds: m.hunkIds?.filter((id) => tour.hunks[id]) }];
-    }
-  }
   const named = new Map(brief.value.chapters.map((c) => [c.id, c]));
   const chapters = tour.chapters.map((c) => {
     const b = named.get(c.id);
@@ -344,7 +315,6 @@ function applyBriefing(tour: Tour, brief: Awaited<ReturnType<typeof analyzeBrief
       ...c,
       ...(b ? { title: b.title } : {}),
       summary: fixOpt(b ? b.summary : c.summary),
-      untestedBranches: c.untestedBranches.map(fix),
       orphanReasons: Object.fromEntries(Object.entries(c.orphanReasons).map(([k, v]) => [k, fix(v)])),
       ...(c.checklist ? { checklist: c.checklist.map((it) => ({ ...it, reason: fixOpt(it.reason) })) } : {}),
     };
@@ -356,7 +326,6 @@ function applyBriefing(tour: Tour, brief: Awaited<ReturnType<typeof analyzeBrief
     ...tour,
     mode: 'agent',
     intent: fix(brief.value.intent || tour.intent),
-    flags: flags.map((f) => ({ ...f, message: fix(f.message) })),
     chapters: [...flows, ...chapters.filter((c) => c.kind !== 'flow')],
   };
   if (brief.modelUsed) next.modelUsage = { briefing: brief.modelUsed };
@@ -409,6 +378,7 @@ export function reuseLevel(saved: Tour, identity: string): 'complete' | 'resume'
 
 const NARRATED_KINDS = new Set<Chapter['kind']>(['flow', 'supporting', 'tests', ...SPECIAL_CHAPTERS.map((c) => c.kind)]);
 const STOPPED_EARLY = 'Narration stopped early';
+export const MODEL_UNAVAILABLE = 'Model unavailable';
 
 interface LiveData {
   threads?: Tour['existingThreads'];
@@ -518,6 +488,15 @@ export async function runPipeline(opts: PipelineOptions): Promise<Tour> {
     opts.onTour(tour);
   }
 
+  if (opts.narrate && tour.mode !== 'agent') {
+    const canned = opts.narrate(tour);
+    tour = applyBriefing(tour, { value: canned.briefing });
+    for (const c of canned.chapters) tour = applyChapterResult(tour, c.id, c.result);
+    const narrated = new Set(canned.chapters.map((c) => c.id));
+    tour = { ...tour, chapters: tour.chapters.map((c) => (narrated.has(c.id) ? { ...c, narrated: true } : c)) };
+    opts.onTour(tour);
+  }
+
   if (!opts.noAgent) {
     try {
       if (tour.mode !== 'agent') {
@@ -554,8 +533,6 @@ export async function runPipeline(opts: PipelineOptions): Promise<Tour> {
               const id = start.id;
               const batches = chapterBatches(tour, start);
               const multi = batches.length > 1;
-              const staticBranches = start.untestedBranches;
-              const branches: string[][] = [];
               // Every batch runs at once (within the call limit). With several batches the
               // model's hunkOrder is dropped and only batch 0's diagram is kept, so no batch
               // depends on another.
@@ -578,9 +555,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<Tour> {
                     const value = { ...r.value };
                     if (multi) delete value.hunkOrder;
                     if (i > 0) delete value.diagram;
-                    branches[i] = value.untestedBranches ?? [];
-                    const merged = branches.flat();
-                    tour = applyChapterResult(tour, id, value, { minorIds, sharedRiskIds, untestedBranches: multi ? (merged.length ? merged : staticBranches) : undefined });
+                    tour = applyChapterResult(tour, id, value, { minorIds, sharedRiskIds });
                     opts.onTour(tour);
                   }),
                 ),
@@ -613,13 +588,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<Tour> {
       if (tour.mode !== 'agent') {
         tour = {
           ...tour,
-          flags: [
-            {
-              kind: 'model-unavailable',
-              message: `Model unavailable (${(e as Error).message.slice(0, 120)}): plain diff mode with kind sorting and test pairing by name; agent features are off.`,
-            },
-            ...tour.flags,
-          ],
+          notes: [`${MODEL_UNAVAILABLE} (${(e as Error).message.slice(0, 120)}): plain diff mode with kind sorting and test pairing by name; agent features are off.`, ...tour.notes],
         };
         onProgress('Writing briefing', true);
       } else {

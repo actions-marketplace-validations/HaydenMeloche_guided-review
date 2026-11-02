@@ -2,13 +2,15 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useInput } from './input.js';
 import { Box, Text, useSelected, useTheme } from './themed.js';
 import { ROLES } from './theme.js';
-import type { Chapter, ChapterOrder, ExistingThread, Flag, Tour } from '../types.js';
-import { chapterState, meter, ORDER_LABEL, pad, progress, riskMark, stateMark, type States } from './nav.js';
+import type { Chapter, ChapterOrder, Draft, ExistingThread, Tour } from '../types.js';
+import { chapterState, meter, ORDER_LABEL, pad, progress, stateMark, type States } from './nav.js';
+import { chapterNotes, chapterSize } from './chapter/lineNotes.js';
 import { DiagramView } from './DiagramView.js';
 import { renderGraph } from '../diagram/text.js';
 import { MdLineView, renderMarkdown } from './markdown.js';
 import { Reader } from './Panels.js';
 import { AskOverlay } from './AskOverlay.js';
+import { hasSummary, SummaryPanel } from './SummaryPanel.js';
 import { KeyBar, type AgentCtx } from './ChapterScreen.js';
 import { Key } from './KeyBar.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
@@ -28,8 +30,9 @@ import { hasSidePanel } from './breakpoints.js';
 import { TitleBar } from './TitleBar.js';
 import { Confirm } from './Confirm.js';
 
-// Rows each block may take; the chapters get the rest of the screen.
-const BUDGET = { intent: 4, description: 6, flags: 3, reviews: 2, blast: 2 };
+// Rows each block may take. The chapters take their own rows, and the description, last on the
+// screen, gets what is left; when it is long, it is cut with a note at the bottom and r reads it.
+const BUDGET = { reviews: 2, descriptionMin: 5 };
 const BRIEFING_PROSE = 88;
 
 // File references the briefing model puts in its summary, such as "(src/x.ts:31-42; y.ts:3)".
@@ -48,32 +51,6 @@ export function stripFileRefs(text: string): string {
       : group,
   );
 }
-
-// A flag as a row of the Watch for table: a short label, and its sentence as the detail.
-const FLAG_LABEL: Record<string, string> = {
-  'scope-creep': 'outside the stated scope',
-  'generated-out-of-sync': 'generated file may be stale',
-  'large-pr': 'large PR',
-  'no-entry-point': 'no entry point found',
-  'model-unavailable': 'model unavailable',
-  'missing-change': 'possibly missing change',
-  info: 'note',
-};
-function flagRow(f: Flag): { label: string; detail: string; color?: string; mark: string } {
-  const label = f.kind === 'generated-out-of-sync' && /lockfile/i.test(f.message) ? 'lockfile may be stale' : (FLAG_LABEL[f.kind] ?? f.kind.replace(/-/g, ' '));
-  const color = FLAG_COLOR[f.kind];
-  return { label, detail: f.message, color: color === 'gray' ? undefined : color, mark: color === 'gray' ? G.note : G.flag };
-}
-
-const FLAG_COLOR: Record<string, string> = {
-  'scope-creep': 'magenta',
-  'generated-out-of-sync': 'yellow',
-  'large-pr': 'yellow',
-  'no-entry-point': 'yellow',
-  'model-unavailable': 'red',
-  'missing-change': 'cyan',
-  info: 'gray',
-};
 
 // One screen: the goal, an overview diagram, the chapter list with reading state
 // and size, and anything flagged up front.
@@ -95,7 +72,9 @@ export function BriefingScreen(props: {
   deltaOnly?: boolean;
   toggleDelta?: () => void;
   states: States;
+  drafts?: Draft[]; // your drafts, counted on each chapter's row
   analyzing?: string; // chapters still being narrated, shown at the header's right end
+  writingBriefing?: boolean; // the model's briefing is still being written over this static tour
   agent?: AgentCtx;
   aiOff?: string; // why the agent is absent
   width: number;
@@ -109,7 +88,7 @@ export function BriefingScreen(props: {
   onMerge?: () => void; // M: merge the PR
   onFeedback?: () => void; // t: the feedback on your own PR (author mode)
   onChecks?: () => void; // c: the PR's checks and their logs
-  onTheme?: () => void; // L: the color theme picker
+  onTheme?: () => void; // the color theme picker, from the palette (L is the PR list's)
   onRestart?: () => void; // restart the tour: every hunk unread again, from the start
   onBack?: () => void; // esc, q: back to the PR list; unset (a preview), q quits
   onQuit: () => void;
@@ -120,7 +99,7 @@ export function BriefingScreen(props: {
   const { flash, show: showFlash, dismiss: dismissFlash } = useFlash();
   const [noticeSeen, setNoticeSeen] = useState<string>();
   const notice = props.notice && props.notice !== noticeSeen ? props.notice : undefined;
-  const [overlay, setOverlay] = useState<'none' | 'diagram' | 'ask' | 'read' | 'reviews' | 'help' | 'palette' | 'restart'>('none');
+  const [overlay, setOverlay] = useState<'none' | 'diagram' | 'ask' | 'read' | 'summary' | 'reviews' | 'help' | 'palette' | 'restart'>('none');
   useEffect(() => setSel(0), [props.order]);
   // D keeps the selected chapter when it is in both lists.
   const keepSel = useRef<string | undefined>(undefined);
@@ -134,6 +113,14 @@ export function BriefingScreen(props: {
     );
     keepSel.current = undefined;
   }, [chapters]);
+  // The briefing reorders flow chapters when it lands; the selection stays on its chapter.
+  const [plainChapters, setPlainChapters] = useState<Chapter[]>();
+  if (tour.mode === 'plain' && plainChapters !== chapters) setPlainChapters(chapters);
+  if (tour.mode === 'agent' && plainChapters) {
+    setPlainChapters(undefined);
+    const i = chapters.findIndex((c) => c.id === plainChapters[sel]?.id);
+    if (i >= 0 && i !== sel) setSel(i);
+  }
 
   // Per-render work over the whole tour is memoized, so j/k only re-renders the list.
   const prog = useMemo(() => progress(tour, states), [tour, states]);
@@ -143,10 +130,6 @@ export function BriefingScreen(props: {
   const leftW = wide ? width - rightW - 4 : width - 2;
   // Prose beside a list reads best at a briefing's measure, narrower than a reader's.
   const proseW = Math.min(leftW, BRIEFING_PROSE);
-  const intent = useMemo(() => {
-    const all = renderMarkdown(stripFileRefs(tour.intent), proseW);
-    return all.length > BUDGET.intent ? [...all.slice(0, BUDGET.intent - 1), [...all[BUDGET.intent - 1], { text: ' …', dim: true }]] : all;
-  }, [tour.intent, proseW]);
   const descAll = useMemo(() => (tour.description?.trim() ? renderMarkdown(tour.description, proseW) : []), [tour.description, proseW]);
 
   useInput(
@@ -175,8 +158,8 @@ export function BriefingScreen(props: {
       if (input === 'M' && props.onMerge) return props.onMerge();
       if (input === 't' && props.onFeedback) return props.onFeedback();
       if (input === 'c' && props.onChecks) return props.onChecks();
-      if (input === 'L' && props.onTheme) return props.onTheme();
       if (input === 'r' && tour.description?.trim()) return setOverlay('read');
+      if (input === 'i' && tour.intent.trim()) return setOverlay('summary');
       if (input === 'V' && tour.existingReviews?.some((r) => r.author !== tour.author && r.author !== tour.viewer)) return setOverlay('reviews');
       // Esc and q go up a level; in a preview the briefing is the top, where only q quits.
       if (key.escape) return props.onBack?.();
@@ -205,6 +188,11 @@ export function BriefingScreen(props: {
   if (overlay === 'read') {
     return <Reader title={`#${tour.pr} — from the author`} markdown={tour.description ?? ''} width={width} height={height} onClose={() => setOverlay('none')} />;
   }
+  // With a model, the summary is written when first opened; without one, the briefing's intent stands in.
+  if (overlay === 'summary') {
+    if (props.agent) return <SummaryPanel tour={tour} agent={props.agent} width={width} height={height} onClose={() => setOverlay('none')} />;
+    return <Reader title={`#${tour.pr} — summary`} markdown={tour.intent} width={width} height={height} closeKey="i" onClose={() => setOverlay('none')} />;
+  }
   if (overlay === 'reviews') {
     const markdown = (tour.existingReviews ?? [])
       .filter((r) => r.author !== tour.author && r.author !== tour.viewer)
@@ -219,15 +207,11 @@ export function BriefingScreen(props: {
   const askHeight = overlay === 'ask' ? Math.min(Math.max(5, height - 10), Math.max(16, Math.floor(height * 0.6))) : 0;
   const bodyH = height - 4 - askHeight; // title, margin, status line, key bar
 
-  // The briefing is a dashboard with a text budget: the author's description and the chapters
-  // (the one thing the keys act on) come first after the intent, and every other block gets a
-  // few rows, with the way to read the rest beside it.
-  // Missing tests show on each hunk in the chapters, so the briefing leaves that flag out.
-  const watch = [...tour.flags.filter((f) => f.kind !== 'missing-tests').map((f) => flagRow(f)), ...tour.notes.map((n) => ({ label: 'note', detail: n, color: undefined, mark: G.note }))];
-  const watchShown = watch.slice(0, BUDGET.flags);
+  // The briefing is a dashboard with a text budget: the chapters (the one thing the keys act on)
+  // come first, then the author's description, and the model's summary last; every block but the
+  // chapters gets a few rows, with the way to read the rest beside it.
   const otherReviews = (tour.existingReviews ?? []).filter((r) => r.author !== tour.author && r.author !== tour.viewer);
   const reviews = otherReviews.slice(-BUDGET.reviews).reverse();
-  const blast = tour.blastRadius.filter((b) => b.callers.length).slice(0, BUDGET.blast);
   const rrComments = rr ? rr.comments.slice(0, 3) : [];
   const rrRows = rr ? 1 + rrComments.length + 1 : 0;
   // On a re-review showing only changes, every chapter is listed and the unchanged ones are greyed.
@@ -241,34 +225,38 @@ export function BriefingScreen(props: {
     0,
     rows.findIndex((r) => r.ci === sel),
   );
-  const desc = descAll.slice(0, BUDGET.description);
-  // A cut between paragraphs would end on a blank row.
-  while (desc.length && !desc[desc.length - 1].some((s) => s.text.trim())) desc.pop();
-  const topRows = (props.readiness ? 1 : 0) + intent.length + rrRows;
-  const restRows =
-    (watchShown.length ? watchShown.length + 2 + (watch.length > watchShown.length ? 1 : 0) : 0) +
-    (desc.length ? desc.length + 2 : 0) +
-    (reviews.length ? reviews.length + 2 : 0) +
-    (blast.length ? blast.length + 2 : 0) +
-    (tour.existingThreads.length ? 1 : 0);
-  // The chapters get what the other blocks leave, and never fewer than five rows.
-  const chapterRoom = Math.max(5, bodyH - topRows - 2 - restRows);
+  const topRows = (props.readiness ? 1 : 0) + rrRows;
+  // The blocks between the chapters and the description.
+  const midRows = (reviews.length ? reviews.length + 2 : 0) + (tour.existingThreads.length ? 1 : 0) + (props.writingBriefing ? 2 : 0);
+  // The chapter block: its heading, and a blank row above it when something is above.
+  const chapterHead = topRows ? 2 : 1;
+  // The chapters keep the description to a few rows at least, and never drop under five rows.
+  const descMin = descAll.length ? Math.min(descAll.length + 2, BUDGET.descriptionMin) : 0;
+  const chapterRoom = Math.max(5, bodyH - topRows - chapterHead - midRows - descMin);
   const windowed = rows.length > chapterRoom;
   const shownCount = windowed ? chapterRoom - 1 : rows.length;
   const chStart = windowed ? Math.max(0, Math.min(selRow - Math.floor(shownCount / 2), rows.length - shownCount)) : 0;
-  // The marks' legend under the chapters, while there is a spare row for it.
-  const legendRow = bodyH - (topRows + 2 + shownCount + (windowed ? 1 : 0) + restRows) > 1;
-  const usedRows = topRows + 2 + shownCount + (windowed ? 1 : 0) + restRows + (legendRow ? 1 : 0);
+  const chapterRows = chapterHead + shownCount + (windowed ? 1 : 0);
+  // The marks' legend under the chapters, while the description still gets a few rows after it.
+  const legendRow = bodyH - topRows - chapterRows - midRows - descMin > 1;
+  const fixedRows = topRows + chapterRows + (legendRow ? 1 : 0) + midRows;
+  // The description: a blank row, its heading, then its lines; a cut one ends with the note.
+  const descRoom = descAll.length ? Math.max(0, bodyH - fixedRows - 2) : 0;
+  const descCut = descAll.length > descRoom;
+  const desc = descAll.slice(0, descCut ? Math.max(0, descRoom - 1) : descRoom);
+  // A cut between paragraphs would end on a blank row.
+  while (desc.length && !desc[desc.length - 1].some((s) => s.text.trim())) desc.pop();
+  const usedRows = fixedRows + (descAll.length && descRoom ? 2 + desc.length + (descCut ? 1 : 0) : 0);
   const diagramBelowH = wide ? 0 : Math.max(0, Math.min(16, bodyH - usedRows - 1));
   const numW = String(rows.length).length;
-  const labelW = Math.min(30, Math.max(0, ...watchShown.map((w) => w.label.length)) + 2);
+  // Each chapter's size, +added −removed, in columns that line up down the list.
+  const sizes = new Map(rows.map(({ chapter: c, ci }) => [c.id, ci < 0 ? undefined : chapterSize(tour, c)]));
+  const addW = Math.max(0, ...[...sizes.values()].map((z) => (z ? String(z.added).length : 0))) + 1;
+  const delW = Math.max(0, ...[...sizes.values()].map((z) => (z ? String(z.removed).length : 0))) + 1;
 
   const left = (
     <Box flexDirection="column" width={leftW}>
       {props.readiness ? <ReadinessLine readiness={props.readiness} width={leftW} hint={!!props.onMerge} /> : null}
-      {intent.map((l, i) => (
-        <MdLineView key={i} line={l} />
-      ))}
       {rr ? (
         <Box flexDirection="column" marginTop={1} flexShrink={0}>
           <Text wrap="truncate">
@@ -309,23 +297,7 @@ export function BriefingScreen(props: {
           ))}
         </Box>
       ) : null}
-      {descAll.length ? (
-        <Box flexDirection="column" marginTop={1} flexShrink={0}>
-          <SectionHeading title="From the author" width={leftW}>
-            {descAll.length > desc.length ? (
-              <>
-                <Text dimColor>{` · ${plural(descAll.length - desc.length, 'more line')} · `}</Text>
-                <Key k="r" />
-                <Text dimColor> read all</Text>
-              </>
-            ) : null}
-          </SectionHeading>
-          {desc.map((l, i) => (
-            <MdLineView key={i} line={l} />
-          ))}
-        </Box>
-      ) : null}
-      <Box flexDirection="column" marginTop={1} flexShrink={0}>
+      <Box flexDirection="column" marginTop={topRows ? 1 : 0} flexShrink={0}>
         <SectionHeading title="Chapters" width={leftW}>
           <Text bold color="cyan">
             {' '}
@@ -342,10 +314,16 @@ export function BriefingScreen(props: {
           const st = stateMark(chapterState(tour, c, states));
           const p = progress(tour, states, c.hunkIds);
           const m = meter(p.read + p.skipped, p.total, 4);
-          const risk = Math.max(0, ...c.hunkIds.map((id) => tour.hunks[id]?.risk ?? 0));
-          const rk = risk >= 2 ? riskMark(risk) : undefined;
           const count = c.optional ? 'optional' : !delta ? `${p.read + p.skipped}/${p.total}` : unchanged ? 'unchanged' : `${c.hunkIds.length} of ${fullCount(c.id)} changed`;
-          const tail = `  ${c.optional || unchanged ? '' : `${m.filled}${m.rest} `}${count.padStart(5)} ${rk ? rk.mark : ' '}`;
+          // Where the discussion is: open threads (or resolved ones, when none is open) and your drafts.
+          const said = chapterNotes(tour, c, props.drafts ?? []);
+          const threadNote = said.open ? `${said.open} open` : said.resolved ? `${said.resolved} resolved` : '';
+          const draftNote = said.drafts ? `${G.draft} ${said.drafts}` : '';
+          const notes = [threadNote, draftNote].filter(Boolean).join(' · ');
+          const size = sizes.get(c.id);
+          const added = size ? `+${size.added}`.padStart(addW) : ' '.repeat(addW);
+          const removed = size ? `−${size.removed}`.padEnd(delW) : ' '.repeat(delW);
+          const tail = `  ${c.optional || unchanged ? '' : `${m.filled}${m.rest} `}${count.padStart(5)}  ${added} ${removed}${notes ? `  ${notes}` : ''}`;
           const selected = !unchanged && ci === sel;
           const quiet = unchanged || (c.collapsed && !selected);
           const n = String(chStart + k + 1).padStart(numW);
@@ -361,8 +339,15 @@ export function BriefingScreen(props: {
                   <Text dimColor>{m.rest}</Text>
                 </>
               )}
-              <Text dimColor>{` ${count.padStart(5)} `}</Text>
-              {rk ? <Text color={rk.color}>{rk.mark}</Text> : ' '}
+              <Text dimColor>{` ${count.padStart(5)}  `}</Text>
+              <Text color={quiet || !size?.added ? undefined : 'green'} dimColor={!size?.added}>
+                {added}
+              </Text>{' '}
+              <Text color={quiet || !size?.removed ? undefined : 'red'} dimColor={!size?.removed}>
+                {removed}
+              </Text>
+              {threadNote ? <Text color={said.open ? 'yellow' : undefined} dimColor={!said.open}>{`  ${threadNote}`}</Text> : null}
+              {draftNote ? <Text dimColor>{`${threadNote ? ' · ' : '  '}${draftNote}`}</Text> : null}
             </Text>
           );
         })}
@@ -370,26 +355,10 @@ export function BriefingScreen(props: {
         {/* Where the marks first appear, what they mean; ? then Tab has them all. */}
         {legendRow ? (
           <Text dimColor wrap="truncate">
-            {`  ${G.read} read  ${G.skipped} skipped  ${G.deferred} deferred  ${G.unread} unread  ${G.risk} risky  · ? then tab for every mark`}
+            {`  ${G.read} read  ${G.skipped} skipped  ${G.deferred} deferred  ${G.unread} unread  · ? then tab for every mark`}
           </Text>
         ) : null}
       </Box>
-      {watchShown.length ? (
-        <Box flexDirection="column" marginTop={1} flexShrink={0}>
-          <SectionHeading title="Watch for" width={leftW} />
-          {watchShown.map((w, i) => (
-            <Text key={i} wrap="truncate">
-              {' '}
-              <Text color={w.color} dimColor={!w.color}>{`${w.mark} `}</Text>
-              <Text color={w.color} dimColor={!w.color}>
-                {pad(w.label, labelW)}
-              </Text>
-              <Text dimColor>{safe(w.detail)}</Text>
-            </Text>
-          ))}
-          {watch.length > watchShown.length ? <Text dimColor>{`   +${watch.length - watchShown.length} more`}</Text> : null}
-        </Box>
-      ) : null}
       {reviews.length ? (
         <Box flexDirection="column" marginTop={1} flexShrink={0}>
           <SectionHeading title="Other reviewers" width={leftW}>
@@ -411,22 +380,37 @@ export function BriefingScreen(props: {
           ))}
         </Box>
       ) : null}
-      {blast.length ? (
-        <Box flexDirection="column" marginTop={1} flexShrink={0}>
-          <SectionHeading title="Blast radius" width={leftW} />
-          {blast.map((b) => (
-            <Text key={b.symbol + b.hunkId} wrap="truncate">
-              {safe(
-                `${b.symbol}: ${plural(b.callers.length, 'unchanged caller')} — ${b.callers
-                  .slice(0, 3)
-                  .map((c) => `${c.file}:${c.line}`)
-                  .join(', ')}`,
-              )}
-            </Text>
-          ))}
+      {tour.existingThreads.length ? <Text dimColor>{threadCounts(tour.existingThreads)} shown inline.</Text> : null}
+      {props.writingBriefing ? (
+        <Box marginTop={1} flexShrink={0}>
+          <Text dimColor wrap="truncate">
+            The model is writing the briefing: its summary (i), chapter titles and order arrive here.
+          </Text>
         </Box>
       ) : null}
-      {tour.existingThreads.length ? <Text dimColor>{threadCounts(tour.existingThreads)} shown inline.</Text> : null}
+      {descAll.length > 0 && descRoom > 0 ? (
+        <Box flexDirection="column" marginTop={1} flexShrink={0}>
+          <SectionHeading title="From the author" width={leftW}>
+            {props.agent ? (
+              <>
+                <Text dimColor> · </Text>
+                <Key k="i" />
+                <Text dimColor>{hasSummary(tour) ? ' read AI description' : ' generate AI description'}</Text>
+              </>
+            ) : null}
+          </SectionHeading>
+          {desc.map((l, i) => (
+            <MdLineView key={i} line={l} />
+          ))}
+          {descCut ? (
+            <Text wrap="truncate">
+              <Text dimColor>{`… ${plural(descAll.length - desc.length, 'more line')} · `}</Text>
+              <Key k="r" />
+              <Text dimColor> read all</Text>
+            </Text>
+          ) : null}
+        </Box>
+      ) : null}
       {tour.overview && diagramBelowH >= 6 ? (
         <Box marginTop={1} height={diagramBelowH} overflow="hidden" flexShrink={0}>
           <DiagramView graph={tour.overview} width={leftW} height={diagramBelowH} interactive={false} />
@@ -440,7 +424,7 @@ export function BriefingScreen(props: {
       <TitleBar
         repo={tour.repo}
         title={`#${tour.pr} ${tour.title}`}
-        note={`@${tour.author} · ${tour.headSha.slice(0, 8)} · ${tour.mode === 'agent' ? 'guided' : 'plain mode'}`}
+        note={`@${tour.author} · ${tour.headSha.slice(0, 8)} · ${tour.mode === 'agent' || props.writingBriefing ? 'guided' : 'plain mode'}`}
         busy={props.analyzing}
         where="briefing"
         progress={{ done: prog.readLines, total: prog.totalLines, hunks: `${prog.read + prog.skipped}/${prog.total} hunks` }}
@@ -478,15 +462,15 @@ export function BriefingScreen(props: {
           width={width}
           accent
           // Keys hinted where they apply on screen (D, f, d beside the overview, r under a cut-off
-          // description) stay off the bar.
+          // description, i on its heading) stay off the bar.
           keys={reviewBriefingBar({
             start: props.resume ?? 'start',
             agent: !!props.agent,
-            readDescription: descAll.length <= BUDGET.description,
+            readDescription: !descCut,
+            summary: !!props.agent && !descAll.length, // otherwise hinted on the description's heading
             diagram: !(wide && tour.overview),
             feedback: !!props.onFeedback,
             checks: !!props.onChecks,
-            theme: !!props.onTheme,
           })}
           extraEnd={[PALETTE_HINT]}
           end={[
@@ -503,12 +487,15 @@ export function BriefingScreen(props: {
       { label: props.resume ? `Resume (${props.resume.replace(/^resume · /, '')})` : 'Start reading', key: 'n', run: () => props.onStart() },
       ...(props.agent ? [{ label: 'Ask the model about the whole PR', key: 'a', run: () => setOverlay('ask') }] : []),
       ...(tour.description?.trim() ? [{ label: 'Read the PR description', key: 'r', run: () => setOverlay('read') }] : []),
+      ...(tour.intent.trim()
+        ? [{ label: props.agent ? (hasSummary(tour) ? 'Read the AI description' : 'Generate an AI description') : 'Read the summary', key: 'i', run: () => setOverlay('summary') }]
+        : []),
       ...(tour.overview ? [{ label: 'Explore the overview diagram', key: 'd', run: () => setOverlay('diagram') }] : []),
       { label: 'Change the chapter order', key: 'f', run: () => props.cycleOrder() },
       { label: 'Submit the review', key: 's', run: () => props.onSubmit() },
       ...(props.onMerge ? [{ label: 'Merge the PR', key: 'M', run: () => props.onMerge?.() }] : []),
       ...(props.onChecks ? [{ label: 'Checks and their logs', key: 'c', run: () => props.onChecks?.() }] : []),
-      ...(props.onTheme ? [{ label: 'Color theme', key: 'L', run: () => props.onTheme?.() }] : []),
+      ...(props.onTheme ? [{ label: 'Color theme', run: () => props.onTheme?.() }] : []),
       ...(props.onRestart && reviewed ? [{ label: 'Restart the tour: mark every hunk unread', run: () => setOverlay('restart') }] : []),
       ...chapters.map((c, i) => ({ label: `Go to chapter ${i + 1}: ${c.title}`, detail: plural(c.hunkIds.length, 'hunk'), run: () => props.onStart(i) })),
     ];

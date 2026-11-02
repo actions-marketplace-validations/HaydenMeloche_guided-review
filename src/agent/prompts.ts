@@ -15,6 +15,15 @@ Rules:
 - Never edit files.`;
 
 const MAX_HUNK_LINES = 120;
+// A hunk larger than that is read whole up to this many lines when the rendering takes no more
+// than half a chapter's budget: the biggest new class in a PR is the one not to skim.
+const LEAD_HUNK_LINES = 600;
+
+// How many of a hunk's lines its narration prompt shows.
+export function hunkLimit(h: Hunk): number {
+  if (h.lines.length <= MAX_HUNK_LINES) return MAX_HUNK_LINES;
+  return renderHunk(h, LEAD_HUNK_LINES).length <= CHAPTER_BUDGET / 2 ? LEAD_HUNK_LINES : MAX_HUNK_LINES;
+}
 
 // Rendering is the bulk of prompt building; hunks are immutable once emitted (a change makes a
 // new object), so a rendering can be cached per hunk object.
@@ -35,7 +44,11 @@ function renderHunkUncached(h: Hunk, maxLines: number): string {
     const sign = l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ';
     return `${sign}${l.text}`;
   });
-  if (h.lines.length > maxLines) body.push(`… (${h.lines.length - maxLines} more lines)`);
+  if (h.lines.length > maxLines) {
+    const next = h.lines[maxLines];
+    const at = next.newLine ?? next.oldLine;
+    body.push(`… (${h.lines.length - maxLines} more lines not shown; read ${h.file}${at ? ` from line ${at}` : ''} before narrating this hunk)`);
+  }
   const meta = [
     h.symbols.length ? `symbols: ${h.symbols.join(', ')}` : '',
     h.riskReasons.length ? `static risk: ${h.riskReasons.join('; ')}` : '',
@@ -134,16 +147,11 @@ ${files.join('\n')}
 ## Static analysis: candidate chapters (flows traced from entry points, in call order; ±N = changed lines)
 ${chapters.join('\n') || '(none found)'}
 
-## Flags already raised
-${tour.flags.map((f) => `- ${f.kind}: ${f.message}`).join('\n') || '(none)'}
-
 ## Excerpts of hand-written changes
 ${excerpts.join('\n\n')}
 
 Return:
 - intent: the goal of the PR in at most two sentences, from the description, issues and commits, checked against the diff. Plain prose with no file:line references: the chapters show where the code is.
-- scopeCreep: changes that do not serve the stated goal (cite hunk ids). Empty if none.
-- missingChanges: what the PR did not change but probably should (docs, CHANGELOG, a migration for a model change, a feature flag, translations), only with evidence from this repo that it uses that practice; skip anything already in "Flags already raised". Empty if none.
 - chapters: for each chapter id above, a short title naming the flow (e.g. "Create invoice: route → service → DB") and a one-sentence summary. List them in the reading order you recommend.
 - overview: a small graph (3-12 nodes) of what changed and what it touches, read top to bottom as the path a request or user takes: start at the entry point (the route, handler, command or UI action that triggers the change) and follow it through each component to where it ends. One node per major component; nodes are things (a component, route, hook, query, store or API), never actions: a prefetch is an edge to the query it fills, not a node. hunkId on nodes that map to one hunk. Shared state that several parts read or write (URL params, a store, a cache, a table) is a single node with an edge for each read and each write, even when that makes a loop; that round trip is often the point of the change. Every edge points the way control or data flows (caller → callee, writer → state → reader), and every node is connected to the path; leave out test fixtures, mocks, loading placeholders and pure type changes unless they are the point of the PR. changed=true only on changed parts; add an unchanged node (an API, a caller) when it explains why the change exists. Edge labels are 1-3 words saying what the source does to the target ("calls", "renders", "reads", "writes"); if the source does not do it, the edge is drawn the wrong way round (a route prefetches a query, not the reverse). Draw each relationship once, from the caller: results coming back are implied, so add no "returns" edge. A UI control is rendered by a component; draw that edge too, so the control sits under it rather than floating at the top. kind: call for a flow through components, state only for status or enum transitions, entity for schema, deps for import structure.`;
 }
@@ -188,7 +196,7 @@ function renderedBatches(tour: Tour, ids: string[]): string[][] {
   for (const id of ids) {
     const h = tour.hunks[id];
     if (!h) continue;
-    const n = renderHunk(h).length;
+    const n = renderHunk(h, hunkLimit(h)).length;
     if (size + n > CHAPTER_BUDGET && batches[batches.length - 1].length) {
       batches.push([]);
       size = 0;
@@ -200,7 +208,7 @@ function renderedBatches(tour: Tour, ids: string[]): string[][] {
 }
 
 export function isTruncated(h: Hunk): boolean {
-  return h.lines.length > MAX_HUNK_LINES;
+  return h.lines.length > hunkLimit(h);
 }
 
 // Minor hunks are summarized together per chapter instead of narrated one by one: output
@@ -303,8 +311,7 @@ Chapter ${chapter.id} (lockfiles): "${chapter.title}". The lockfile hunks are no
 ${lockfileSection(tour, chapter)}
 
 Return:
-- hunks: a single entry with id "${MINOR_SUMMARY_ID}" (do not narrate hunks one by one) whose narration summarizes the indirect changes in 2-5 short bullets, most important first: the major version changes and what breaks in them, packages added or removed that matter, and security fixes the new versions are known to bring (with the advisory id if you know it). If the manifest changes explain these, say so in one line. Answer from what you know of the releases and set citesCode=false; say so when you do not know a release instead of guessing. ${SPECIAL_LENGTH}
-- untestedBranches: empty.`;
+- hunks: a single entry with id "${MINOR_SUMMARY_ID}" (do not narrate hunks one by one) whose narration summarizes the indirect changes in 2-5 short bullets, most important first: the major version changes and what breaks in them, packages added or removed that matter, and security fixes the new versions are known to bring (with the advisory id if you know it). If the manifest changes explain these, say so in one line. Answer from what you know of the releases and set citesCode=false; say so when you do not know a release instead of guessing. ${SPECIAL_LENGTH}`;
 }
 
 const PAIR_DIRECT_MAX = 30;
@@ -369,8 +376,51 @@ Indirect (not named in the manifests: transitive, or a refresh):
 ${indirectLines.join('\n') || '- none'}
 
 Return:
-- hunks: a single entry with id "${MINOR_SUMMARY_ID}" (do not narrate hunks one by one) whose narration covers the manifest and lockfile changes together; it is shown on every page of the pair. Do not describe the edit to the file (the reviewer sees the diff). First each direct dependency, most important first. For one upgraded or downgraded, give "name old → new" (the versions the lockfile resolves, when it lists them) and then the highlights of what is new between those versions: notable features, breaking changes, deprecations and security fixes, 1-3 short bullets. For a dependency added for the first time or removed, give "name version (added)" or "name (removed)" and instead of release notes a high-level overview of the package in 1-2 sentences: what it is, what it is typically used for, and, for an addition, where this PR uses it (grep the repo). For a major upgrade lead with the breaking changes and grep the repo for uses of anything removed or renamed. A runtime or toolchain version in these hunks (engines, the go directive, rust-version) is treated like an upgrade, adding when the old or new version reaches end of life if that is near or past. Then 1-2 bullets on the indirect changes that matter: major version jumps, notable packages added or removed, and security fixes the new versions are known to bring (with the advisory id if you know it); if none matter, say so in a few words. Read a changelog in the worktree (e.g. node_modules/<name>/CHANGELOG.md) when one exists; otherwise answer from what you know of the release and set citesCode=false. If you do not know a release, say so instead of guessing. ${length} Set risk (0-3) on that entry only with a short riskReason, e.g. a major upgrade with breaking changes the code uses.
-- untestedBranches: empty.`;
+- hunks: a single entry with id "${MINOR_SUMMARY_ID}" (do not narrate hunks one by one) whose narration covers the manifest and lockfile changes together; it is shown on every page of the pair. Do not describe the edit to the file (the reviewer sees the diff). First each direct dependency, most important first. For one upgraded or downgraded, give "name old → new" (the versions the lockfile resolves, when it lists them) and then the highlights of what is new between those versions: notable features, breaking changes, deprecations and security fixes, 1-3 short bullets. For a dependency added for the first time or removed, give "name version (added)" or "name (removed)" and instead of release notes a high-level overview of the package in 1-2 sentences: what it is, what it is typically used for, and, for an addition, where this PR uses it (grep the repo). For a major upgrade lead with the breaking changes and grep the repo for uses of anything removed or renamed. A runtime or toolchain version in these hunks (engines, the go directive, rust-version) is treated like an upgrade, adding when the old or new version reaches end of life if that is near or past. Then 1-2 bullets on the indirect changes that matter: major version jumps, notable packages added or removed, and security fixes the new versions are known to bring (with the advisory id if you know it); if none matter, say so in a few words. Read a changelog in the worktree (e.g. node_modules/<name>/CHANGELOG.md) when one exists; otherwise answer from what you know of the release and set citesCode=false. If you do not know a release, say so instead of guessing. ${length} Set risk (0-3) on that entry only with a short riskReason, e.g. a major upgrade with breaking changes the code uses.`;
+}
+
+const CALLERS_PER_SYMBOL = 5;
+
+// Code in files the PR leaves alone that uses what the chapter's hunks change, found by name.
+// The diff can't show these lines, so a changed signature reaching them is worth naming.
+function callersSection(tour: Tour, chapter: Chapter): string {
+  const ids = new Set(chapter.hunkIds);
+  const items = tour.blastRadius.filter((b) => ids.has(b.hunkId));
+  if (!items.length) return '';
+  const what = { signature: 'signature changed', table: 'table changed', event: 'event changed' } as const;
+  const lines = items.map((b) => {
+    const shown = b.callers.slice(0, CALLERS_PER_SYMBOL).map((c) => `  - ${c.file}:${c.line}: ${c.text}`);
+    const more = b.callers.length > shown.length ? [`  - … ${b.callers.length - shown.length} more`] : [];
+    return [`- ${b.symbol} (hunk ${b.hunkId}${b.change ? `, ${what[b.change]}` : ''}):`, ...shown, ...more].join('\n');
+  });
+  return `\n\n## Uses in unchanged files (matched by name, so some may be another symbol)\n\nWhere a hunk changes a signature, table or event that one of these uses, read the use if needed and say in that hunk's narration which of them the change could break (file:line), or that they still fit. Raise risk when one breaks.\n\n${lines.join('\n')}`;
+}
+
+const ELSEWHERE_FILES = 20;
+const ELSEWHERE_CASES = 12;
+
+// Changed test files read in other chapters, with their case names. Each chapter is narrated on
+// its own, so without this a chapter calls a branch untested when its test sits a chapter away.
+function testsElsewhereSection(tour: Tour, chapter: Chapter): string {
+  const own = new Set(chapter.hunkIds);
+  const chapterOf = new Map<string, Chapter>();
+  for (const c of tour.chapters) for (const id of c.hunkIds) chapterOf.set(id, c);
+  const lines: string[] = [];
+  for (const f of tour.files) {
+    if (f.kind !== 'test' || f.status === 'deleted') continue;
+    const ids = f.hunkIds.filter((id) => tour.hunks[id] && !own.has(id));
+    if (!ids.length) continue;
+    const symbols = ids.flatMap((id) => tour.hunks[id].symbols);
+    // Case names (Class.case) over the class itself, when the hunks declare any.
+    const cases = symbols.filter((s) => s.includes('.'));
+    const names = [...new Set((cases.length ? cases : symbols).map((s) => s.split('.').pop()!))];
+    const where = chapterOf.get(ids[0]);
+    const list = names.length ? `: ${names.slice(0, ELSEWHERE_CASES).join(', ')}${names.length > ELSEWHERE_CASES ? ', …' : ''}` : '';
+    lines.push(`- ${f.path}${where ? ` (chapter "${where.title}")` : ''}${list}`);
+    if (lines.length >= ELSEWHERE_FILES) break;
+  }
+  if (!lines.length) return '';
+  return `\n\n## Changed tests in other chapters\n\nThese test files also changed in this PR and are read in other chapters. Before saying that code here has no test, check whether one of them exercises it (read the file when a case name suggests so) and cite the case.\n\n${lines.join('\n')}`;
 }
 
 export function chapterPrompt(tour: Tour, chapter: Chapter): string {
@@ -384,7 +434,7 @@ export function chapterPrompt(tour: Tour, chapter: Chapter): string {
   const minorRendered: string[] = [];
   for (const h of hunks) {
     const isMinor = minor.has(h.id);
-    const r = renderHunk(h, isMinor ? MINOR_RENDER_LINES : MAX_HUNK_LINES);
+    const r = renderHunk(h, isMinor ? MINOR_RENDER_LINES : hunkLimit(h));
     const out = isMinor ? minorRendered : rendered;
     if (budget - r.length < 0) {
       out.push(`### hunk ${h.id} — ${h.file} ${h.header} (omitted for size; narrate from the file if needed)`);
@@ -400,6 +450,8 @@ export function chapterPrompt(tour: Tour, chapter: Chapter): string {
     chapter.kind === 'supporting'
       ? '\nThese hunks are not reached from any entry point. For each, also give orphanReason: a one-line reason it is in the PR (e.g. "config default", "dead code removal").'
       : '';
+  const callers = callersSection(tour, chapter);
+  const elsewhere = testsElsewhereSection(tour, chapter);
   const checklist = chapter.checklist?.length
     ? `\n\nTeam checklist for this chapter. Pre-check each item against the code (read files if needed): pass, fail, or unknown when you cannot tell; give a one-line reason citing file:line.\n${chapter.checklist.map((c) => `- ${c.id}: ${c.item}`).join('\n')}`
     : '';
@@ -417,11 +469,44 @@ Chapter ${chapter.id} (${chapter.kind}): "${chapter.title}"${chapter.entryPoint 
 Briefing summary: ${chapter.summary || '(none)'}
 The hunks below are in the call order static analysis found.${supporting}${specialContext}
 
-${rendered.join('\n\n')}${minorSection}${checklist}
+${rendered.join('\n\n')}${minorSection}${callers}${elsewhere}${checklist}
 
 Return:
 - hunkOrder: all hunk ids, in the order a request or job would run through them (handler, then service, then data layer). Put a type or schema change right before its first use. Keep the given order if it is already right.
 ${hunksAsk}
-- untestedBranches: new branches or behaviors with no linked test case, each as "file:line — what is untested".
 - diagram: include one when the flow crosses 3+ functions, components or services (call; most flow chapters do), when it changes behavior of an existing path (before-after, nodes grouped "before"/"after"), changes enum/status transitions (state), or touches schema (entity). 3-10 nodes (a single rename or field swap needs no diagram); changed=true on changed nodes; hunkId on nodes that map to a hunk. Shared state (URL params, a store, a cache) is one node with an edge for each read and write; edges point the way control or data flows, labelled with what the source does in 1-3 words ("reads", "renders", "prefetches"). Each node is named for the component it is (a function, hook, module or route, 2-4 words such as "PaymentEventsTable" or "URL date params"), never a sentence or an action (a prefetch is an edge to the query it fills); what it does belongs on the edges, and edge labels are never code expressions. A change to conditions or values inside one component needs no diagram. Draw each relationship once, from the caller, with no "returns" edge. Use state only for status or enum transitions, not for data flow. Omit otherwise.${chapter.checklist?.length ? '\n- checklist: one entry per checklist id above.' : ''}`;
+}
+
+const SUMMARY_FILES = 60;
+
+// The on-demand summary (i on the briefing): the briefing's two sentences grown into a page,
+// from what the tour already knows. The description is the author's claim; the diff is the truth.
+export function summaryPrompt(tour: Tour): string {
+  const chapters = tour.chapters
+    .map((c) => {
+      const files = [...new Set(c.hunkIds.map((id) => tour.hunks[id]?.file).filter(Boolean))];
+      return `- ${c.title} (${c.kind}${c.risk ? `, risk ${c.risk}` : ''}): ${c.summary || '(no summary)'}\n  files: ${files.slice(0, 6).join(', ')}${files.length > 6 ? `, +${files.length - 6}` : ''}`;
+    })
+    .join('\n');
+  const files = tour.files.slice(0, SUMMARY_FILES).map((f) => `- [${f.kind}] ${f.path} +${f.additions}/-${f.deletions}`);
+  if (tour.files.length > SUMMARY_FILES) files.push(`- … ${tour.files.length - SUMMARY_FILES} more files`);
+  return `PR #${tour.pr} — ${tour.title}
+Author: @${tour.author}
+
+Briefing intent: ${tour.intent || '(unknown)'}
+
+Author's description:
+${tour.description?.trim() || '(none)'}
+
+Chapters, in reading order:
+${chapters || '(none)'}
+
+Files:
+${files.join('\n')}
+
+Write a summary of this PR for a reviewer about to read it, in Markdown, 150-250 words:
+1. One paragraph: what the PR does and why, checked against the diff rather than taken from the description. Say where the description and the code disagree.
+2. "How it's built": one bullet per chapter in reading order, naming the files that matter (paths, no line numbers).
+3. "Worth attention": 2-4 bullets on what deserves care, from the risk, what the description promises but the diff lacks (a migration, docs, a changeset, translations, where this repo keeps such things), changes outside the stated goal, and what you read; none if nothing stands out.
+Read files in the worktree only where the chapter summaries leave a question open. Say plainly when something is your inference.`;
 }

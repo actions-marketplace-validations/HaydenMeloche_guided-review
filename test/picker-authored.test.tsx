@@ -11,6 +11,7 @@ vi.mock('../src/github/gh.js', async (orig) => ({
   listReviewRequests: vi.fn(async () => [
     { repo: 'acme/app', number: 1, title: 'Review me', author: 'dev', url: 'https://github.com/acme/app/pull/1', updatedAt: '2026-10-08T00:00:00Z', isDraft: false, labels: [] },
   ]),
+  listReviewedPRs: vi.fn(async () => ({ prs: [], truncated: false })),
   listAuthoredPRs: vi.fn(() => new Promise<{ prs: AuthoredPR[]; truncated: boolean }>((r) => (resolveMine = (prs, truncated = false) => r({ prs, truncated })))),
   fetchPRPreview: vi.fn(() => new Promise(() => {})),
   viewerLogin: vi.fn(async () => 'me'),
@@ -77,7 +78,6 @@ describe('a repo in both sections', () => {
     await waitFor(() => expect(ui.lastFrame()).toContain('Mine in the same repo'));
     for (const key of ['j', 'k', 'j']) {
       ui.stdin.write(key);
-      await new Promise((r) => setTimeout(r, 20));
       const frame = ui.lastFrame()!;
       expect(frame.match(/acme\/app \(1\)/g)).toHaveLength(2);
       expect(frame.match(/Review me/g)).toHaveLength(1);
@@ -174,5 +174,40 @@ describe('Esc in the picker', () => {
     ui.stdin.write('q');
     await waitFor(() => expect(onQuit).toHaveBeenCalledTimes(1));
     ui.unmount();
+  });
+});
+
+describe('coming back to the picker', () => {
+  it('shows the cached list on the same PR without reloading it', async () => {
+    const { listReviewRequests } = await import('../src/github/gh.js');
+    const list = vi.mocked(listReviewRequests);
+    const pr = (number: number, title: string, updatedAt: string) => ({
+      repo: `acme/r${number}`,
+      number,
+      title,
+      author: 'dev',
+      url: `https://github.com/acme/r${number}/pull/${number}`,
+      updatedAt,
+      isDraft: false,
+      labels: [],
+    });
+    list.mockResolvedValueOnce([pr(1, 'First', '2026-10-09T00:00:00Z'), pr(2, 'Second', '2026-10-08T00:00:00Z')]);
+    const cache = {};
+    const onPick = vi.fn();
+    const props = { store, width: 120, height: 24, onPick, onQuit: () => {}, readClipboard: async () => undefined, downloads: {}, onDownload: () => {}, cache };
+    const first = render(<PickerScreen {...props} />);
+    await waitFor(() => expect(first.lastFrame()).toContain('Second'));
+    first.stdin.write('g');
+    first.stdin.write('j');
+    await waitFor(() => expect((cache as { selKey?: string }).selKey).toBe('acme/r2#2'));
+    first.unmount();
+
+    list.mockClear();
+    const again = render(<PickerScreen {...props} />);
+    expect(again.lastFrame()).toContain('Second');
+    again.stdin.write('\r');
+    await waitFor(() => expect(onPick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'acme/r2', number: 2 })));
+    expect(list).not.toHaveBeenCalled();
+    again.unmount();
   });
 });

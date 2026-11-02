@@ -31,6 +31,7 @@ export const PICKER_KEYS: KeyDef<PickerKeyCtx>[] = [
   { keys: ['d'], group: 'Download', help: 'Download the selected tours (or the highlighted one)' },
   { keys: ['r'], group: 'App', help: 'Refresh the list', bar: { shown: 'r', label: 'refresh' } },
   { keys: ['L'], group: 'App', help: 'Color theme', bar: { shown: 'L', label: 'theme', when: (c) => c.theme } },
+  { keys: ['U'], group: 'App', help: 'Update gr, when a newer version is out' },
   { keys: ['?'] },
   { keys: ['h'], alias: true },
   { keys: ['q'] },
@@ -45,10 +46,10 @@ export interface ReviewBriefingKeyCtx {
   start: string; // what n does: start, or resume and where
   agent: boolean;
   readDescription: boolean; // r is not already hinted under a cut-off description
+  summary: boolean; // i is not already hinted on the description's heading
   diagram: boolean; // d is not already hinted beside the overview
   feedback: boolean; // your own PR
   checks: boolean;
-  theme: boolean;
 }
 
 export const REVIEW_BRIEFING_KEYS: KeyDef<ReviewBriefingKeyCtx>[] = [
@@ -56,17 +57,17 @@ export const REVIEW_BRIEFING_KEYS: KeyDef<ReviewBriefingKeyCtx>[] = [
   { keys: ['Enter'], group: 'Read', help: 'Open the selected chapter', bar: { shown: 'enter', label: 'open' } },
   { keys: ['j', 'k'], group: 'Read', help: 'Select a chapter', bar: { shown: 'j/k', label: 'select' } },
   { keys: ['1', '2', '3', '4', '5', '6', '7', '8', '9'], doc: ['1'], name: '1–9', group: 'Read', help: 'Open the chapter with that number' },
-  { keys: ['f'], group: 'Read', help: 'Cycle Guided, Risk first, Small first and File order' },
+  { keys: ['f'], group: 'Read', help: 'Cycle Guided, Risk first, Small first, File and Commit order' },
   { keys: ['D'], group: 'Read', help: 'Re-review: only new and changed hunks, or the full review' },
   { keys: ['a'], group: 'Ask', help: 'Ask the model about the whole PR', bar: { shown: 'a', label: 'ask about the PR', when: (c) => c.agent } },
   { keys: ['r'], group: 'View', help: 'Read the full PR description', bar: { shown: 'r', label: 'read description', when: (c) => c.readDescription } },
+  { keys: ['i'], group: 'View', help: 'Generate an AI description of the PR (written when you open it, then kept)', bar: { shown: 'i', label: 'AI description', when: (c) => c.summary } },
   { keys: ['V'], group: 'View', help: 'Read the submitted reviews' },
   { keys: ['d'], group: 'View', help: 'Explore the overview diagram', bar: { shown: 'd', label: 'overview diagram', when: (c) => c.diagram } },
   { keys: ['s'], group: 'PR', help: 'Submit screen', bar: { shown: 's', label: 'submit' } },
   { keys: ['M'], group: 'PR', help: 'Merge the PR' },
   { keys: ['c'], group: 'PR', help: 'Checks and their logs', bar: { shown: 'c', label: 'checks', when: (c) => c.checks } },
   { keys: ['t'], group: 'PR', help: 'Your PR: switch to its feedback', bar: { shown: 't', label: 'your feedback', when: (c) => c.feedback } },
-  { keys: ['L'], group: 'App', help: 'Color theme', bar: { shown: 'L', label: 'theme', when: (c) => c.theme } },
   { keys: [':'], group: 'App', help: 'Command palette: the briefing’s commands, and a chapter to open' },
   { keys: ['?'] },
   { keys: ['h'], alias: true },
@@ -98,7 +99,9 @@ export const submitBar = () => barOf(SUBMIT_KEYS, {});
 // ---------- the merge dialog ----------
 
 export interface MergeKeyCtx {
-  canMerge: boolean;
+  canMerge: boolean; // merge now, or turn on auto-merge
+  auto: boolean; // P turns on auto-merge rather than merging
+  autoOn: boolean; // auto-merge is on and the viewer may turn it off
   waitingDraft: boolean; // the model is drafting the message
   methods: boolean; // more than one merge method
   message: boolean; // the method takes a commit message
@@ -110,15 +113,21 @@ export interface MergeKeyCtx {
 
 const merging = (c: MergeKeyCtx) => c.canMerge && !c.waitingDraft;
 export const MERGE_KEYS: KeyDef<MergeKeyCtx>[] = [
-  { keys: ['P'], group: 'Merge', help: 'Merge (asks first; Enter too)', bar: { shown: 'P', label: 'merge', when: merging } },
+  {
+    keys: ['P'],
+    group: 'Merge',
+    help: 'Merge, or turn on auto-merge when checks or reviews still block it (asks first; Enter too)',
+    bar: { shown: 'P', label: (c) => (c.auto ? 'auto-merge' : 'merge'), when: merging },
+  },
+  { keys: ['a'], group: 'Merge', help: 'Turn auto-merge off', bar: { shown: 'a', label: 'turn off auto-merge', when: (c) => c.autoOn } },
   { keys: ['x'], group: 'Merge', help: 'While the model drafts the message: use GitHub’s default', bar: { shown: 'x', label: 'use GitHub’s default', when: (c) => c.canMerge && c.waitingDraft } },
   { keys: ['m'], group: 'Merge', help: 'Switch the merge method', bar: { shown: 'm', label: 'method', when: (c) => c.canMerge && c.methods } },
   { keys: ['e'], group: 'Message', help: 'Edit the commit title', bar: { shown: 'e', label: 'edit title', when: (c) => merging(c) && c.message } },
   { keys: ['b'], group: 'Message', help: 'Edit the commit body', bar: { shown: 'b', label: 'edit body', when: (c) => merging(c) && c.message } },
   { keys: ['g'], group: 'Message', help: 'Have the model draft the message again', bar: { shown: 'g', label: 'draft again', when: (c) => merging(c) && c.message && c.agent } },
-  { keys: ['d'], group: 'Merge', help: 'Delete the branch after merging, or keep it' },
-  { keys: ['r'], group: 'Not ready', help: 'Mark a draft PR ready for review', bar: { shown: 'r', label: 'mark ready for review', when: (c) => !c.canMerge && c.canMarkReady } },
-  { keys: ['u'], group: 'Not ready', help: 'Update the branch from its base', bar: { shown: 'u', label: (c) => `update from ${c.base}`, when: (c) => !c.canMerge && c.canUpdate } },
+  { keys: ['d'], group: 'Merge', help: 'Delete the branch after merging, or keep it (not with auto-merge)' },
+  { keys: ['r'], group: 'Not ready', help: 'Mark a draft PR ready for review', bar: { shown: 'r', label: 'mark ready for review', when: (c) => (!c.canMerge || c.auto) && c.canMarkReady } },
+  { keys: ['u'], group: 'Not ready', help: 'Update the branch from its base', bar: { shown: 'u', label: (c) => `update from ${c.base}`, when: (c) => (!c.canMerge || c.auto) && c.canUpdate } },
   { keys: ['?'] },
   { keys: ['h'], alias: true },
   { keys: ['q'], alias: true },

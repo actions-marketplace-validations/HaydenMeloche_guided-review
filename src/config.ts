@@ -4,7 +4,6 @@ import { grHome } from './paths.js';
 import { TERMINAL_THEME } from './tui/theme.js';
 import type { ChapterOrder, FileKind, KindRule, RepoConfig } from './types.js';
 import { AGENT_ROLES, EFFORTS, PROVIDERS, type AgentConfig, type AgentRouting, type Effort, type Provider } from './agent/types.js';
-import { CODING_AGENT_VALUES, CUSTOM_AGENT, customCommandProblem, DEFAULT_CODING_AGENT, isCodingAgent, type CodingAgent, type CodingAgentSetting } from './codingAgent.js';
 
 export const KINDS: FileKind[] = ['logic', 'test', 'config', 'mechanical', 'generated', 'vendored'];
 const REPO_CONFIG_KEYS = ['kinds', 'testPatterns', 'checklists'];
@@ -81,7 +80,7 @@ export function repoConfigProblems(text: string): string[] {
 }
 
 // The "chapterOrder" values in config.json; "guide" is the guided (flow) order.
-export const CHAPTER_ORDER_SETTINGS = { guide: 'flow', risk: 'risk', size: 'size', file: 'file' } as const satisfies Record<string, ChapterOrder>;
+export const CHAPTER_ORDER_SETTINGS = { guide: 'flow', risk: 'risk', size: 'size', file: 'file', commit: 'commit' } as const satisfies Record<string, ChapterOrder>;
 export type ChapterOrderSetting = keyof typeof CHAPTER_ORDER_SETTINGS;
 export const DEFAULT_CHAPTER_ORDER: ChapterOrderSetting = 'guide';
 
@@ -118,12 +117,11 @@ export type UserConfig = Omit<AgentRouting, 'provider'> & {
   sidebar?: boolean;
   shortExplanation?: boolean;
   commentLabels?: boolean; // false: comments carry no label (blocking, question, suggestion, nit)
+  syncViewed?: boolean; // false: read state stays off GitHub's Viewed checkboxes
   theme?: string;
   glyphs?: GlyphSetting;
   icons?: IconSetting;
   tipsSeen?: string[];
-  codingAgent?: CodingAgent;
-  codingAgentCommand?: string; // with "codingAgent": "custom"
   github?: GitHubConfig;
 };
 
@@ -271,6 +269,18 @@ export function loadCommentLabels(raw = readUserConfigFile()): boolean {
   return (raw && parseCommentLabels(raw, userConfigPath())) ?? true;
 }
 
+// "syncViewed": false keeps gr's read state off GitHub's Viewed checkboxes, for a reader who uses
+// the two as separate passes. On when unset. Readable without a model provider.
+function parseSyncViewed(raw: Record<string, unknown>, where: string): boolean | undefined {
+  if (raw.syncViewed === undefined) return undefined;
+  if (typeof raw.syncViewed !== 'boolean') throw new UserConfigError(`${where}: "syncViewed" must be true or false`);
+  return raw.syncViewed;
+}
+
+export function loadSyncViewed(raw = readUserConfigFile()): boolean {
+  return (raw && parseSyncViewed(raw, userConfigPath())) ?? true;
+}
+
 // A view setting, readable without a model provider: hideWhitespace is on when unset, splitDiff off.
 export function loadViewSetting(key: ViewSetting, raw = readUserConfigFile()): boolean {
   return (raw && parseViewSetting(raw, key, userConfigPath())) ?? VIEW_DEFAULTS[key];
@@ -360,24 +370,6 @@ export function saveThemeSetting(theme: string): boolean {
   return true;
 }
 
-function parseCodingAgent(raw: Record<string, unknown>, where: string): CodingAgentSetting | undefined {
-  if (raw.codingAgent === undefined) return undefined;
-  if (!isCodingAgent(raw.codingAgent)) {
-    throw new UserConfigError(`${where}: unknown codingAgent ${JSON.stringify(raw.codingAgent)} (expected ${CODING_AGENT_VALUES.join(', ')})`);
-  }
-  if (raw.codingAgent !== CUSTOM_AGENT) return { agent: raw.codingAgent };
-  const command = typeof raw.codingAgentCommand === 'string' ? raw.codingAgentCommand : undefined;
-  if (!command?.trim()) throw new UserConfigError(`${where}: "codingAgent": "custom" needs a "codingAgentCommand", such as "aider --message"`);
-  const problem = customCommandProblem(command);
-  if (problem) throw new UserConfigError(`${where}: "codingAgentCommand": ${problem}`);
-  return { agent: CUSTOM_AGENT, command };
-}
-
-// The coding agent o opens, readable without a model provider; Claude Code when unset.
-export function loadCodingAgent(raw = readUserConfigFile()): CodingAgentSetting {
-  return (raw && parseCodingAgent(raw, userConfigPath())) ?? { agent: DEFAULT_CODING_AGENT };
-}
-
 function parseGitHubConfig(raw: Record<string, unknown>, where: string): GitHubConfig | undefined {
   if (raw.github === undefined) return undefined;
   if (!raw.github || typeof raw.github !== 'object' || Array.isArray(raw.github)) throw new UserConfigError(`${where}: "github" must be an object`);
@@ -434,6 +426,8 @@ export function loadUserConfig(raw = readUserConfigFile()): UserConfig {
   }
   const commentLabels = parseCommentLabels(raw, file);
   if (commentLabels !== undefined) out.commentLabels = commentLabels;
+  const syncViewed = parseSyncViewed(raw, file);
+  if (syncViewed !== undefined) out.syncViewed = syncViewed;
   const theme = parseTheme(raw, file);
   if (theme) out.theme = theme;
   const glyphs = parseChoice(raw, 'glyphs', GLYPH_SETTINGS, file);
@@ -442,11 +436,6 @@ export function loadUserConfig(raw = readUserConfigFile()): UserConfig {
   if (icons) out.icons = icons;
   const tipsSeen = parseTipsSeen(raw, file);
   if (tipsSeen) out.tipsSeen = tipsSeen;
-  const codingAgent = parseCodingAgent(raw, file);
-  if (codingAgent) {
-    out.codingAgent = codingAgent.agent;
-    if (codingAgent.command) out.codingAgentCommand = codingAgent.command;
-  }
   const github = parseGitHubConfig(raw, file);
   if (github) out.github = github;
   if (raw.roles !== undefined) {

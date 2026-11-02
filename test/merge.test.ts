@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { defaultMergeMessage, defaultMethod, mergeReadiness } from '../src/review/merge.js';
+import { defaultMergeMessage, defaultMethod, mergeReadiness, readinessWithApproval } from '../src/review/merge.js';
 import { summarizeChecks, type MergeStatus } from '../src/github/gh.js';
 
 const status = (extra: Partial<MergeStatus> = {}): MergeStatus => ({
@@ -69,6 +69,29 @@ describe('mergeReadiness', () => {
   });
 });
 
+describe('readinessWithApproval', () => {
+  it('lifts the review a merge waits on, and the branch protection that held it', () => {
+    const waiting = status({ reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED' });
+    expect(mergeReadiness(waiting).canMerge).toBe(false);
+    expect(readinessWithApproval(waiting, 'head')).toMatchObject({ level: 'ready', canMerge: true });
+  });
+
+  it('keeps every other blocker', () => {
+    const r = readinessWithApproval(status({ reviewDecision: 'REVIEW_REQUIRED', checks: { ...status().checks, requiredFailed: ['test'] } }), 'head');
+    expect(r).toMatchObject({ level: 'blocked', canMerge: false, blockers: ['required check failing: test'] });
+    expect(readinessWithApproval(status({ reviewDecision: 'CHANGES_REQUESTED' }), 'head').blockers).toEqual(['changes requested']);
+  });
+
+  it('blocks an approval of commits pushed since the tour', () => {
+    expect(readinessWithApproval(status({ headSha: 'newer' }), 'head')).toMatchObject({
+      level: 'blocked',
+      canMerge: false,
+      canAutoMerge: false,
+      blockers: ['new commits since your tour: read them before approving'],
+    });
+  });
+});
+
 describe('merge messages', () => {
   it('defaults to squash when allowed', () => {
     expect(defaultMethod(['merge', 'squash'])).toBe('squash');
@@ -92,6 +115,22 @@ describe('summarizeChecks', () => {
         { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
       ]),
     ).toMatchObject({ passed: 1, failed: 2, pending: 1, failedNames: ['lint', 'docs'], requiredFailed: ['lint'], requiredPending: ['ci/test'] });
+  });
+});
+
+describe('auto-merge', () => {
+  const waiting = { passed: 1, failed: 0, pending: 1, failedNames: [], requiredFailed: [], requiredPending: ['build'], items: [] };
+  it('is offered for a PR that waits on checks or reviews, when GitHub says the viewer may', () => {
+    expect(mergeReadiness(status({ mergeStateStatus: 'BLOCKED', checks: waiting, viewerCanEnableAutoMerge: true }))).toMatchObject({ canMerge: false, canAutoMerge: true });
+    expect(mergeReadiness(status({ mergeStateStatus: 'BLOCKED', reviewDecision: 'REVIEW_REQUIRED', viewerCanEnableAutoMerge: true })).canAutoMerge).toBe(true);
+    expect(mergeReadiness(status({ mergeStateStatus: 'BLOCKED', checks: waiting, viewerCanEnableAutoMerge: false })).canAutoMerge).toBe(false);
+  });
+
+  it('is not offered for a PR that can merge now, is already set, is a draft, or conflicts', () => {
+    expect(mergeReadiness(status({ viewerCanEnableAutoMerge: true })).canAutoMerge).toBe(false);
+    expect(mergeReadiness(status({ mergeStateStatus: 'BLOCKED', checks: waiting, viewerCanEnableAutoMerge: true, autoMerge: 'squash' })).canAutoMerge).toBe(false);
+    expect(mergeReadiness(status({ isDraft: true, mergeStateStatus: 'DRAFT', viewerCanEnableAutoMerge: true })).canAutoMerge).toBe(false);
+    expect(mergeReadiness(status({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', viewerCanEnableAutoMerge: true })).canAutoMerge).toBe(false);
   });
 });
 
