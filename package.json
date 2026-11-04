@@ -1,6 +1,6 @@
 {
   "name": "@haydenmeloche/guided-review",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Read a code change the way the code runs, in your terminal: a tour of a pull request, branch, or working tree, with chapters that follow the code's flow, tests beside each change, and one review to submit.",
   "keywords": [
     "code-review",
@@ -35,7 +35,8 @@
     "dist/**/*.js.map",
     "codex/",
     "claude/",
-    "docs/"
+    "docs/",
+    "!docs/images/"
   ],
   "engines": {
     "node": ">=22.13.0"
@@ -48,6 +49,7 @@
     "build": "tsc -p .",
     "dev": "GR_HOME=${GR_HOME:-$(pwd)/.gr-dev} tsx src/cli.tsx",
     "reset:db": "node -e \"const fs=require('node:fs'); const path=require('node:path'); const dir=process.env.GR_HOME ?? path.resolve('.gr-dev'); for (const suffix of ['', '-wal', '-shm']) fs.rmSync(path.join(dir,'gr.db'+suffix),{force:true}); console.log('Guided Review database reset in '+dir+'.');\"",
+    "demo:record": "scripts/demo.sh",
     "backtest": "GR_HOME=${GR_HOME:-$(pwd)/.gr-dev} node --import tsx --disable-warning=ExperimentalWarning scripts/backtest-chapters.ts",
     "typecheck": "tsc -p . --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run --project unit",

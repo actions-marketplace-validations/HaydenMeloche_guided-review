@@ -17,6 +17,7 @@ import {
 } from '../github/gh.js';
 import type { Store } from '../store/db.js';
 import { KeyBar } from './ChapterScreen.js';
+import { Key } from './KeyBar.js';
 import { TextInput } from './TextInput.js';
 import { pad, truncate, wrap } from './nav.js';
 import { sanitizeTerminal as safe } from '../util/sanitize.js';
@@ -214,6 +215,8 @@ interface PickerProps {
   notice?: string;
   onPick: (t: Target, mode?: 'author') => void; // your own PRs open their feedback
   onLocal?: () => void; // l: tour the branch checked out where gr runs; unset outside a git repository
+  onTutor?: () => void; // T: the tutor, in the demo
+  offerTutor?: boolean; // until the tutor is finished or dismissed once, a line offers it
   readLocalChanges?: () => Promise<LocalChanges | undefined>; // what l would tour, offered above the list while there is some
   onMerge?: (t: Target) => void; // M
   onChecks?: (t: Target) => void; // c: the PR's checks and their logs
@@ -267,6 +270,7 @@ export function PickerScreen(props: PickerProps) {
   prsRef.current = prs;
   const selKey = useRef('');
   const restoreKey = useRef<string | undefined>(cache?.selKey);
+  const moved = useRef(false); // the cursor was moved by a key, not just left where it started
   const loading = useRef(false);
 
   // Refreshing keeps the current list on screen until the new one arrives.
@@ -322,7 +326,9 @@ export function PickerScreen(props: PickerProps) {
           }
           const keys = new Set(p.map(keyFor));
           setSelected((prev) => new Set([...prev].filter((id) => keys.has(id))));
-          restoreKey.current = selKey.current;
+          // The review requests land above the other sections, so on their first load the cursor
+          // stays at the top unless a key moved it; after that it follows its PR.
+          restoreKey.current = prsRef.current || moved.current ? selKey.current : undefined;
           if (cacheRef.current) {
             cacheRef.current.prs = p;
             cacheRef.current.fetchedAt = Date.now();
@@ -592,6 +598,7 @@ export function PickerScreen(props: PickerProps) {
         if (props.update && props.onUpdate) return props.onUpdate();
         return setHint('No newer version of gr to install.');
       }
+      if (input === 'T' && props.onTutor) return props.onTutor();
       if (input === 'l') {
         if (!props.onLocal) return setHint('l tours local changes: run gr inside a git repository.');
         // Before the first read says, l opens the tour anyway: the tour itself says what it found.
@@ -613,6 +620,7 @@ export function PickerScreen(props: PickerProps) {
         setSelected(next);
       }
       if (input === 'd') startDownload();
+      if (input === 'j' || key.downArrow || input === 'k' || key.upArrow || input === 'g' || input === 'G') moved.current = true;
       if (input === 'j' || key.downArrow) setSel((s) => Math.min(items.length - 1, s + 1));
       if (input === 'k' || key.upArrow) setSel((s) => Math.max(0, s - 1));
       if (input === 'g') setSel(0);
@@ -754,6 +762,12 @@ export function PickerScreen(props: PickerProps) {
             U
           </Text>
           <Text> to update</Text>
+        </Text>
+      ) : props.offerTutor && props.onTutor ? (
+        <Text wrap="truncate">
+          <Text dimColor>New to gr? </Text>
+          <Key k="T" />
+          <Text dimColor> starts the tutor: about 10 minutes in a sample tour, offline.</Text>
         </Text>
       ) : (
         <Text> </Text>

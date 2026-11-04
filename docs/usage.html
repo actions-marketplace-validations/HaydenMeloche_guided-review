@@ -38,6 +38,7 @@
           <nav aria-label="On this page" class="on-page">
             <p class="nav-title">On this page</p>
             <ul>
+              <li><a href="#learn-gr">Learn gr</a></li>
               <li><a href="#moving-around">Moving around</a></li>
               <li><a href="#pick-a-pr">Pick a PR</a></li>
               <li><a href="#read-the-tour">Read the tour</a></li>
@@ -55,6 +56,12 @@
           <h1>Using Guided Review</h1>
           <p>
             How to pick a PR, read a tour, comment, re-review, respond to a review on your own PR, merge, and preview your own branch. For setup, see <a href="install.html">Install and set up</a>.
+          </p>
+          <h2 id="learn-gr"><a class="anchor" href="#learn-gr" aria-hidden="true">#</a>Learn gr</h2>
+          <p>
+            <code>gr tutor</code> opens a sample tour with lessons over it, in the spirit of <code>vimtutor</code>. <br />
+            <br />
+            Give it a try to learn how to use guided review!
           </p>
           <h2 id="moving-around"><a class="anchor" href="#moving-around" aria-hidden="true">#</a>Moving around</h2>
           <p>Three keys move you back on every screen:</p>
@@ -149,6 +156,10 @@
                   </td>
                 </tr>
                 <tr>
+                  <td><code>T</code></td>
+                  <td>The <a href="#learn-gr">tutor</a>, in a sample tour.</td>
+                </tr>
+                <tr>
                   <td><code>?</code> / <code>q</code></td>
                   <td>List the keys, or quit.</td>
                 </tr>
@@ -172,10 +183,7 @@
           </p>
           <figure class="shot">
             <a href="images/briefing.webp"
-              ><img
-                src="images/briefing.webp"
-                alt="The briefing screen: whether the PR can merge, a summary of the PR, chapters in reading order with progress and size, the author's description, and an overview diagram"
-                loading="lazy"
+              ><img src="images/briefing.webp" alt="The briefing screen: chapters in reading order with progress and size, the author's description, and an overview diagram" loading="lazy"
             /></a>
           </figure>
           <div class="table-wrap">
@@ -245,7 +253,7 @@
             threads are followed to where their lines are now.
           </p>
           <figure class="shot">
-            <a href="images/ask.webp"><img src="images/ask.webp" alt="A question about a changed line, answered inline below the code with file and line references" loading="lazy" /></a>
+            <a href="images/ask.webp"><img src="images/ask.webp" alt="Asking who can use a discount code, answered inline below the line with file and line references" loading="lazy" /></a>
           </figure>
           <p>Press <code>a</code> on a line or range to ask about it. The model can read the whole repository, so answers can cover code outside the diff, and they cite files and lines.</p>
           <p>
@@ -909,7 +917,7 @@ gr feedback                  # work through the review on your own PR
 gr preview                   # tour the current branch before opening a PR
 gr preview --base parent     # against the branch it stacks on
 gr diff HEAD~3               # the working tree against a commit; gr diff a..b for two commits
-gr demo                      # try a tour of a sample change: offline, no PR, gh, or model
+gr tutor                     # learn gr: lessons in a sample tour, offline, no PR, gh, or model
 gr open 1234                 # open a tour in a new tmux or Terminal window
 gr open --preview            # open gr preview in a new tmux or Terminal window
 gr build 1234 --comment      # build a tour without the TUI and post it to the PR (for CI)
