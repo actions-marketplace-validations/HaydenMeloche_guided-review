@@ -26,10 +26,10 @@ import {
   type GlyphSetting,
   type IconSetting,
 } from './config.js';
-import { editRepoConfig, setup } from './setup.js';
+import { editRepoConfig, setup, setupClones } from './setup.js';
 import { installClaudeCommand, installCodexSkill, refreshInstalled, type SkillInstallResult } from './codexSkill.js';
 import { planOpen, runOpen, targetArg } from './open.js';
-import { KEEP_TOURS_PER_PR, TOUR_MAX_AGE_DAYS } from './store/retention.js';
+import { KEEP_TOURS_PER_PR, REPO_MAX_AGE_DAYS, TOUR_MAX_AGE_DAYS } from './store/retention.js';
 import { AGENT_ROLES, configForRole, validateRouting } from './agent/types.js';
 import { packagedRun, packageInfo, promptForUpdate, RELEASES_URL, startUpdateCheck, updateNow } from './updateCheck.js';
 import { holdTerminalInput, SCREEN_RENDER } from './tui/renderOptions.js';
@@ -75,11 +75,12 @@ ${[
   usage('open --preview', 'Open the preview of your current branch in a new terminal window'),
   usage('build [number|URL]', 'Build a tour without the TUI (for CI); share it with --comment or --out'),
   usage('doctor', 'Check what gr needs (git, gh, ripgrep, your model, …) and how to fix what is missing'),
-  usage('cleanup [--days n]', 'Remove local PR worktrees (skip worktrees with changes) and old tours'),
+  usage('cleanup [--days n]', 'Remove local PR worktrees (skip worktrees with changes), unused clones, and old tours'),
   usage('update', 'Install the newest version of gr'),
   usage('config', 'Choose a model provider (or none), models, API key, and GitHub access'),
   usage('config --edit', 'Open ~/.guided-review/config.json in your editor'),
   usage('config --repo', "Edit this repo's .guided-review.json (file kinds, test globs, checklists)"),
+  usage('config --clones', 'Find your clones, so PRs are checked out from them instead of downloaded'),
   usage('install-claude-command', 'Add /guided-review to Claude Code'),
   usage('install-codex-skill', 'Add Guided Review as a Codex skill'),
   usage('completion <zsh|bash|fish>', 'Print a script that completes commands, flags, branches and PR numbers'),
@@ -111,6 +112,7 @@ ${[
       fresh: { type: 'boolean', default: false },
       repo: { type: 'boolean', default: false },
       edit: { type: 'boolean', default: false },
+      clones: { type: 'boolean', default: false },
       force: { type: 'boolean', default: false },
       preview: { type: 'boolean', default: false },
       base: { type: 'string' },
@@ -232,7 +234,7 @@ async function main() {
       editRepoConfig((await localRepoRoot(cwd)) ?? fail('not inside a git repository.'));
       return;
     }
-    await runConfig({ edit: cli.flags.edit });
+    await runConfig({ edit: cli.flags.edit, clones: cli.flags.clones });
     return;
   }
   if (cmd === 'cleanup') {
@@ -242,6 +244,7 @@ async function main() {
     const result = await cleanup(maxAge);
     process.stdout.write(`Removed ${result.worktrees.removed.length} PR worktree(s).\n`);
     for (const item of result.worktrees.skipped) process.stdout.write(`Skipped ${item.path}: ${item.reason}\n`);
+    process.stdout.write(`Removed ${result.repos.length} of gr's own clone(s): unused for ${REPO_MAX_AGE_DAYS} days, or replaced by yours.\n`);
     process.stdout.write(`Removed ${result.tours} old tour(s): the newest ${KEEP_TOURS_PER_PR} per PR are kept, minus any not opened in ${maxAge} days.\n`);
     if (result.prs) process.stdout.write(`Cleared reading state for ${result.prs} PR(s) with no tour left; unposted drafts are kept.\n`);
     return;
@@ -383,12 +386,15 @@ async function main() {
     const result = await setup({ firstRun: true });
     if (result.kind === 'cancelled') fail(`no config saved. Run \`${NAME} config\` when you're ready, or pass --no-agent to review without a model.`);
   }
-  // The weekly cleanup runs while the PR is resolved, and finishes before the tour can open a worktree.
+  // The daily cleanup runs while the PR is resolved, and finishes before the tour can open a worktree.
   const cleanupP = autoCleanup();
   // Load the TUI while the PR is being resolved below.
   const tui = Promise.all([import('ink'), import('./tui/App.js')]);
   tui.catch(() => undefined); // awaited below; a failure surfaces there
   const localRepoP = localRepoRoot(cwd);
+  // The clone gr runs in is remembered, so later PRs of its repository are checked out from it
+  // wherever gr is started.
+  void localRepoP.then((root) => (root ? import('./git/clones.js').then(({ recordClone }) => recordClone(root)) : undefined)).catch(() => undefined);
   const takesArg = cmd === 'review' || cmd === 'feedback';
   const needsRepo = takesArg ? !!arg : !!cmd && cmd !== 'preview' && cmd !== 'diff' && !demo;
   const cwdRepoP = needsRepo && /^#?\d+$/.test((takesArg ? arg : cmd).trim()) ? currentRepo(cwd) : Promise.resolve(undefined);
@@ -543,7 +549,7 @@ async function main() {
 // gr config, and c at the end of the demo's tutor. The wizard's theme preview draws as the tour
 // will: for this terminal, with the config's marks. A config that can't be read keeps the default
 // marks; setup says what is wrong with it.
-async function runConfig(o: { edit?: boolean } = {}): Promise<void> {
+async function runConfig(o: { edit?: boolean; clones?: boolean } = {}): Promise<void> {
   if (!o.edit && process.stdin.isTTY && process.stdout.isTTY) {
     await readTerminal(!!process.env.NO_COLOR);
     try {
@@ -552,6 +558,10 @@ async function runConfig(o: { edit?: boolean } = {}): Promise<void> {
     } catch (error) {
       if (!(error instanceof UserConfigError)) throw error;
     }
+  }
+  if (o.clones) {
+    await setupClones().catch((e: Error) => fail(e.message));
+    return;
   }
   await setup({ edit: o.edit });
 }

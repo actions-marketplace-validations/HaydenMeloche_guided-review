@@ -19,6 +19,8 @@ import {
   setThreadResolved,
   viewerLogin,
   type ViewedState,
+  starGuidedReview,
+  hasStarredGuidedReview,
 } from '../github/gh.js';
 import { hunksViewedOnGitHub, viewedChanges } from '../review/viewed.js';
 import { isBotAuthor, isShortTour } from '../review/botPR.js';
@@ -35,6 +37,7 @@ import { ChapterScreen, type Services } from './ChapterScreen.js';
 import { BriefingScreen } from './BriefingScreen.js';
 import { SubmitScreen } from './SubmitScreen.js';
 import { ReviewPopup } from './ReviewPopup.js';
+import { STAR_AFTER, StarPrompt } from './StarPrompt.js';
 import { CommentEditor, CommentLabels } from './CommentEditor.js';
 import { aiChromeRows } from './AiSuggestion.js';
 import { initComposer, type ComposerEnv, type ComposerState, type ReferenceServices } from './composer.js';
@@ -62,6 +65,10 @@ import { demoNarration, demoPreview, DEMO_ANSWERS, NO_PREPARED_ANSWER, preparedA
 import { useTutor, type TutorNav } from './tutor/Tutor.js';
 import { Anchor } from './tutor/anchors.js';
 import type { PreparedAsk } from './AskOverlay.js';
+
+// Shown once, the first time a PR comes from gr's own clone rather than the user's. No wider than
+// the intro's shortest footer, so it doesn't widen the box it shows in.
+export const CLONES_TIP = 'Tip: gr config --clones uses your clone of this repo';
 
 export interface Target {
   repo: string;
@@ -275,6 +282,8 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const [worktree, setWorktree] = useState<string>('');
   const [tour, setTour] = useState<Tour | undefined>();
   const [steps, setSteps] = useState<Step[]>([]);
+  const [cloneTip, setCloneTip] = useState(false); // the one-time clones tip, for the briefing
+  const [downloadTip, setDownloadTip] = useState(false); // the clones tip under the loading steps
   const [analyzing, setAnalyzing] = useState<string | undefined>();
   const [narration, setNarration] = useState<{ done: number; total: number }>();
   const [error, setError] = useState('');
@@ -288,16 +297,20 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const [shortExplanation, setShortExplanation] = useState(opts.shortExplanation ?? false);
   // First-run tips: each shows once, then is saved as seen.
   const tipsSeen = useRef(new Set(opts.tipsSeen ?? []));
-  const takeTip = (tip: string) => {
-    if (!opts.saveTipSeen || tipsSeen.current.has(tip)) return false;
-    tipsSeen.current.add(tip);
-    try {
-      opts.saveTipSeen?.(tip);
-    } catch {
-      // An unwritable config shows the tip again next time; nothing else depends on it.
-    }
-    return true;
-  };
+  const saveTipSeen = opts.saveTipSeen;
+  const takeTip = useCallback(
+    (tip: string) => {
+      if (!saveTipSeen || tipsSeen.current.has(tip)) return false;
+      tipsSeen.current.add(tip);
+      try {
+        saveTipSeen(tip);
+      } catch {
+        // An unwritable config shows the tip again next time; nothing else depends on it.
+      }
+      return true;
+    },
+    [saveTipSeen],
+  );
   const [hideTestPane, setHideTestPane] = useState(false);
   const [deltaOnly, setDeltaOnly] = useState(false);
   // Commit order's chapters for this head, once read (a git log of the tour's commits).
@@ -332,6 +345,26 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
   const skipBriefing = useRef(false);
   const [checking, setChecking] = useState<Target>(); // the checks popup, over the picker or the briefing
   const [askingReviewers, setAskingReviewers] = useState<Target>(); // the reviewers popup, over the picker
+  const [askingStar, setAskingStar] = useState(false); // the one-time ask to star gr, over the picker
+  // After a posted review: once enough are posted, ask to star gr, unless they already have (if
+  // GitHub can't say, ask anyway). Only a counter, so a failure never fails the post.
+  const askToStar = () => {
+    try {
+      if (!store.countPostedReview(STAR_AFTER)) return;
+    } catch {
+      return;
+    }
+    void hasStarredGuidedReview()
+      .catch(() => false)
+      .then((starred) => {
+        try {
+          store.setStarAsked();
+        } catch {
+          return;
+        }
+        if (!starred) setAskingStar(true);
+      });
+  };
   const [pickerReload, setPickerReload] = useState(0);
   const pickerCache = useRef<PickerCache>({}); // the list as it was, for coming back from a tour
   // Diffs from each outdated thread's commit to the head, so the tour shows it on its line now.
@@ -444,6 +477,8 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
       setPhase('load');
       setPrTitle(undefined);
       setSteps([]);
+      setCloneTip(false);
+      setDownloadTip(false);
       setAnalyzing(undefined);
       setNarration(undefined);
       setError('');
@@ -477,7 +512,24 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
           info = await fetchPR(t.repo, t.number, signal);
           onProgress(`Fetching ${t.repo}#${t.number}`, true);
           onProgress('Checking out head in a worktree');
-          wt = await ensureWorktree(info, { localRepo: opts.localRepo });
+          let cloning: string | undefined;
+          wt = await ensureWorktree(info, {
+            localRepo: opts.localRepo,
+            onOwnCopy: (repo, downloading) => {
+              if (downloading) {
+                cloning = `Downloading ${repo}`;
+                onProgress(cloning);
+              }
+              // Every download shows the tip under the loading steps, as it happens. The first PR
+              // from gr's own clone also shows it once on the briefing, until a key is pressed; the
+              // PR list's background checkouts don't use that up.
+              if (takeTip('clones')) {
+                setCloneTip(true);
+                setDownloadTip(true);
+              } else if (downloading) setDownloadTip(true);
+            },
+          });
+          if (cloning) onProgress(cloning, true);
           onProgress('Checking out head in a worktree', true);
         }
         if (gen !== loadGen.current) return;
@@ -575,7 +627,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         setPhase('error');
       }
     },
-    [opts, store, onProgress, flagDraftsOnChangedLines, loadAuthor],
+    [opts, store, onProgress, flagDraftsOnChangedLines, loadAuthor, takeTip],
   );
 
   // Mount only: later loads come from explicit actions, and `load` changes identity with opts.
@@ -1058,6 +1110,8 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     loadAbort.current?.abort();
     setTour(undefined);
     setSteps([]);
+    setCloneTip(false);
+    setDownloadTip(false);
     setBanner(undefined);
     setNewHead(undefined);
     setLocalEdited(false);
@@ -1077,6 +1131,8 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
     loadAbort.current?.abort();
     setPhase('load');
     setSteps([]);
+    setCloneTip(false);
+    setDownloadTip(false);
     setTour(undefined);
     void demoPreview().then(
       (p) => {
@@ -1250,6 +1306,22 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
             if (changed) setPickerReload((n) => n + 1);
           },
         });
+      // Last, so the PR's own popups, which open on a key, stay on top of this one.
+      if (askingStar)
+        return (
+          <ReviewPopup background={picker(false)} width={columns} height={rows} maxWidth={64} maxHeight={columns < 70 ? 12 : 9}>
+            {() => (
+              <StarPrompt
+                star={starGuidedReview}
+                onDone={(notice) => {
+                  setAskingStar(false);
+                  if (notice) setPickerNotice(notice);
+                }}
+                onQuit={requestQuit}
+              />
+            )}
+          </ReviewPopup>
+        );
       return withThemePicker(picker);
     }
     if (phase === 'error') {
@@ -1278,6 +1350,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
         ...shown,
         ...Array.from({ length: INTRO_STEPS - shown.length }, () => ' '),
         ' ',
+        ...(downloadTip ? [[{ text: CLONES_TIP, dim: true }] as IntroLine] : []),
         [{ text: `The briefing opens once the diff is mapped · ${back ? 'q for the PR list · Q to quit' : 'q to quit'}`, dim: true }],
       ];
     };
@@ -1399,6 +1472,8 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
       <BriefingScreen
         resume={resumeLabel()}
         notice={postedNotice?.key === `${tour.repo}#${tour.pr}` ? postedNotice.text : undefined}
+        tip={cloneTip ? CLONES_TIP : undefined}
+        onTipShown={() => setCloneTip(false)}
         tour={tour}
         chapters={chapters}
         allChapters={allChapters}
@@ -1571,6 +1646,7 @@ function Screens(opts: AppOptions & { theme: ThemeControl }) {
                   const notice = `Posted review for ${tour.repo}#${tour.pr}: ${review.url}${moved.length ? ` · ${plural(moved.length, 'comment')} re-anchored` : ''}`;
                   setPickerNotice(notice);
                   setPostedNotice({ key: `${tour.repo}#${tour.pr}`, text: notice });
+                  if (!demo) askToStar();
                   setPhase('pick');
                 }}
                 onBack={() => setPhase(submitFrom)}
